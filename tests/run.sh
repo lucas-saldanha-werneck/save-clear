@@ -31,6 +31,8 @@ new_case() {  # $1 = scenario
   export SAVE_CLEAR_STATE_DIR="$D/state" SAVE_CLEAR_CLAUDE="$T/fake_claude.py" FAKE_DIR="$D" FAKE_SCENARIO="$1"
   export FAKE_A=$A FAKE_B=$B FAKE_C=cccccccc-0000-0000-0000-00000000000c
   "$TM" -S "$TMS" kill-server 2>/dev/null
+  # wait for the old server to go: on Linux a new client can reach the dying one ("server exited unexpectedly")
+  for _ in $(seq 1 25); do [ -S "$TMS" ] || break; sleep 0.2; done
   "$TM" new-session -d -s sctest -x 160 -y 40 "bash $T/fake_tui.sh $D"
   sleep 1
   # guard: the server the helper sees must be ONLY the test one
