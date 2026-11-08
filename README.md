@@ -90,8 +90,10 @@ the plugin.
 Your file is `~/.config/save-clear/config.json` (or the `$XDG_CONFIG_HOME` / `SAVE_CLEAR_CONFIG`
 path above; on Windows `~` is `%USERPROFILE%`). You don't have to create it: the plugin writes it
 the first time a session starts (or the first time the skill runs), from
-[`config.example.json`](config.example.json), with every option at its default and a one-line note
-per option under `_doc`. That file behaves exactly like having no file. Plugin updates never touch
+[`config.example.json`](config.example.json), with every option set to `null` and a one-line note
+per option under `_doc` that shows its default. `null` (or an empty string) means "use the built-in
+default", so that file behaves exactly like having no file, and a later version that changes a
+default reaches you too. Plugin updates never touch
 it, and an existing file is never overwritten, so edit it freely.
 
 | Option | Environment variable | Default | What it does |

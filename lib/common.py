@@ -12,7 +12,7 @@ Files (all under the state folder: $SAVE_CLEAR_STATE_DIR, else $CLAUDE_PLUGIN_DA
 Your own settings can also live in ~/.config/save-clear/config.json ($SAVE_CLEAR_CONFIG), outside the
 plugin folder, so they survive updates. Precedence: plugin option > env var > that file.
 The SessionStart hook (and the save-clear command) create that file from config.example.json the first
-time, with every option at its default; an existing file is never overwritten.
+time, with every option null (= the built-in default); an existing file is never overwritten.
 """
 import calendar
 import contextlib
@@ -112,7 +112,7 @@ OPTIONS = {
 # Same keys as the plugin options. Lowest precedence (plugin option and env var win).
 USER_CONFIG = os.path.expanduser(os.environ.get("SAVE_CLEAR_CONFIG") or os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "save-clear", "config.json"))
-# Starter copied to USER_CONFIG on first run: every option at its default (same behavior as no file).
+# Starter copied to USER_CONFIG on first run: every option null = the built-in default (same as no file).
 EXAMPLE_CONFIG = os.path.join(ROOT, "config.example.json")
 
 

@@ -1338,7 +1338,22 @@ class SeedConfig(Base):
         keys = {k for k in example if not k.startswith("_")}
         self.assertEqual(keys, set(user_config), "one key per plugin option")
         self.assertEqual(set(example["_doc"]) - {"about"}, keys, "a short doc line per option")
-        self.assertEqual({k: example[k] for k in keys}, {k: v["default"] for k, v in user_config.items()})
+        self.assertEqual({example[k] for k in keys}, {None}, "every option null: the seed pins no default")
+        for k, v in user_config.items():  # each note names the default the plugin falls back to
+            if v.get("default"):
+                self.assertIn(str(v["default"]), example["_doc"][k], k)
+
+    def test_seeded_file_follows_a_changed_built_in_default(self):
+        """Whatever default the code passes wins over a seeded file, so a later default change reaches it."""
+        self.env.pop("SAVE_CLEAR_SNAPSHOT_DIR")  # only the seeded file and the code's default are left
+        self.start(source="startup")
+        self.assertEqual(read_bytes(self.cfg), read_bytes(EXAMPLE))
+        code = (f"import json, sys; sys.path.insert(0, {os.path.join(ROOT, 'lib')!r}); import common as c; "
+                "print(json.dumps({n: c.setting(n, 'NEW-DEFAULT-' + n) for n in c.OPTIONS}))")
+        r = subprocess.run([PY, "-c", code], capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout)
+        self.assertEqual(got, {n: "NEW-DEFAULT-" + n for n in got})
 
     def test_missing_file_is_created_by_session_start_with_defaults(self):
         nested = os.path.join(self.t, "new", "dir", "config.json")
@@ -1407,8 +1422,6 @@ class SeedConfig(Base):
         self.start(source="startup", **env)
         self.assertEqual(read_bytes(self.cfg), read_bytes(EXAMPLE))
         seeded = self.dump(**env)
-        # publish_link is the only non-empty default ("off"); only publish_link() ever reads it
-        self.assertEqual((seeded["settings"].pop("publish_link"), without["settings"].pop("publish_link")), ("off", ""))
         self.assertEqual(seeded, without)
         # plugin options (/config) and env vars still win over the seeded defaults
         on = self.dump(CLAUDE_PLUGIN_OPTION_PUBLISH_LINK="on", CLAUDE_PLUGIN_OPTION_LANGUAGE="German", **env)

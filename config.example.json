@@ -1,9 +1,9 @@
 {
   "_doc": {
-    "about": "save-clear settings. The plugin creates this file on first run; plugin updates never change it. Every value here is the default: an empty value means the built-in default. A plugin option (/config) or an environment variable wins over this file. Keys starting with _ are ignored.",
+    "about": "save-clear settings. The plugin creates this file on first run; plugin updates never change it. Every value here is null, which means \"use the built-in default\" (shown in each note), so this file behaves like having none and follows the defaults of later versions. An empty string means the default too. Replace a null to change that setting. A plugin option (/config) or an environment variable wins over this file. Keys starting with _ are ignored.",
     "snapshot_dir": "Where session summaries and compaction backups go. Empty = ~/.claude/snapshots",
     "notify_command": "Program called with one line of text when the automatic /clear succeeds, fails or is refused. Empty = no notifications",
-    "publish_link": "on: publish the summary as a private claude.ai page (when the Artifact tool is available). off = no link",
+    "publish_link": "on: publish the summary as a private claude.ai page (when the Artifact tool is available). off = no link. Default: off",
     "context_cap_tokens": "Run save-clear at the end of the turn once the context passes this many tokens. Empty = 300000. 0 = off",
     "idle_minutes": "Idle trigger only (./install.sh --idle): minutes idle before an automatic save-clear. Empty = 50. 0 = off",
     "idle_min_tokens": "Idle trigger only: sessions with a smaller context are left alone. Empty = 80000",
@@ -14,16 +14,16 @@
     "pre_clear_command": "Runs just before the automatic /clear or clear_session; never stops the clear. Empty = none",
     "on_resume_command": "Runs after the /clear when the summary is delivered; what it prints (exit 0) goes into the new session. Empty = none"
   },
-  "snapshot_dir": "",
-  "notify_command": "",
-  "publish_link": "off",
-  "context_cap_tokens": "",
-  "idle_minutes": "",
-  "idle_min_tokens": "",
-  "language": "",
-  "resume_message": "",
-  "extra_steps": "",
-  "on_save_command": "",
-  "pre_clear_command": "",
-  "on_resume_command": ""
+  "snapshot_dir": null,
+  "notify_command": null,
+  "publish_link": null,
+  "context_cap_tokens": null,
+  "idle_minutes": null,
+  "idle_min_tokens": null,
+  "language": null,
+  "resume_message": null,
+  "extra_steps": null,
+  "on_save_command": null,
+  "pre_clear_command": null,
+  "on_resume_command": null
 }
