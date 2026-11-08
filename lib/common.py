@@ -25,6 +25,14 @@ except ImportError:  # Windows
     fcntl = None
     import msvcrt
 
+# Hook JSON, transcripts and our output are UTF-8. On Windows the default for pipes is the ANSI code
+# page, where printing a character like an arrow fails and the command prints nothing.
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "bin")
 HOME = os.path.expanduser("~")
@@ -40,7 +48,7 @@ def _resolve_state():
         if value and value.strip():
             return os.path.expanduser(value.strip())
     try:
-        with open(POINTER) as f:
+        with open(POINTER, encoding="utf-8") as f:
             value = f.read().strip()
         if value and os.path.isdir(value):
             return value
@@ -58,7 +66,7 @@ def save_pointer():
     if not data or os.environ.get("SAVE_CLEAR_STATE_DIR"):
         return
     try:
-        with open(POINTER) as f:
+        with open(POINTER, encoding="utf-8") as f:
             if f.read().strip() == data:
                 return
     except OSError:
@@ -66,7 +74,7 @@ def save_pointer():
     try:
         os.makedirs(data, exist_ok=True)
         os.makedirs(os.path.dirname(POINTER), exist_ok=True)
-        with open(POINTER, "w") as f:
+        with open(POINTER, "w", encoding="utf-8") as f:
             f.write(data + "\n")
     except OSError:
         pass
@@ -101,7 +109,7 @@ def ensure_state():
 
 def _saved_config():
     try:
-        with open(CONFIG) as f:
+        with open(CONFIG, encoding="utf-8") as f:
             v = json.load(f)
         return v if isinstance(v, dict) else {}
     except Exception:
@@ -162,7 +170,7 @@ def stamp():
 def log(tag, msg):
     try:
         ensure_state()
-        with open(LOG, "a") as f:
+        with open(LOG, "a", encoding="utf-8") as f:
             f.write(f"{stamp()} [{tag}] {msg}\n")
     except OSError:
         pass
@@ -170,7 +178,7 @@ def log(tag, msg):
 
 def write_json(path, value):
     tmp = f"{path}.tmp-{os.getpid()}"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(value, f)
         f.write("\n")
     os.replace(tmp, path)
@@ -180,7 +188,7 @@ def write_json(path, value):
 def locked(path):
     """Exclusive lock on <path> for the whole block (other processes wait)."""
     ensure_state()
-    f = open(path, "a+")
+    f = open(path, "a+", encoding="utf-8")
     try:
         if fcntl:
             fcntl.flock(f, fcntl.LOCK_EX)
@@ -230,7 +238,7 @@ def all_clears():
 
 def read_json(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None

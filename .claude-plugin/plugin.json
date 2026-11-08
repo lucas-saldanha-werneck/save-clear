@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "End-of-session ritual: Claude saves memory and a verified session summary, clears the context by itself, and the next session starts from the summary.",
   "author": {
     "name": "Lucas Saldanha Werneck",

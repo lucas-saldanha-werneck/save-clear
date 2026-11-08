@@ -59,6 +59,8 @@ Restart the session so the hooks load. Then say "save and clear" (also "save-cle
 
 Requires `python3` 3.8 or newer. The automatic `/clear` also needs the `claude` CLI on `PATH`
 (the helper runs `claude agents --json` to check which session it is typing into). macOS or Linux.
+On Windows, save and resume work, but the automatic `/clear` does not (see below). The hooks call
+`python3`, so that command must start Python there.
 
 ## Settings
 
@@ -77,7 +79,8 @@ Set them with `/plugin configure save-clear@save-clear`, or with environment var
 You need none of these. Without them everything works except the automatic `/clear`: Claude tells
 you to type `/clear`, and the summary still comes back by itself.
 
-- tmux: automatic `/clear` in a tmux pane, and for `claude --bg` sessions.
+- tmux: automatic `/clear` in a tmux pane, and for `claude --bg` sessions. tmux does not run
+  natively on Windows, so on Windows you always type `/clear` yourself.
 - A notifier for `notify_command`, for example a script that sends you a push message.
 - A relay session in the Claude desktop app, so the resume arrives right after the clear instead of
   with your next message. See [Desktop app relay](#desktop-app-relay).
@@ -191,7 +194,8 @@ state ended up in `~/.claude/state/save-clear`, delete that folder yourself, plu
 - Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 54 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
   (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
-  fake job state file. CI runs both on Ubuntu and macOS. Install and uninstall were run with the
+  fake job state file. CI runs both on Ubuntu and macOS. On Windows, CI runs the unit tests
+  only, and skips the ones for the automatic `/clear`, which needs tmux. Install and uninstall were run with the
   `claude plugin` CLI.
 - Not tested live: the desktop app relay round trip (request, clear, `send_message`, ack, resume),
   the waker, and `claude --bg` sessions. The unit tests cover their decision logic only. The
@@ -201,7 +205,8 @@ state ended up in `~/.claude/state/save-clear`, delete that folder yourself, plu
   which was not checked from inside the app here. IDE sessions were not tested live; matching them
   by process id assumes `/clear` there keeps the same process, as in the terminal.
 - The app log format was checked against a real macOS log. The Linux and Windows log paths were not.
-- Windows was not tested.
+- Windows was tested only through the unit tests in CI, not in a real Claude session. The
+  automatic `/clear` does not work on Windows, because it needs tmux.
 - The tmux helper reads the screen to see an empty prompt. If colors are off in tmux, it may treat
   the dim placeholder text as a draft and not type.
 

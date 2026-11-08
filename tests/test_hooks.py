@@ -17,6 +17,10 @@ PY = sys.executable
 SID_A = "aaaaaaaa-0000-0000-0000-00000000000a"
 SID_B = "bbbbbbbb-0000-0000-0000-00000000000b"
 SID_NEW = "cccccccc-0000-0000-0000-00000000000c"
+# The automatic /clear types into a terminal through tmux, which does not run natively on Windows.
+# There save-clear falls back to "type /clear yourself" (see ArmClear), so these paths are skipped.
+NO_TMUX = sys.platform == "win32"
+NO_TMUX_WHY = "automatic /clear needs tmux, which does not run natively on Windows"
 
 
 def iso(offset_s=0):
@@ -46,13 +50,21 @@ class Base(unittest.TestCase):
         self.t = t
 
     def tearDown(self):
+        # Windows cannot delete a folder while a process still uses it: a helper the Stop hook
+        # started in the background may need a moment to exit.
+        for _ in range(50):
+            try:
+                self.tmp.cleanup()
+                return
+            except OSError:
+                time.sleep(0.2)
         self.tmp.cleanup()
 
     def run_py(self, rel, args=(), stdin=None, **env):
         e = dict(self.env)
         e.update({k: str(v) for k, v in env.items()})
         r = subprocess.run([PY, os.path.join(ROOT, rel), *args], input=json.dumps(stdin) if stdin is not None else "",
-                           capture_output=True, text=True, cwd=self.proj, env=e, timeout=60)
+                           capture_output=True, text=True, encoding="utf-8", cwd=self.proj, env=e, timeout=60)
         return r
 
     def snapshot(self, body="# Session test\n## Last topic\nwe were testing\n"):
@@ -277,6 +289,7 @@ class Stop(Base):
         self.assertNotIn('"decision": "block"', r.stdout, r.stdout)
 
 
+@unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
 class ClearFlags(Base):
     """Each session has its own automatic-clear request."""
     def arm_bg(self, sid, job):
@@ -325,7 +338,7 @@ class ArmClear(Base):
             "m.check = lambda *a: (0, 'ok: target runs this session')\n"
             "sys.exit(m.cmd_arm_clear([]))\n")
         e = dict(self.env, CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli", TERM_PROGRAM="iTerm.app")
-        r = subprocess.run([PY, "-c", code, ROOT], capture_output=True, text=True, env=e, cwd=self.proj, timeout=60)
+        r = subprocess.run([PY, "-c", code, ROOT], capture_output=True, text=True, encoding="utf-8", env=e, cwd=self.proj, timeout=60)
         self.assertIn("mode=manual", r.stdout, r.stdout + r.stderr)
         self.assertIn("type /clear", r.stdout)
         self.assertEqual(json.loads(self.run_py("bin/save-clear", ["status"]).stdout)["clear"] or [], [])
@@ -354,6 +367,7 @@ class ArmClear(Base):
         self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
 
 
+@unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
 class BgHelper(Base):
     """`claude --bg` mode of the helper, against a fake tmux and a fake job state file."""
     JOB = "job12345"
