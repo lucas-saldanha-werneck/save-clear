@@ -9,6 +9,9 @@ You do not even have to ask: when the context passes 300k tokens (30% of a 1M wi
 it by itself at the end of the turn. Change the number with `context_cap_tokens`, or set it to `0`
 to turn it off.
 
+Optionally, a session you leave idle for 50 minutes can run it by itself too, before the prompt cache
+expires (see [Idle trigger](#idle-trigger-optional)). That one is off until you schedule it.
+
 ## What Claude sees
 
 After the `/clear`, the plugin's SessionStart hook adds the summary to the new session's context.
@@ -72,6 +75,9 @@ Set them with `/plugin configure save-clear@save-clear`, or with environment var
 | `notify_command` | `SAVE_CLEAR_NOTIFY` | empty (off) | A program called with one line of text when the automatic `/clear` fails, is refused or stops halfway, and when it succeeds in tmux |
 | `publish_link` | `SAVE_CLEAR_PUBLISH_LINK` | `off` | `on`: the skill publishes the summary as a private claude.ai page (when the Artifact tool is available), and the next session shows that link first |
 | `context_cap_tokens` | `SAVE_CLEAR_CAP_TOKENS` | `300000` | When the context passes this many tokens, Claude runs save-clear at the end of the turn. `0` = off. With a 200k window, set it lower (e.g. `150000`), or compaction comes first |
+| `idle_minutes` | `SAVE_CLEAR_IDLE_MINUTES` | `50` | Idle trigger only (after `./install.sh --idle`): minutes a session must be idle before it runs save-clear. `0` = off |
+| `idle_min_tokens` | `SAVE_CLEAR_IDLE_MIN_TOKENS` | `80000` | Idle trigger only: sessions with a smaller context are left alone |
+| (none) | `SAVE_CLEAR_LAUNCHD_PREFIX` | `com.claude-tools` | Idle trigger only: prefix of the launchd job label (`<prefix>.save-clear-idle`) |
 | (none) | `SAVE_CLEAR_STATE_DIR` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/state/save-clear` | Flags, relay inbox and the logs `save-clear.log` and `relay.log` |
 
 ## Optional requirements
@@ -84,6 +90,8 @@ you to type `/clear`, and the summary still comes back by itself.
 - A notifier for `notify_command`, for example a script that sends you a push message.
 - A relay session in the Claude desktop app, so the resume arrives right after the clear instead of
   with your next message. See [Desktop app relay](#desktop-app-relay).
+- A scheduler for the idle trigger: launchd on macOS (`./install.sh --idle` sets it up), cron on
+  Linux (`./install.sh --idle` prints the line). Without it the idle trigger simply never runs.
 - Auto memory: if the project has a `~/.claude/projects/<project>/memory/` folder, Claude updates it
   too. Otherwise that step is skipped.
 
@@ -142,6 +150,63 @@ Two backups run without the skill. Before any compaction, the full transcript is
 an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker. After it, the summary Claude Code wrote is kept as
 `COMPACT-SUMMARY-<timestamp>-<id>.md`.
 
+### Idle trigger (optional)
+
+The idle trigger targets the **1-hour prompt cache**. While a session's context is in that cache,
+coming back to a big session reads it cheaply; once the cache expires, the whole context is written
+to the cache again at full price. It does not check which cache length your account or setup gets:
+if your sessions use the 5-minute cache, the cache is already cold at 50 minutes and the trigger
+only saves you from re-sending a big context, not from a cache write. The idle trigger runs save-clear in a session you left
+idle for `idle_minutes` (default 50), so the next time you come back the session holds a short
+summary instead of the big context.
+
+It is opt-in. Turn it on once, from a clone of this repo or from the installed plugin folder:
+
+```
+./install.sh --idle               # macOS: launchd job, every 2 minutes
+./install.sh --idle --dry-run     # show the job without writing or loading it
+./install.sh --uninstall          # remove it
+```
+
+On Linux the script prints a cron line for you to add; it changes nothing. The job points at the
+folder you ran `install.sh` from, so run it again if that folder moves (a plugin update installs a
+new folder).
+
+Every run, `bin/save-clear-idle` asks `claude agents --json` for interactive, idle sessions and
+types this into a session's tmux pane:
+
+```
+save-clear (automatic: session idle for 52 min, context 120k; saving before the prompt cache expires). Run the save-clear skill now in "save and clear" mode. ...
+```
+
+only when all of these hold:
+
+- nothing in the session changed (transcript, subagents, background task output) for between
+  `idle_minutes` and `idle_minutes` + 8 minutes, and never more than 59. Later than that the cache
+  is gone anyway, so it leaves old sessions alone. With `idle_minutes` 59 or more there is no window
+  and it logs an error and does nothing;
+- the context is at least `idle_min_tokens` (default 80000);
+- the session has not armed its own `/clear`, and did not arm a resume in the last 15 minutes;
+- after an automatic resume, the context grew 40k tokens or more (a freshly resumed session is not
+  saved again every hour);
+- it did not already act during this idle stretch. A stretch ends when the transcript changes, so
+  if the session later sits idle again without having cleared, it asks again. If it pressed Enter
+  and the session wrote nothing at all, it logs `no-response` once and does not type again;
+- the session runs in a tmux pane, that pane runs exactly this session, and the prompt is empty.
+  Right before Enter it checks again that the session is idle and the prompt holds exactly the typed
+  text. If not, it does not press Enter, erases its text if the prompt still holds exactly that, and
+  does not type again during that idle stretch.
+
+Sessions outside tmux (a plain terminal, iTerm2 without tmux, the desktop app, an IDE) are skipped:
+there is no safe way to check for an empty prompt there. Decisions go to `save-clear.log` with the
+tag `[idle]`. See what it would do right now with `bin/save-clear-idle --dry-run`.
+
+Most runs start no process: it looks at transcript times first and asks `claude agents --json` only
+when one is in the window. The job gets the `PATH` and `CLAUDE_CONFIG_DIR` (if set) of the shell you
+ran `install.sh` from; if your sessions use another config folder, set it and run `install.sh` again
+(no transcripts found is logged once). The job's own errors go to `idle-job.log` in the state folder.
+On Linux, `--interval` must be a multiple of 60 seconds, at most 3540 (cron counts in minutes).
+
 ### Desktop app relay
 
 A desktop app session can clear itself but cannot send itself a message, so the resume waits for
@@ -187,11 +252,12 @@ request (`SAVE_CLEAR_RELAY_GRACE`).
 Your summaries stay in the snapshot folder. Claude Code deletes the plugin's data folder on
 uninstall, which is where the state lives by default. If you set `SAVE_CLEAR_STATE_DIR`, or the
 state ended up in `~/.claude/state/save-clear`, delete that folder yourself, plus the pointer file
-`~/.claude/state/save-clear.path`. Archive the relay session if you made one.
+`~/.claude/state/save-clear.path`. Archive the relay session if you made one. If you scheduled the
+idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron line).
 
 ## Limits and what was not tested
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 54 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 70 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
   (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. On Windows, CI runs the unit tests
@@ -204,6 +270,10 @@ state ended up in `~/.claude/state/save-clear`, delete that folder yourself, plu
   change, the helper only skips the resume request. The desktop app session matching relies on the `CLAUDE_CODE_HOST_SESSION_ID` variable,
   which was not checked from inside the app here. IDE sessions were not tested live; matching them
   by process id assumes `/clear` there keeps the same process, as in the terminal.
+- The idle trigger is tested with a fake `claude agents --json`, a fake tmux and transcripts with
+  set modification times, and `install.sh` with a fake HOME and a fake `launchctl`. The real launchd
+  job was not loaded in the tests. On Windows, CI skips the tests that type into tmux and the
+  `install.sh` tests.
 - The app log format was checked against a real macOS log. The Linux and Windows log paths were not.
 - Windows was tested only through the unit tests in CI, not in a real Claude session. The
   automatic `/clear` does not work on Windows, because it needs tmux.

@@ -4,6 +4,7 @@
 Everything runs in temporary folders (SAVE_CLEAR_STATE_DIR, SAVE_CLEAR_SNAPSHOT_DIR); no tmux,
 no real Claude session. Run: python3 tests/test_hooks.py -v
 """
+import ast
 import json
 import os
 import subprocess
@@ -14,6 +15,9 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
+with open(os.path.join(ROOT, "lib", "common.py"), encoding="utf-8") as _f:
+    RESUME_MSG = next(ast.literal_eval(n.value) for n in ast.parse(_f.read()).body  # the text save-clear types
+                      if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "RESUME_MSG")
 SID_A = "aaaaaaaa-0000-0000-0000-00000000000a"
 SID_B = "bbbbbbbb-0000-0000-0000-00000000000b"
 SID_NEW = "cccccccc-0000-0000-0000-00000000000c"
@@ -711,6 +715,370 @@ class ContextCap(Base):
         r = self.run_py("hooks/context_cap.py", stdin=None, CLAUDE_CODE_ENTRYPOINT="cli")
         self.assertEqual((r.returncode, r.stdout), (0, ""))
         self.assertIn("limit 300k", self.cap(400000, SAVE_CLEAR_CAP_TOKENS="abc").stdout, "bad value = default")
+
+
+def read_text(path):
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+class IdleTrigger(Base):
+    """bin/save-clear-idle: a session idle for N minutes gets a save-clear request typed into its tmux pane.
+
+    A fake `claude agents --json` (a .py file), a fake ~/.claude/projects and the fake tmux. Nothing is
+    scheduled: launchd is never touched here (see InstallScript for the installer, with a fake launchctl)."""
+    PANE_PID = 4242
+
+    def setUp(self):
+        super().setUp()
+        self.projects = os.path.join(self.t, "projects")
+        os.makedirs(os.path.join(self.projects, "-tmp-project"))
+        self.agents_file = os.path.join(self.t, "agents.json")
+        fake = os.path.join(self.t, "fake_claude_agents.py")
+        with open(fake, "w") as f:
+            # Records each call; from the 2nd call on it answers FAKE_AGENTS_LATER if that file exists.
+            f.write("import os, sys\n"
+                    "c = os.environ['FAKE_AGENTS'] + '.calls'\n"
+                    "n = (len(open(c).read()) if os.path.exists(c) else 0) + 1\n"
+                    "open(c, 'a').write('x')\n"
+                    "later = os.environ['FAKE_AGENTS'] + '.later'\n"
+                    "src = later if n > 1 and os.path.exists(later) else os.environ['FAKE_AGENTS']\n"
+                    "sys.stdout.write(open(src).read())\n")
+        self.env.update(SAVE_CLEAR_CLAUDE=fake, FAKE_AGENTS=self.agents_file, SAVE_CLEAR_PROJECTS_DIR=self.projects,
+                        SAVE_CLEAR_IDLE_TYPE_DELAY="0", FAKE_TMUX_PANES=f"{self.PANE_PID} %7")
+        self.set_agents()
+
+    def set_agents(self, status="idle", kind="interactive", sid=SID_A, later=False):
+        with open(self.agents_file + (".later" if later else ""), "w") as f:
+            json.dump([{"kind": kind, "pid": self.PANE_PID, "sessionId": sid, "status": status,
+                        "cwd": self.proj, "name": "test"}], f)
+
+    def session(self, tokens=120000, idle_min=55, sid=SID_A, rows=()):
+        p = os.path.join(self.projects, "-tmp-project", sid + ".jsonl")
+        with open(p, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": {"usage": {
+                "input_tokens": 10, "cache_read_input_tokens": tokens - 10, "cache_creation_input_tokens": 0}}}) + "\n")
+        t = time.time() - idle_min * 60
+        os.utime(p, (t, t))
+        return p
+
+    def idle(self, *args, **env):
+        return self.run_py("bin/save-clear-idle", args, **env)
+
+    def agents_calls(self):
+        return len(read_text(self.agents_file + ".calls"))
+
+    def mark(self, sid=SID_A):
+        return json.loads(read_text(os.path.join(self.state, "idle", sid + ".done")))
+
+    def tmux_calls(self):
+        p = os.path.join(self.t, "tmux-calls.jsonl")
+        if not os.path.exists(p):
+            return []
+        with open(p) as f:
+            return [json.loads(ln) for ln in f if ln.strip()]
+
+    def typed(self):
+        return [c for c in self.tmux_calls() if c[:1] == ["send-keys"]]
+
+    def log_text(self):
+        p = os.path.join(self.state, "save-clear.log")
+        return read_text(p)
+
+    def test_zero_turns_it_off(self):
+        self.session()
+        r = self.idle("--dry-run", SAVE_CLEAR_IDLE_MINUTES="0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("off", r.stdout)
+        self.assertEqual(self.typed(), [])
+        r = self.idle(CLAUDE_PLUGIN_OPTION_IDLE_MINUTES="0")
+        self.assertEqual((r.returncode, self.typed()), (0, []))
+
+    def test_too_early_or_too_late_does_nothing(self):
+        self.session(idle_min=20)
+        self.idle()
+        self.session(idle_min=120)
+        self.idle()
+        self.assertEqual(self.typed(), [])
+        self.assertNotIn("sent", self.log_text())
+
+    def test_small_context_is_skipped_once(self):
+        self.session(tokens=30000)
+        r = self.idle("--dry-run")
+        self.assertIn("context below 80000", r.stdout)
+        self.assertEqual(self.typed(), [])
+        self.idle()  # a real run records the decision for this idle stretch
+        self.assertEqual(self.idle("--dry-run").stdout, "", "decided once per idle stretch")
+        self.session(tokens=30000)  # a new idle stretch, with a lower limit
+        self.assertIn("would-type" if not NO_TMUX else "not in a tmux pane",
+                      self.idle("--dry-run", "--min-tokens", "20000").stdout)
+
+    def test_busy_or_non_interactive_sessions_are_ignored(self):
+        self.session()
+        self.set_agents(status="busy")
+        self.idle()
+        self.set_agents(kind="background")
+        self.idle()
+        self.assertEqual(self.typed(), [])
+
+    def test_armed_clear_or_recent_resume_is_skipped(self):
+        self.session()
+        os.makedirs(self.flag_path("clear"), exist_ok=True)
+        with open(self.flag_path(f"clear/{SID_A}.json"), "w") as f:
+            json.dump({"session_id": SID_A}, f)
+        self.assertIn("already armed its /clear", self.idle("--dry-run").stdout)
+        os.unlink(self.flag_path(f"clear/{SID_A}.json"))
+        self.arm(self.snapshot())
+        self.assertIn("armed a resume in the last 15 minutes", self.idle("--dry-run").stdout)
+
+    def test_no_loop_right_after_an_automatic_resume(self):
+        resumed = {"type": "user", "message": {"content": RESUME_MSG}}
+        first = {"type": "assistant", "message": {"usage": {"input_tokens": 100000}}}
+        self.session(tokens=110000, rows=[resumed, first])
+        self.assertIn("little new since the automatic resume", self.idle("--dry-run").stdout)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_types_again_once_the_session_grew_after_a_resume(self):
+        resumed = {"type": "user", "message": {"content": RESUME_MSG}}
+        first = {"type": "assistant", "message": {"usage": {"input_tokens": 100000}}}
+        self.session(tokens=150000, rows=[resumed, first])
+        self.assertIn("would-type", self.idle("--dry-run").stdout, "grew 50k since the resume")
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_resume_text_inside_a_tool_result_is_not_a_resume(self):
+        # A tool result (e.g. reading the save-clear source or log) quotes the resume request: that is
+        # not an automatic resume, so the small growth after it must not block the request.
+        quoted = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "RESUME_MSG = (\"" + RESUME_MSG + "\")"}]}}
+        later = {"type": "user", "message": {"content": "about the line: " + RESUME_MSG}}
+        side = {"type": "user", "isSidechain": True, "message": {"content": RESUME_MSG}}
+        first = {"type": "assistant", "message": {"usage": {"input_tokens": 100000}}}
+        self.session(tokens=110000, rows=[quoted, first, later, first, side, first])
+        r = self.idle("--dry-run")
+        self.assertNotIn("little new since the automatic resume", r.stdout)
+        self.assertIn("would-type", r.stdout)
+
+    def test_session_outside_tmux_is_skipped(self):
+        self.session()
+        r = self.idle("--dry-run", FAKE_TMUX_PANES="")
+        self.assertIn("not in a tmux pane", r.stdout)
+        self.assertEqual(self.typed(), [])
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_dry_run_types_nothing(self):
+        self.session()
+        r = self.idle("--dry-run")
+        self.assertIn('"would-type"', r.stdout)
+        self.assertIn('"target": "%7"', r.stdout)
+        self.assertEqual(self.typed(), [])
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_idle_session_gets_the_request_once(self):
+        self.session(tokens=120000, idle_min=52)
+        r = self.idle()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        typed = self.typed()
+        self.assertEqual(len(typed), 2, typed)
+        self.assertEqual(typed[0][:4], ["send-keys", "-t", "%7", "-l"])
+        self.assertIn("save-clear (automatic: session idle for 52 min, context 120k", typed[0][4])
+        self.assertEqual(typed[1], ["send-keys", "-t", "%7", "Enter"])
+        self.assertIn('"event": "sent"', self.log_text())
+        self.idle()
+        self.assertEqual(len(self.typed()), 2, "no second request in the same idle stretch")
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_acts_again_in_a_later_idle_stretch_within_the_hour(self):
+        p = self.session(idle_min=55)
+        self.idle()
+        self.assertEqual(len(self.typed()), 2)
+        self.assertIn("sent_at", self.mark())
+        # The request landed (transcript changed), the session did not clear, and it sat idle again.
+        self.session(idle_min=51)
+        self.idle()
+        self.assertEqual(len(self.typed()), 4, "a new idle stretch gets a new request")
+        self.assertTrue(os.path.exists(p))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_no_response_is_logged_once_and_not_retyped(self):
+        self.session(idle_min=52)
+        self.idle()
+        m = self.mark()
+        m["sent_at"] -= 300  # five minutes ago, and the transcript still did not change
+        with open(os.path.join(self.state, "idle", SID_A + ".done"), "w") as f:
+            json.dump(m, f)
+        self.idle()
+        self.idle()
+        self.assertEqual(len(self.typed()), 2, "never a second copy in the same stretch")
+        self.assertEqual(self.log_text().count('"no-response"'), 1)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_failed_check_before_enter_erases_the_typed_text(self):
+        self.session()
+        self.set_agents(status="busy", later=True)  # goes busy between typing and Enter
+        r = self.idle("--only", SID_A)
+        self.assertIn("the typed text was erased", r.stdout)
+        typed = self.typed()
+        self.assertEqual(typed[0][3], "-l")
+        self.assertNotIn(["send-keys", "-t", "%7", "Enter"], typed)
+        self.assertEqual(typed[1][:3], ["send-keys", "-t", "%7"])
+        self.assertEqual(set(typed[1][3:]), {"BSpace"})
+        self.assertEqual(read_text(os.path.join(self.t, "draft.txt")), "", "prompt left empty")
+
+    def test_agents_not_asked_when_nothing_is_in_the_window(self):
+        self.session(idle_min=20)
+        self.idle()
+        self.session(idle_min=200)
+        self.idle()
+        self.assertEqual(self.agents_calls(), 0)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_agents_asked_twice_per_send(self):
+        self.session()
+        self.idle()
+        self.assertEqual(len(self.typed()), 2)
+        self.assertEqual(self.agents_calls(), 2, "once to list, once right before Enter")
+
+    def test_window_never_reaches_60_minutes(self):
+        self.session(idle_min=60.5)
+        r = self.idle("--only", SID_A, SAVE_CLEAR_IDLE_MINUTES="55")  # 55 + 8 would reach 63
+        self.assertIn("outside 55-59", r.stdout)
+        self.assertEqual(self.typed(), [])
+        r = self.idle("--only", SID_A, SAVE_CLEAR_IDLE_MINUTES="59")
+        self.assertIn("leaves no window", r.stdout)
+        self.assertEqual((r.returncode, self.typed()), (0, []))
+        self.assertIn("leaves no window", self.idle("--dry-run", "--idle-min", "50", "--max-min", "50").stdout)
+
+    def test_missing_transcripts_are_logged_once(self):
+        r = self.idle()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.idle()
+        self.assertEqual(self.log_text().count("no transcripts under"), 1)
+        self.assertEqual(self.agents_calls(), 0)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_custom_idle_minutes(self):
+        self.session(idle_min=12)
+        self.idle(SAVE_CLEAR_IDLE_MINUTES="10")
+        self.assertEqual(len(self.typed()), 2)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_draft_in_the_prompt_is_never_touched(self):
+        self.session()
+        with open(os.path.join(self.t, "draft.txt"), "w") as f:
+            f.write("half-written idea")
+        r = self.idle("--only", SID_A)
+        self.assertIn("the prompt has a draft", r.stdout)
+        self.assertEqual(self.typed(), [])
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_pane_running_another_session_is_not_typed_into(self):
+        self.session(sid=SID_A)
+        # the pane's process now reports session B, but A's transcript is the idle one
+        with open(self.agents_file, "w") as f:
+            json.dump([{"kind": "interactive", "pid": self.PANE_PID, "sessionId": SID_A, "status": "idle"},
+                       {"kind": "interactive", "pid": self.PANE_PID, "sessionId": SID_B, "status": "idle"}], f)
+        r = self.idle("--only", SID_A)
+        self.assertIn("no single Claude in the pane", r.stdout)
+        self.assertEqual(self.typed(), [])
+
+
+@unittest.skipIf(sys.platform == "win32", "install.sh is a bash script for macOS (launchd) and Linux (cron line)")
+class InstallScript(Base):
+    """install.sh with a fake HOME and a fake launchctl: no real launchd job is ever loaded."""
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(self.t, "home")
+        os.makedirs(self.home)
+        self.calls = os.path.join(self.t, "launchctl-calls")
+        # `print` says "not loaded" unless FAKE_LOADED_PRINTS more answers say "loaded";
+        # `bootstrap` fails FAKE_BOOTSTRAP_FAILS times first.
+        with open(os.path.join(self.fakebin, "launchctl"), "w") as f:
+            f.write(f'''#!/bin/sh
+echo "$@" >> "{self.calls}"
+count() {{ n=$(cat "{self.t}/lc-$1" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "{self.t}/lc-$1"; echo $n; }}
+case "$1" in
+  print) [ "$(count print)" -le "${{FAKE_LOADED_PRINTS:-0}}" ] && exit 0; exit 1 ;;
+  bootstrap) [ "$(count bootstrap)" -le "${{FAKE_BOOTSTRAP_FAILS:-0}}" ] && exit 5; exit 0 ;;
+esac
+exit 0
+''')
+        os.chmod(os.path.join(self.fakebin, "launchctl"), 0o755)
+
+    def install(self, *args, os_name="Darwin", **env):
+        e = dict(self.env, HOME=self.home, SAVE_CLEAR_INSTALL_OS=os_name)
+        e.update(env)
+        return subprocess.run(["bash", os.path.join(ROOT, "install.sh"), *args], capture_output=True, text=True,
+                              env=e, timeout=60)
+
+    def launchctl(self):
+        return read_text(self.calls)
+
+    def test_dry_run_changes_nothing(self):
+        r = self.install("--idle", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("<string>com.claude-tools.save-clear-idle</string>", r.stdout)
+        self.assertIn(os.path.join(ROOT, "bin", "save-clear-idle"), r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "Library")))
+        self.assertEqual(self.launchctl(), "")
+
+    def test_install_and_uninstall_with_custom_prefix(self):
+        r = self.install("--idle", "--interval", "300", SAVE_CLEAR_LAUNCHD_PREFIX="org.example")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        plist = os.path.join(self.home, "Library", "LaunchAgents", "org.example.save-clear-idle.plist")
+        body = read_text(plist)
+        self.assertIn("<integer>300</integer>", body)
+        self.assertIn("bootstrap gui/", self.launchctl())
+        if sys.platform == "darwin":
+            self.assertEqual(subprocess.run(["plutil", "-lint", plist], capture_output=True).returncode, 0)
+        r = self.install("--uninstall", SAVE_CLEAR_LAUNCHD_PREFIX="org.example")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(plist))
+        self.assertIn("bootout gui/", self.launchctl())
+
+    def test_waits_for_bootout_and_retries_bootstrap(self):
+        r = self.install("--idle", FAKE_LOADED_PRINTS="2", FAKE_BOOTSTRAP_FAILS="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.launchctl().splitlines()
+        self.assertEqual([c.split()[0] for c in calls],
+                         ["bootout", "print", "print", "print", "bootstrap", "bootstrap"])
+        r = self.install("--idle", FAKE_BOOTSTRAP_FAILS="9")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("bootstrap failed", r.stderr)
+
+    def test_job_gets_config_dir_and_an_error_log(self):
+        cfg = os.path.join(self.t, "alt claude")
+        r = self.install("--idle", "--dry-run", CLAUDE_CONFIG_DIR=cfg)
+        self.assertIn(f"<key>CLAUDE_CONFIG_DIR</key><string>{cfg}</string>", r.stdout)
+        self.assertIn(f"<key>StandardErrorPath</key><string>{os.path.join(self.state, 'idle-job.log')}</string>",
+                      r.stdout)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", self.install("--idle", "--dry-run").stdout)
+        r = self.install("--idle", os_name="Linux", CLAUDE_CONFIG_DIR=cfg)
+        self.assertIn(f"CLAUDE_CONFIG_DIR={cfg} ", r.stdout)
+        self.assertIn("2>>" + os.path.join(self.state, "idle-job.log"), r.stdout)
+
+    def test_linux_rejects_intervals_cron_cannot_express(self):
+        for bad in ("90", "3600", "7200"):
+            r = self.install("--idle", "--interval", bad, os_name="Linux")
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn("multiple of 60", r.stderr)
+        self.assertIn("*/5 * * * *", self.install("--idle", "--interval", "300", os_name="Linux").stdout)
+
+    def test_linux_only_prints_a_cron_line(self):
+        r = self.install("--idle", os_name="Linux")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("crontab -e", r.stdout)
+        self.assertIn("*/2 * * * *", r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "Library")))
+        self.assertEqual(self.launchctl(), "")
+
+    def test_bad_arguments(self):
+        self.assertEqual(self.install().returncode, 2)
+        self.assertEqual(self.install("--idle", "--interval", "5").returncode, 2)
+        self.assertEqual(self.install("--bogus").returncode, 2)
 
 
 if __name__ == "__main__":

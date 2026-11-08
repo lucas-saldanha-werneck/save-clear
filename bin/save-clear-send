@@ -25,15 +25,15 @@ Test knobs: SAVE_CLEAR_STATE_DIR, SAVE_CLEAR_CLAUDE (a fake `claude`), SAVE_CLEA
 """
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import (BIN, MARGIN_MS, RESUME_MSG, claude_bin, clear_key, log as _log, notify, now_ms,  # noqa: E402
-                    short, tmux_bin, user_messages_since, write_clear)
+from common import (BIN, MARGIN_MS, RESUME_MSG, ancestors, claude_bin, clear_key, draft_why,  # noqa: E402
+                    log as _log, notify, now_ms, prompt_block, prompt_text, ps_parents, short, squash, tmux_bin,
+                    user_messages_since, write_clear)
 
 CLAUDE = claude_bin()
 TMUX = tmux_bin() or "tmux"
@@ -58,27 +58,6 @@ def sh(cmd, timeout=20):
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
     except Exception:
         return ""
-
-
-def ps_parents():
-    par = {}
-    for ln in sh(["ps", "-A", "-o", "pid=,ppid="]).splitlines():
-        try:
-            a, b = ln.split()
-            par[int(a)] = int(b)
-        except ValueError:
-            pass
-    return par
-
-
-def ancestors(pid, par):
-    out = []
-    for _ in range(30):
-        out.append(pid)
-        pid = par.get(pid, 0)
-        if pid in (0, 1):
-            break
-    return out
 
 
 def pane_pid():
@@ -346,44 +325,6 @@ def screen(t=None):
     return sh([TMUX, "capture-pane", "-p", "-e", "-t", t or target])
 
 
-DIM = re.compile(r"\x1b\[2m.*?(\x1b\[(0|22)m|$)")
-ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-
-
-def prompt_text(text):
-    """Text typed after the ❯ prompt (without the dim hint); None if there is no prompt."""
-    for ln in reversed(text.splitlines()):
-        if "❯" in ln:
-            return ANSI.sub("", DIM.sub("", ln.split("❯", 1)[1])).replace(" ", " ").strip().strip("│").strip()
-    return None
-
-
-BORDER = re.compile(r"^[\s\u2500-\u257f]*$")  # box-drawing lines around the prompt
-
-
-def clean(line):
-    return ANSI.sub("", DIM.sub("", line)).replace("\u00a0", " ")
-
-
-def prompt_block(text):
-    """Everything after the ❯ prompt, wrapped lines included; None if there is no prompt."""
-    lines = text.splitlines()
-    for i in range(len(lines) - 1, -1, -1):
-        if "❯" in lines[i]:
-            parts = [clean(lines[i].split("❯", 1)[1])]
-            for ln in lines[i + 1:]:
-                c = clean(ln)
-                if not c.strip() or BORDER.match(c):
-                    break
-                parts.append(c)
-            return " ".join(p.strip().strip("│").strip() for p in parts).strip()
-    return None
-
-
-def squash(t):
-    return "".join((t or "").split())
-
-
 def ready_for_enter(text):
     """Right before Enter: same session and pid, idle, and the prompt holds exactly `text`."""
     ag, why = ours()
@@ -432,9 +373,7 @@ def free():
     if p is None:
         return False, "no-prompt"
     if p:
-        if "\x1b" not in s:
-            return False, "draft (screen has no colors: may be only the hint; check NO_COLOR in tmux)"
-        return False, "draft"
+        return False, draft_why(s)
     return True, ""
 
 
