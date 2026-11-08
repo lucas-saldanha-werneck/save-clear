@@ -12,6 +12,11 @@ to turn it off.
 Optionally, a session you leave idle for 50 minutes can run it by itself too, before the prompt cache
 expires (see [Idle trigger](#idle-trigger-optional)). That one is off until you schedule it.
 
+Optionally, the summary is also published as a private claude.ai page, and the next session's first
+line is its link: `Previous conversation: https://claude.ai/artifact/...`. The old conversation stays
+one tap away, which helps on the phone, where the chat is wiped by the `/clear`. Turn it on with
+`publish_link` (needs the Artifact tool).
+
 ## What Claude sees
 
 After the `/clear`, the plugin's SessionStart hook adds the summary to the new session's context.
