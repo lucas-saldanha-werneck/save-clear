@@ -164,6 +164,8 @@ def cmd_rearm(args):
         return 1
     flag["ts"] = flag["armed_at"] = now_ms()
     flag["deltas"] = flag.get("deltas", 0) + 1
+    # This round was the user's message, which is what kept the session busy: not a leftover task.
+    flag.pop("busy_rearm", None)
     flag["key"] = flag.get("key") or (clear_key(job=job) if job and flag.get("mode") == "bg" else clear_key(sid))
     write_clear(flag)
     print(f"re-armed (round {flag['deltas']} after the save)")

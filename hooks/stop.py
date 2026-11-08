@@ -125,22 +125,17 @@ def main():
         flag["bg_asked"] = True
         try:
             write_json(FLAG["path"], flag)
-            asked = True
         except OSError as e:  # cannot remember that we asked: do not risk asking every turn
             log("stop", f"could not mark the background-task request, clearing without it: {e!r}")
-            asked = False
-    else:
-        asked = False
-    if asked:
-        snap = my_snapshot(hook) or "(the one you wrote)"
-        log("stop", "asked Claude to stop leftover background tasks before the /clear")
-        print(json.dumps({
-            "decision": "block",
-            "reason": ("save-clear: the automatic /clear waited, but the session stayed busy. "
-                       + stop_tasks_instruction("Now,").replace("to the snapshot", f"to the snapshot {snap}", 1)
-                       + " End the turn with one short line; the /clear follows."),
-        }))
-        return
+        else:
+            log("stop", "asked Claude to stop leftover background tasks before the /clear")
+            print(json.dumps({
+                "decision": "block",
+                "reason": ("save-clear: the automatic /clear waited, but the session stayed busy. "
+                           + stop_tasks_instruction("Now,", my_snapshot(hook) or "(the one you wrote)")
+                           + " End the turn with one short line; the /clear follows."),
+            }))
+            return
 
     drop_flag()  # consumed: fires at most once; the helper re-arms when needed
     if job and flag.get("mode") != "bg":

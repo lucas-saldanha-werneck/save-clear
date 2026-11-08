@@ -454,7 +454,7 @@ def run_tmux():
             log(f"waiting: {why}")
             last = why
         if time.time() - t0 > MAX_WAIT:
-            rearm(f"waited {MAX_WAIT}s and it stayed {why}", busy=why == "busy")
+            rearm(f"waited {MAX_WAIT}s and it stayed {why}")
             return 0
         time.sleep(2)
     log(f"target checked: pane {target} runs session {short(EXPECT['sid'])} (pid {EXPECT['pid']})")

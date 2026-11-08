@@ -1310,7 +1310,6 @@ class UserConfig(Base):
         self.assertEqual(self.hook_calls(), [])
 
 
-EXAMPLE = os.path.join(ROOT, "config.example.json")
 class KillBackgroundTasks(Base):
     """kill_background_tasks: off (default) changes nothing; on asks Claude to stop this session's tasks."""
     LINE = "kill_background_tasks: on"
@@ -1432,6 +1431,34 @@ class KillBackgroundTasks(Base):
         self.assertIn("one more thing", reason)
         self.assertNotIn("TaskStop", reason)
 
+    def test_message_rearm_drops_the_busy_marker(self):
+        # The helper saw "busy" because the user typed after the save; Claude answers and re-arms.
+        self.write_flag(busy_rearm=True)
+        self.assertEqual(self.run_py("bin/save-clear", ["rearm", SID_A]).returncode, 0)
+        with open(self.flag_path(f"clear/{SID_A}.json")) as f:
+            self.assertNotIn("busy_rearm", json.load(f))
+        r = self.stop(SAVE_CLEAR_KILL_BACKGROUND_TASKS="on")
+        self.assertNotIn('"decision": "block"', r.stdout, "no request to stop tasks after a message round")
+
+    def test_stop_hook_names_this_sessions_snapshot(self):
+        snap = self.snapshot()
+        self.arm(snap)
+        self.write_flag(busy_rearm=True)
+        reason = json.loads(self.stop(SAVE_CLEAR_KILL_BACKGROUND_TASKS="on").stdout)["reason"]
+        self.assertIn(f"Then add to the snapshot {snap} a section", reason)
+
+    def test_resume_ignores_a_none_section_and_accepts_a_suffix(self):
+        cases = {"## Stopped background tasks\nnone\n": False,
+                 "## Stopped background tasks\n- None.\n\n## Next\nx\n": False,
+                 "## Stopped background tasks (none)\n": False,
+                 "## Stopped background tasks\n": False,
+                 "## Stopped background tasks (2)\n- b1x2: tail -f app.log\n": True,
+                 "## Stopped background tasks:\n- b1x2: tail -f app.log (restart)\n## Next\n": True}
+        for body, named in cases.items():
+            self.arm(self.snapshot("# Session\n## Last topic\nx\n" + body))
+            ctx = json.loads(self.start(CLAUDE_PID=4242).stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertEqual("stopped background tasks before the /clear" in ctx, named, body)
+
     def test_resume_names_the_stopped_tasks_only_if_listed(self):
         plain = self.snapshot()
         self.arm(plain)
@@ -1444,6 +1471,7 @@ class KillBackgroundTasks(Base):
         self.assertIn("tail -f app.log", ctx)
 
 
+EXAMPLE = os.path.join(ROOT, "config.example.json")
 SETTINGS_DUMP = """
 import json, sys
 sys.path.insert(0, {lib!r})

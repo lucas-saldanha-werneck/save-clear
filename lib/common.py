@@ -294,15 +294,17 @@ def kill_background_tasks():
 STOPPED_SECTION = "## Stopped background tasks"
 
 
-def stop_tasks_instruction(when):
+def stop_tasks_instruction(when, snapshot=""):
     """What Claude is told to do when kill_background_tasks is on. Only Claude can stop its own
     background tasks (TaskStop); a hook cannot tell them apart from other processes, so it never kills."""
     return (f"kill_background_tasks: on. {when} stop every background task THIS session started that is still "
             "running (Bash commands run with run_in_background, Monitor watches): use the TaskStop tool "
             "(KillShell in older versions) with each task id. Never stop anything this session did not start "
-            "(other sessions, the user's own programs, servers it did not launch). Then add to the snapshot a "
-            f"section \"{STOPPED_SECTION}\" with one line per task (id, what it was doing, whether it must be "
-            "started again), or \"none\" if nothing was running.")
+            "(other sessions, the user's own programs, servers it did not launch). Then add to the snapshot "
+            + (f"{snapshot} " if snapshot else "") + "a "
+            f"section \"{STOPPED_SECTION}\" (this heading in English, exactly, whatever the snapshot's language) "
+            "with one line per task (id, what it was doing, whether it must be started again), or \"none\" if "
+            "nothing was running.")
 
 
 def claude_bin():

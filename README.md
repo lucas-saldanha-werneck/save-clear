@@ -214,9 +214,13 @@ keep the session busy, so the helper never sees it idle and only re-arms the `/c
   tells Claude to stop the tasks this session started that are still running, with the TaskStop tool,
   and to list them under `## Stopped background tasks` in the summary (or "none").
 - If the helper still finds the session busy and re-arms, the next Stop hook blocks once and asks
-  Claude for the same thing; the stop after that goes ahead with the `/clear`.
+  Claude for the same thing; the stop after that goes ahead with the `/clear`. That second chance
+  needs a later end of turn: if a task keeps the session busy while no turn runs at all, no Stop hook
+  comes, so the first step (before the clear is armed) is the one that counts. A re-arm caused by
+  your own message after the save does not count as busy.
 - After the `/clear`, the resume tells the new session to name the stopped tasks and say which ones
-  need to be started again.
+  need to be started again (not when the section only says "none"). The heading stays in English,
+  even with `language` set, because the resume looks for it.
 
 The plugin itself never kills a process. Hooks and the helper cannot tell this session's background
 tasks apart from other processes (MCP servers, other sessions, your own programs), and only Claude
@@ -335,7 +339,7 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
 
 ## Limits and what was not tested
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 118 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 121 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
   (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. On Windows, CI runs the unit tests

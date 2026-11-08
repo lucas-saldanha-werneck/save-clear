@@ -37,7 +37,8 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    steps for this ritual: follow them, at the point they name (no point named = before step 6). If it
    prints a line starting with `kill_background_tasks: on` and this is save-and-clear mode, do what that
    line says now: stop the background tasks THIS session started that are still running (TaskStop with
-   each task id) and list them under `## Stopped background tasks` in the snapshot. Never stop anything
+   each task id) and list them under `## Stopped background tasks` in the snapshot (that heading stays in
+   English, exactly, even when the snapshot is in another language: the resume looks for it). Never stop anything
    this session did not start. That option off (no such line) = leave background tasks alone.
    Write `<folder>/SESSION-SUMMARY-<YYYYMMDD-HHMMSS>-<short-slug>.md`:
 
