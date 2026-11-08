@@ -1332,6 +1332,11 @@ class SeedConfig(Base):
         self.assertEqual(read_bytes(os.path.join(self.home, ".config", "save-clear", "config.json")),
                          read_bytes(EXAMPLE))
 
+    def test_relative_path_is_not_seeded_into_the_project(self):
+        r = self.start(source="startup", SAVE_CLEAR_CONFIG="rel-config.json")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(os.listdir(self.proj), [])
+
     def test_unwritable_place_never_breaks_the_session(self):
         blocker = os.path.join(self.t, "a-file")
         with open(blocker, "w") as f:

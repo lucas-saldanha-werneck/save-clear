@@ -120,7 +120,7 @@ def seed_user_config():
     """Create USER_CONFIG from config.example.json if it does not exist yet. Never overwrites or
     changes an existing file (O_EXCL), never raises, prints nothing. True if it created the file."""
     try:
-        if os.path.lexists(USER_CONFIG):
+        if not os.path.isabs(USER_CONFIG) or os.path.lexists(USER_CONFIG):  # relative = the project folder
             return False
         with open(EXAMPLE_CONFIG, "rb") as f:
             data = f.read()
