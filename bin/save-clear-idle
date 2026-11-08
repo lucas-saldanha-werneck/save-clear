@@ -49,7 +49,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (HOME, RESUME_MSG, STATE, ancestors, claude_bin, clear_key, clear_path,  # noqa: E402
+from common import (HOME, RESUME_MSG, STATE, resume_msg, is_resume_text, ancestors, claude_bin, clear_key, clear_path,  # noqa: E402
                     draft_why, log as _log, now_ms, prompt_block, ps_parents, setting, short, squash, tail_lines,
                     tmux_bin)
 
@@ -164,10 +164,13 @@ def last_context(tp):
     return 0
 
 
-def is_resume_request(line):
+def is_resume_request(line, custom):
     """A top-level user message whose text is the resume request save-clear types (not a tool result
-    or a file that merely quotes it)."""
-    if RESUME_MSG[:20] not in line:
+    or a file that merely quotes it). `custom` = resume_msg(), worked out once by the caller."""
+    # quick filter on the raw line, in its JSON-escaped form (quotes and backslashes are escaped there;
+    # non-ASCII text may be \u-escaped, so only ASCII probes filter)
+    probe = json.dumps(custom[:20], ensure_ascii=False)[1:-1]
+    if RESUME_MSG[:20] not in line and probe.isascii() and probe not in line:
         return False
     try:
         d = json.loads(line)
@@ -177,14 +180,15 @@ def is_resume_request(line):
         return False
     msg = d.get("message")
     content = msg.get("content") if isinstance(msg, dict) else None
-    return isinstance(content, str) and content.lstrip().startswith(RESUME_MSG)
+    return isinstance(content, str) and (content.lstrip().startswith(RESUME_MSG) or is_resume_text(content, custom))
 
 
 def resume_baseline(tp):
     """Context size right after the last automatic resume, or None if there was none."""
     base, seen = None, False
+    custom = resume_msg()
     for line in tail_lines(tp, 8 * 1024 * 1024):
-        if is_resume_request(line):
+        if is_resume_request(line, custom):
             seen, base = True, None
             continue
         if seen and base is None and '"usage"' in line:

@@ -8,7 +8,7 @@ own entry. A global flag would hand the summary to whichever session starts firs
 import os
 import re
 
-from common import RESUME_FLAG, RESUME_LOCK, ensure_state, locked, log, now_ms, read_json, write_json
+from common import RESUME_FLAG, RESUME_LOCK, ensure_state, language, locked, log, now_ms, read_json, write_json
 
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
 
@@ -165,7 +165,7 @@ def _take(hook, env, now):
 URL_RE = re.compile(r"^summary_url:\s*(https://\S+)\s*$", re.M)
 
 
-def resume_text(snapshot_path):
+def resume_text(snapshot_path, extra=""):
     try:
         with open(snapshot_path, encoding="utf8") as f:
             summary = f.read()
@@ -177,9 +177,14 @@ def resume_text(snapshot_path):
     if url:
         lines += [f'FIRST LINE of your first reply, exactly: "Previous conversation: {url.group(1)}" '
                   "(the /clear wiped the screen; the user can read the old conversation there).", ""]
+    lang = language()
+    if lang:
+        lines += [f"Write your replies in {lang}.", ""]
     lines += ["ORDER: write the summary as a TEXT message before asking any question. A question first "
-              "ends the turn and the user never sees the summary.", "",
-              summary, "", "---",
+              "ends the turn and the user never sees the summary.", ""]
+    if extra:
+        lines += ["## From your on_resume_command (do this first)", "", extra, ""]
+    lines += [summary, "", "---",
               "Continue from the point above. If the user brings a completely new topic, ignore this "
               "context and do what they ask."]
     return "\n".join(lines)

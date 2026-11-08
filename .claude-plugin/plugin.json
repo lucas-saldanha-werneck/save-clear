@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "End-of-session ritual: Claude saves memory and a verified session summary, clears the context by itself, and the next session starts from the summary.",
   "author": {
     "name": "Lucas Saldanha Werneck",
@@ -59,6 +59,42 @@
       "type": "string",
       "title": "Idle trigger: smallest context worth saving (tokens)",
       "description": "The idle trigger skips sessions with a smaller context. Empty = 80000.",
+      "default": ""
+    },
+    "language": {
+      "type": "string",
+      "title": "Language (optional)",
+      "description": "Language for the snapshot and the reply after the resume, e.g. Portuguese. Empty = the conversation's language.",
+      "default": ""
+    },
+    "resume_message": {
+      "type": "string",
+      "title": "Resume request text (optional)",
+      "description": "What is typed (terminal) or sent by the relay (desktop app) right after the /clear. Empty = the built-in English request.",
+      "default": ""
+    },
+    "extra_steps": {
+      "type": "string",
+      "title": "Extra steps for the ritual (optional)",
+      "description": "Your own instructions the skill follows during the save (text, or the path of a file that holds them). Example: call a tool before clear_session.",
+      "default": ""
+    },
+    "on_save_command": {
+      "type": "string",
+      "title": "Command run at save time (optional)",
+      "description": "Runs when the skill arms the resume, with SAVE_CLEAR_SNAPSHOT set. What it prints is appended to the snapshot.",
+      "default": ""
+    },
+    "pre_clear_command": {
+      "type": "string",
+      "title": "Command run right before /clear (optional)",
+      "description": "Runs just before the automatic /clear (terminal) or clear_session (desktop app). Gets SAVE_CLEAR_SESSION_ID, SAVE_CLEAR_MODE, SAVE_CLEAR_TARGET. Never stops the clear.",
+      "default": ""
+    },
+    "on_resume_command": {
+      "type": "string",
+      "title": "Command run on resume (optional)",
+      "description": "Runs after the /clear, when the summary is delivered, with SAVE_CLEAR_SNAPSHOT set. What it prints (exit 0) is added to the new session's context.",
       "default": ""
     }
   }
