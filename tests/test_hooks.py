@@ -1258,5 +1258,123 @@ class UserConfig(Base):
         self.assertEqual(self.hook_calls(), [])
 
 
+EXAMPLE = os.path.join(ROOT, "config.example.json")
+SETTINGS_DUMP = """
+import json, sys
+sys.path.insert(0, {lib!r})
+import common as c
+print(json.dumps({{"settings": {{n: c.setting(n) for n in c.OPTIONS}}, "snapshot_dir": c.snapshot_dir(),
+    "publish_link": c.publish_link(), "language": c.language(), "extra_steps": c.extra_steps(),
+    "resume_msg": c.resume_msg()}}, sort_keys=True))
+"""
+
+
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+class SeedConfig(Base):
+    """The plugin creates ~/.config/save-clear/config.json by itself on first run (install runs no hook)."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.env["SAVE_CLEAR_CONFIG"]
+        self.home = os.path.join(self.t, "home")
+        os.makedirs(self.home)
+
+    def dump(self, **env):
+        r = subprocess.run([PY, "-c", SETTINGS_DUMP.format(lib=os.path.join(ROOT, "lib"))], capture_output=True,
+                           text=True, encoding="utf-8", env=dict(self.env, **env), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_example_lists_every_option_at_the_plugin_default(self):
+        with open(EXAMPLE, encoding="utf-8") as f:
+            example = json.load(f)
+        with open(os.path.join(ROOT, ".claude-plugin", "plugin.json"), encoding="utf-8") as f:
+            user_config = json.load(f)["userConfig"]
+        keys = {k for k in example if not k.startswith("_")}
+        self.assertEqual(keys, set(user_config), "one key per plugin option")
+        self.assertEqual(set(example["_doc"]) - {"about"}, keys, "a short doc line per option")
+        self.assertEqual({k: example[k] for k in keys}, {k: v["default"] for k, v in user_config.items()})
+
+    def test_missing_file_is_created_by_session_start_with_defaults(self):
+        nested = os.path.join(self.t, "new", "dir", "config.json")
+        self.env["SAVE_CLEAR_CONFIG"] = nested
+        r = self.start(source="startup")
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), "silent")
+        self.assertEqual(read_bytes(nested), read_bytes(EXAMPLE))
+
+    def test_missing_file_is_created_by_the_command_too(self):
+        r = self.run_py("bin/save-clear", ["status"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read_bytes(self.cfg), read_bytes(EXAMPLE))
+
+    def test_existing_file_is_never_touched(self):
+        for body in (b'{"language": "Portuguese"}', b"{not json", b""):
+            with open(self.cfg, "wb") as f:
+                f.write(body)
+            before = os.stat(self.cfg).st_mtime_ns
+            self.start(source="startup")
+            self.run_py("bin/save-clear", ["dir"])
+            self.assertEqual(read_bytes(self.cfg), body)
+            self.assertEqual(os.stat(self.cfg).st_mtime_ns, before)
+
+    def test_xdg_and_home_are_respected(self):
+        self.env.pop("SAVE_CLEAR_CONFIG")
+        xdg = os.path.join(self.t, "xdg")
+        self.start(source="startup", HOME=self.home, USERPROFILE=self.home, XDG_CONFIG_HOME=xdg)
+        self.assertEqual(read_bytes(os.path.join(xdg, "save-clear", "config.json")), read_bytes(EXAMPLE))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config")), "XDG_CONFIG_HOME wins over ~/.config")
+        self.start(source="startup", HOME=self.home, USERPROFILE=self.home)
+        self.assertEqual(read_bytes(os.path.join(self.home, ".config", "save-clear", "config.json")),
+                         read_bytes(EXAMPLE))
+
+    def test_unwritable_place_never_breaks_the_session(self):
+        blocker = os.path.join(self.t, "a-file")
+        with open(blocker, "w") as f:
+            f.write("x")
+        self.env["SAVE_CLEAR_CONFIG"] = os.path.join(blocker, "sub", "config.json")  # parent is a file
+        self.arm(self.snapshot())
+        r = self.start(CLAUDE_PID=4242)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("we were testing", json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.run_py("bin/save-clear", ["dir"]).returncode, 0)
+        if os.name != "nt" and os.geteuid() != 0:  # a read-only folder (root and Windows ignore the mode)
+            ro = os.path.join(self.t, "ro")
+            os.makedirs(ro)
+            os.chmod(ro, 0o500)
+            try:
+                r = self.start(source="startup", SAVE_CLEAR_CONFIG=os.path.join(ro, "config.json"))
+                self.assertEqual((r.returncode, r.stderr), (0, ""))
+                self.assertEqual(os.listdir(ro), [])
+            finally:
+                os.chmod(ro, 0o700)
+
+    def test_seeded_file_behaves_like_no_file(self):
+        env = dict(HOME=self.home, USERPROFILE=self.home)
+        self.env.pop("SAVE_CLEAR_SNAPSHOT_DIR")
+        without = self.dump(**env)
+        self.assertFalse(os.path.exists(self.cfg))
+        self.start(source="startup", **env)
+        self.assertEqual(read_bytes(self.cfg), read_bytes(EXAMPLE))
+        seeded = self.dump(**env)
+        # publish_link is the only non-empty default ("off"); only publish_link() ever reads it
+        self.assertEqual((seeded["settings"].pop("publish_link"), without["settings"].pop("publish_link")), ("off", ""))
+        self.assertEqual(seeded, without)
+        # plugin options (/config) and env vars still win over the seeded defaults
+        on = self.dump(CLAUDE_PLUGIN_OPTION_PUBLISH_LINK="on", CLAUDE_PLUGIN_OPTION_LANGUAGE="German", **env)
+        self.assertEqual((on["publish_link"], on["language"]), (True, "German"))
+        self.assertTrue(self.dump(SAVE_CLEAR_PUBLISH_LINK="on", **env)["publish_link"])
+        # the hooks that read numeric options: same result with and without the file
+        for script in ("hooks/context_cap.py",):
+            hook = {"session_id": SID_A, "transcript_path": os.path.join(self.proj, "none.jsonl")}
+            a = self.run_py(script, stdin=hook, **env)
+            os.remove(self.cfg)
+            b = self.run_py(script, stdin=hook, SAVE_CLEAR_CONFIG="/nonexistent/x.json", **env)
+            self.assertEqual((a.returncode, a.stdout), (b.returncode, b.stdout))
+
+
 if __name__ == "__main__":
     unittest.main()

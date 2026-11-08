@@ -11,6 +11,8 @@ Files (all under the state folder: $SAVE_CLEAR_STATE_DIR, else $CLAUDE_PLUGIN_DA
 
 Your own settings can also live in ~/.config/save-clear/config.json ($SAVE_CLEAR_CONFIG), outside the
 plugin folder, so they survive updates. Precedence: plugin option > env var > that file.
+The SessionStart hook (and the save-clear command) create that file from config.example.json the first
+time, with every option at its default; an existing file is never overwritten.
 """
 import calendar
 import contextlib
@@ -110,6 +112,32 @@ OPTIONS = {
 # Same keys as the plugin options. Lowest precedence (plugin option and env var win).
 USER_CONFIG = os.path.expanduser(os.environ.get("SAVE_CLEAR_CONFIG") or os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "save-clear", "config.json"))
+# Starter copied to USER_CONFIG on first run: every option at its default (same behavior as no file).
+EXAMPLE_CONFIG = os.path.join(ROOT, "config.example.json")
+
+
+def seed_user_config():
+    """Create USER_CONFIG from config.example.json if it does not exist yet. Never overwrites or
+    changes an existing file (O_EXCL), never raises, prints nothing. True if it created the file."""
+    try:
+        if os.path.lexists(USER_CONFIG):
+            return False
+        with open(EXAMPLE_CONFIG, "rb") as f:
+            data = f.read()
+        os.makedirs(os.path.dirname(USER_CONFIG) or ".", exist_ok=True)
+        fd = os.open(USER_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    except Exception:
+        return False
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        try:  # only the half-written file this call just created
+            os.remove(USER_CONFIG)
+        except Exception:
+            pass
+        return False
 
 RESUME_MSG = ("save-clear: resuming. Start with the LAST topic (where we stopped and what is still open); "
               "then, in one short paragraph, the rest that was saved and the next steps.")

@@ -85,6 +85,15 @@ update replaces only the plugin's code. Precedence: plugin option, then environm
 the config file. Keep your personal behavior in small scripts next to that file instead of editing
 the plugin.
 
+### Your settings
+
+Your file is `~/.config/save-clear/config.json` (or the `$XDG_CONFIG_HOME` / `SAVE_CLEAR_CONFIG`
+path above; on Windows `~` is `%USERPROFILE%`). You don't have to create it: the plugin writes it
+the first time a session starts (or the first time the skill runs), from
+[`config.example.json`](config.example.json), with every option at its default and a one-line note
+per option under `_doc`. That file behaves exactly like having no file. Plugin updates never touch
+it, and an existing file is never overwritten, so edit it freely.
+
 | Option | Environment variable | Default | What it does |
 |---|---|---|---|
 | `snapshot_dir` | `SAVE_CLEAR_SNAPSHOT_DIR` | `~/.claude/snapshots` | Where summaries and the compaction backups go |
