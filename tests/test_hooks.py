@@ -1323,6 +1323,7 @@ class SeedConfig(Base):
 
     def test_xdg_and_home_are_respected(self):
         self.env.pop("SAVE_CLEAR_CONFIG")
+        self.env.pop("XDG_CONFIG_HOME", None)  # some CI runners set it
         xdg = os.path.join(self.t, "xdg")
         self.start(source="startup", HOME=self.home, USERPROFILE=self.home, XDG_CONFIG_HOME=xdg)
         self.assertEqual(read_bytes(os.path.join(xdg, "save-clear", "config.json")), read_bytes(EXAMPLE))
