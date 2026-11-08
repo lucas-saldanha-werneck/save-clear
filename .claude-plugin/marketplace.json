@@ -1,0 +1,15 @@
+{
+  "name": "save-clear",
+  "description": "Save the session, clear the context by itself, resume from the summary.",
+  "owner": {
+    "name": "Lucas Saldanha Werneck",
+    "url": "https://github.com/lucas-saldanha-werneck"
+  },
+  "plugins": [
+    {
+      "name": "save-clear",
+      "source": "./",
+      "description": "End-of-session ritual: Claude saves memory and a verified session summary, clears the context by itself, and the next session starts from the summary."
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "name": "save-clear",
+  "version": "0.1.0",
+  "description": "End-of-session ritual: Claude saves memory and a verified session summary, clears the context by itself, and the next session starts from the summary.",
+  "author": {
+    "name": "Lucas Saldanha Werneck",
+    "url": "https://github.com/lucas-saldanha-werneck"
+  },
+  "homepage": "https://github.com/lucas-saldanha-werneck/save-clear",
+  "repository": "https://github.com/lucas-saldanha-werneck/save-clear",
+  "license": "MIT",
+  "keywords": ["context", "clear", "checkpoint", "session", "summary", "resume", "hooks", "tmux"],
+  "userConfig": {
+    "snapshot_dir": {
+      "type": "string",
+      "title": "Snapshot folder",
+      "description": "Where session summaries and compaction safety nets are written. Empty = ~/.claude/snapshots",
+      "default": ""
+    },
+    "notify_command": {
+      "type": "string",
+      "title": "Notify command (optional)",
+      "description": "Program called with one line of text when the automatic /clear succeeds, fails or is refused (e.g. a script that sends you a push message). Empty = no notifications.",
+      "default": ""
+    },
+    "publish_link": {
+      "type": "string",
+      "title": "Publish the summary as a link (optional)",
+      "description": "on: when the Artifact tool is available, the skill publishes the summary as a private claude.ai page and the next session shows the link first. Useful from a phone, where /clear wipes the screen.",
+      "options": ["off", "on"],
+      "default": "off"
+    }
+  }
+}

@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""save-clear: types /clear (and then the resume request) into the terminal running THIS session.
+
+Started detached by the Stop hook. Modes:
+  tmux  <pane>       the session runs in a tmux pane (needs tmux)
+  iterm <dev/tty>    the session runs in an iTerm2 tab on macOS (needs iTerm2 + osascript)
+  bg    <job id>     a `claude --bg` background session (needs tmux: attaches in a hidden tmux)
+
+Safety rules:
+- Types only when the session is idle (`claude agents --json` says idle, no "esc to interrupt")
+  and the prompt is EMPTY. It never erases a draft.
+- Before EVERY key, the Claude process in the target must be the session from the flag (same
+  sessionId) and the same pid as at the first check. Otherwise it refuses, logs REFUSED, exits 3.
+- /clear is confirmed only when the SAME pid shows a NEW sessionId. Only then is the resume
+  request typed.
+- If the session goes back to work (a new message arrived), it re-arms the flag and exits: the
+  next Stop hook decides.
+
+Usage: save-clear-send <tmux|iterm|bg> <target> <session_id> <flag-json> <transcript>
+       save-clear-send --check <tmux|iterm> <target> <session_id>   (0 ok, 1 refused, 2 unknown)
+Test knobs: SAVE_CLEAR_STATE_DIR, SAVE_CLEAR_CLAUDE (a fake `claude`), SAVE_CLEAR_DRY_RUN=1.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from common import (BIN, CLEAR_FLAG, MARGIN_MS, RESUME_MSG, claude_bin, log as _log, notify, now_ms,  # noqa: E402
+                    short, tmux_bin, user_messages_since, write_json)
+
+CLAUDE = claude_bin()
+TMUX = tmux_bin() or "tmux"
+DRY = os.environ.get("SAVE_CLEAR_DRY_RUN") == "1"
+MAX_WAIT = int(os.environ.get("SAVE_CLEAR_MAX_WAIT", "1200"))  # 20 min waiting for the session to be free
+
+CHECK = len(sys.argv) > 1 and sys.argv[1] == "--check"
+flag_json, transcript = "{}", ""
+if CHECK:
+    mode, target, sid = (sys.argv[2:] + ["", "", ""])[:3]
+else:
+    mode, target, sid, flag_json, transcript = (sys.argv[1:] + ["", "", "", "{}", ""])[:5]
+
+
+def log(msg):
+    _log(f"{'check ' if CHECK else ''}{mode} {target}", msg)
+
+
+def sh(cmd, timeout=20):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def ps_parents():
+    par = {}
+    for ln in sh(["ps", "-A", "-o", "pid=,ppid="]).splitlines():
+        try:
+            a, b = ln.split()
+            par[int(a)] = int(b)
+        except ValueError:
+            pass
+    return par
+
+
+def ancestors(pid, par):
+    out = []
+    for _ in range(30):
+        out.append(pid)
+        pid = par.get(pid, 0)
+        if pid in (0, 1):
+            break
+    return out
+
+
+def pane_pid():
+    for ln in sh([TMUX, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}"]).splitlines():
+        parts = ln.split()
+        if len(parts) == 2 and parts[1] == target:
+            return int(parts[0])
+    return None
+
+
+def target_agents():
+    """Interactive Claude processes that receive what is typed into the target; None = cannot list."""
+    try:
+        ags = json.loads(sh([CLAUDE, "agents", "--json"]) or "null")
+    except Exception:
+        return None
+    if not isinstance(ags, list):
+        return None
+    ags = [a for a in ags if isinstance(a, dict) and a.get("kind") == "interactive" and a.get("pid")]
+    if mode == "tmux":
+        pp = pane_pid()
+        if pp is None:
+            return []
+        par = ps_parents()
+        return [a for a in ags if pp in ancestors(a["pid"], par)]
+    want = target[len("/dev/"):] if target.startswith("/dev/") else target  # iterm: /dev/ttys003 -> ttys003
+    return [a for a in ags if sh(["ps", "-o", "tty=", "-p", str(a["pid"])]).strip() == want]
+
+
+def target_agent():
+    """(agent, reason). Empty reason = exactly one Claude in the target."""
+    ags = target_agents()
+    if ags is None:
+        return None, "cannot-list"
+    if not ags:
+        return None, "no-claude"
+    if len(ags) > 1:
+        return None, "ambiguous (" + ", ".join(f"{short(a.get('sessionId'))}/pid {a['pid']}" for a in ags) + ")"
+    return ags[0], ""
+
+
+# ---------- check only (arm-clear and the Stop hook) ----------
+if CHECK:
+    if mode not in ("tmux", "iterm") or not target or not sid:
+        print("refused: usage --check <tmux|iterm> <target> <session_id>")
+        sys.exit(2)
+    ag, why = target_agent()
+    if ag is None:
+        if why != "cannot-list":
+            log(f"REFUSED: {why}; expected {short(sid)}")
+        print(f"refused: {why} in target {target}")
+        sys.exit(2 if why == "cannot-list" else 1)
+    if ag.get("sessionId") != sid:
+        msg = f"target {target} runs session {short(ag.get('sessionId'))} (pid {ag['pid']}), not {short(sid)}"
+        log(f"REFUSED: {msg}")
+        print("refused: " + msg)
+        sys.exit(1)
+    print(f"ok: target {target} runs session {short(sid)} (pid {ag['pid']})")
+    sys.exit(0)
+
+
+# ---------- helper ----------
+EXPECT = {"sid": sid, "pid": None}  # who must be in the target before every key
+
+
+def refuse(why):
+    log(f"REFUSED: {why}. Typed nothing; flag not re-armed. Type /clear by hand in the right session.")
+    notify(f"save-clear: did not clear - {why}")
+    sys.exit(3)
+
+
+def rearm(why):
+    try:
+        flag = json.loads(flag_json)
+    except Exception:
+        flag = {}
+    if not flag:
+        log(f"not re-armed ({why}): empty flag")
+        return
+    flag["armed_at"] = now_ms()
+    flag["rearms"] = flag.get("rearms", 0) + 1
+    if flag["rearms"] > 5:
+        log(f"gave up ({why}): already re-armed 5 times")
+        notify(f"save-clear: gave up on the automatic /clear ({why}). Type /clear by hand.")
+        return
+    write_json(CLEAR_FLAG, flag)
+    log(f"re-armed ({why}); the next end of turn tries again")
+
+
+def new_messages():
+    try:
+        since = json.loads(flag_json).get("ts", 0) - MARGIN_MS
+    except Exception:
+        return []
+    return user_messages_since(transcript, since)
+
+
+# ----- bg mode: no terminal of its own; attach in a hidden tmux, type, detach -----
+def run_bg():
+    if not tmux_bin():
+        refuse("bg mode needs tmux, which is not installed")
+    job_state = os.path.join(os.path.expanduser("~"), ".claude", "jobs", target, "state.json")
+    st = ""
+    for _ in range(60):  # 1) the job leaves "working" (the turn ended)
+        try:
+            with open(job_state) as f:
+                st = json.load(f).get("state", "")
+        except Exception:
+            st = ""
+        if st and st != "working":
+            break
+        time.sleep(1)
+    log(f"job state: {st or '?'}")
+    s = f"save-clear-{target}"
+    sh([TMUX, "kill-session", "-t", s])
+    if DRY:
+        log(f"dry-run: would attach {target} and type /clear + resume")
+        return 0
+    if subprocess.run([TMUX, "new-session", "-d", "-s", s, "-x", "200", "-y", "50",
+                       f"{CLAUDE} attach {target}"]).returncode != 0:
+        log("tmux/attach failed")
+        return 1
+    ok = False
+    for _ in range(40):  # 2) idle prompt in the client
+        time.sleep(1)
+        p = sh([TMUX, "capture-pane", "-p", "-t", s])
+        if "❯" in p and "esc to interrupt" not in p:
+            ok = True
+            break
+    if not ok:
+        log("prompt never became idle; aborted")
+        sh([TMUX, "kill-session", "-t", s])
+        return 1
+    for keys, pause in ((["/clear", "Enter"], 4), (["-l", RESUME_MSG], 1), (["Enter"], 2), (["C-z"], 2)):
+        sh([TMUX, "send-keys", "-t", s, *keys])
+        time.sleep(pause)
+    sh([TMUX, "kill-session", "-t", s])
+    log("sent /clear + resume; client closed")
+    return 0
+
+
+# ----- iterm mode: AppleScript into the iTerm2 session with this tty (immune to window focus) -----
+ITERM_SCRIPT = """
+on run argv
+  set target to item 1 of argv
+  set resumeMsg to item 2 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is target then
+            tell s to write text "/clear"
+            delay 3
+            tell s to write text resumeMsg newline NO
+            delay 1
+            tell s to write text ""
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+end run
+"""
+
+
+def run_iterm():
+    if not re.match(r"^/dev/ttys\d+$", target):
+        refuse(f"target {target} is not a terminal tty")
+    time.sleep(4)
+    ag, why = target_agent()
+    if ag is None or ag.get("sessionId") != sid:
+        refuse(f"tty {target} does not run session {short(sid)} ({why or 'runs ' + short(ag.get('sessionId'))})")
+    if DRY:
+        log("dry-run: would type /clear + resume through iTerm2")
+        return 0
+    r = subprocess.run(["osascript", "-", target, RESUME_MSG], input=ITERM_SCRIPT, text=True,
+                       capture_output=True, timeout=60)
+    if r.returncode != 0:
+        log(f"osascript failed: {r.stderr.strip()[:200]}")
+        notify("save-clear: the automatic /clear failed in iTerm2. Type /clear by hand.")
+        return 1
+    log("sent /clear + resume through iTerm2")
+    return 0
+
+
+# ----- tmux mode -----
+def ours():
+    """The Claude in the pane, checked: the expected session and the same process. Else refuse and EXIT."""
+    ag, why = target_agent()
+    if ag is None:
+        if why.startswith("ambiguous"):
+            refuse(f"more than one Claude in the pane: {why}")
+        return None, why
+    if ag.get("sessionId") != EXPECT["sid"]:
+        refuse(f"the pane runs session {short(ag.get('sessionId'))} (pid {ag['pid']}), "
+               f"but the flag belongs to {short(EXPECT['sid'])}")
+    if EXPECT["pid"] is None:
+        EXPECT["pid"] = ag["pid"]
+    elif ag["pid"] != EXPECT["pid"]:
+        refuse(f"the pane's process changed (pid {EXPECT['pid']} -> {ag['pid']})")
+    return ag, ""
+
+
+def keys(*args):
+    if DRY:
+        log("dry-run: would type " + repr(args))
+        return
+    sh([TMUX, "send-keys", "-t", target, *args])
+
+
+def screen():
+    # -e keeps colors: the empty-prompt hint is dim (ESC[2m); a real draft is not.
+    return sh([TMUX, "capture-pane", "-p", "-e", "-t", target])
+
+
+DIM = re.compile(r"\x1b\[2m.*?(\x1b\[(0|22)m|$)")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def prompt_text(text):
+    """Text typed after the ❯ prompt (without the dim hint); None if there is no prompt."""
+    for ln in reversed(text.splitlines()):
+        if "❯" in ln:
+            return ANSI.sub("", DIM.sub("", ln.split("❯", 1)[1])).replace(" ", " ").strip().strip("│").strip()
+    return None
+
+
+def free():
+    """(free, reason). Free = expected session + idle + empty prompt."""
+    ag, why = ours()
+    if ag is None:
+        return False, why
+    if ag.get("status") != "idle":
+        return False, "busy"
+    s = screen()
+    if "esc to interrupt" in s:
+        return False, "busy"
+    p = prompt_text(s)
+    if p is None:
+        return False, "no-prompt"
+    if p:
+        if "\x1b" not in s:
+            return False, "draft (screen has no colors: may be only the hint; check NO_COLOR in tmux)"
+        return False, "draft"
+    return True, ""
+
+
+TRIGGER = ("save-clear (automatic): your message arrived after the save. Add to the snapshot only what came "
+           "after it (section \"## After the save\") and run: python3 \"" + os.path.join(BIN, "save-clear") + "\" rearm. "
+           "The /clear follows.")
+
+
+def stop_if_new(step):
+    """A user message after the save: do not clear. Re-arm and, if free, ask Claude to save the rest."""
+    msgs = new_messages()
+    if not msgs:
+        return
+    rearm(f"{step}: new message after the save ({msgs[-1][:40]!r})")
+    ok, _ = free()
+    if ok:
+        keys("-l", TRIGGER)
+        time.sleep(1)
+        keys("Enter")
+        log("asked Claude to save what came after")
+    sys.exit(0)
+
+
+def type_line(text):
+    """Types only if the pane still runs the expected session with an empty prompt."""
+    ok, why = free()
+    if not ok:
+        return False, why
+    keys("-l", text)
+    time.sleep(1)  # separate Enter: long text becomes a "paste" and swallows the Enter
+    keys("Enter")
+    return True, ""
+
+
+def cleared_now():
+    """New sessionId in the SAME process = our /clear took."""
+    ag, _ = target_agent()
+    if ag and ag["pid"] == EXPECT["pid"] and ag.get("sessionId") and ag["sessionId"] != EXPECT["sid"]:
+        return ag["sessionId"]
+    return None
+
+
+def run_tmux():
+    time.sleep(float(os.environ.get("SAVE_CLEAR_START_DELAY", "2")))  # let the other Stop hooks finish
+    # 1) Wait until free. If Claude goes back to work, it is the Stop hook's turn: re-arm.
+    t0, last, busy_since = time.time(), "", None
+    while True:
+        ok, why = free()
+        if ok:
+            stop_if_new("before starting")
+            break
+        if why == "busy":
+            busy_since = busy_since or time.time()
+            if time.time() - busy_since > 8:
+                rearm("the session went back to work: new message or another hook")
+                return 0
+        else:
+            busy_since = None
+        if why != last:
+            log(f"waiting: {why}")
+            last = why
+        if time.time() - t0 > MAX_WAIT:
+            rearm(f"waited {MAX_WAIT}s and it stayed {why}")
+            return 0
+        time.sleep(2)
+    log(f"target checked: pane {target} runs session {short(EXPECT['sid'])} (pid {EXPECT['pid']})")
+
+    # 2) /clear, then confirm the sessionId changed in the same process
+    new_sid = None
+    for attempt in (1, 2):
+        stop_if_new("before /clear")
+        sent, why = False, ""
+        for _ in range(5):
+            sent, why = type_line("/clear")
+            if sent or why != "busy":
+                break
+            time.sleep(1)
+        if not sent:
+            rearm(f"before /clear: {why}")
+            return 0
+        if DRY:
+            log("dry-run: stopped before confirming /clear (nothing was typed)")
+            return 0
+        for _ in range(10):
+            time.sleep(1)
+            new_sid = cleared_now()
+            if new_sid:
+                break
+        if new_sid:
+            break
+        if prompt_text(screen()) == "/clear":  # typed but the Enter was lost
+            new_sid = cleared_now()
+            if new_sid:
+                break
+            ours()
+            keys("Enter")
+            time.sleep(3)
+            new_sid = cleared_now()
+            if new_sid:
+                break
+        log(f"/clear attempt {attempt}: sessionId did not change")
+    if not new_sid:
+        rearm("the /clear did not take")
+        notify("save-clear: the automatic /clear did not take. Type /clear by hand.")
+        return 1
+    log(f"/clear confirmed (sessionId {short(EXPECT['sid'])} -> {short(new_sid)}, same process pid {EXPECT['pid']})")
+    EXPECT["sid"] = new_sid
+
+    # 3) Resume request (wait for the new session to be ready)
+    time.sleep(2)
+    for _ in range(15):
+        sent, why = type_line(RESUME_MSG)
+        if sent:
+            break
+        if why.startswith("draft"):
+            log("resume request not sent: the user is already typing")
+            return 0
+        time.sleep(2)
+    else:
+        log("resume request not sent: the session was not free within 30 s")
+        return 1
+    time.sleep(3)
+    if prompt_text(screen()) == RESUME_MSG:  # Enter swallowed by the paste
+        ours()
+        keys("Enter")
+    log("sent /clear (confirmed) + resume request")
+    notify("save-clear: session saved and cleared.")
+    return 0
+
+
+log(f"helper started (session {short(sid)})")
+if mode == "bg":
+    sys.exit(run_bg())
+if not sid:
+    refuse("the hook did not pass the expected session_id")
+if mode == "iterm":
+    sys.exit(run_iterm())
+if mode == "tmux":
+    sys.exit(run_tmux())
+refuse(f"unknown mode {mode!r}")

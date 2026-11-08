@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""save-clear command, called by the skill from Bash.
+
+  save-clear dir                 print (and create) the snapshot folder; also the options in effect
+  save-clear arm-resume <file>   the next session started by /clear in THIS session gets <file>
+  save-clear arm-clear           pick how the automatic /clear can be sent and arm the Stop hook
+  save-clear rearm               after saving "what came after the save", arm the /clear again
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import resume  # noqa: E402
+from common import (BIN, CLEAR_FLAG, ensure_state, log, now_ms, publish_link, read_json,  # noqa: E402
+                    snapshot_dir, tmux_bin, write_json)
+
+
+def cmd_dir():
+    d = snapshot_dir()
+    os.makedirs(d, exist_ok=True)
+    print(d)
+    print(f"publish_link: {'on' if publish_link() else 'off'}")
+    return 0
+
+
+def cmd_arm_resume(args):
+    ok, msg = resume.arm(args[0] if args else "", args[1] if len(args) > 1 else None)
+    print(msg, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+def tty_of(pid):
+    try:
+        out = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+    t = out.strip()
+    return "" if t in ("", "?", "??") else t
+
+
+def is_iterm():
+    return (sys.platform == "darwin" and shutil.which("osascript") is not None
+            and (os.environ.get("TERM_PROGRAM") == "iTerm.app" or os.environ.get("LC_TERMINAL") == "iTerm2"))
+
+
+def check(mode, target, sid):
+    r = subprocess.run([sys.executable, os.path.join(BIN, "save-clear-send"), "--check", mode, target, sid],
+                       capture_output=True, text=True, timeout=30)
+    return r.returncode, r.stdout.strip()
+
+
+def cmd_arm_clear(args):
+    env = os.environ
+    sid = env.get("CLAUDE_CODE_SESSION_ID") or (args[0] if args else "")
+    ep = env.get("CLAUDE_CODE_ENTRYPOINT") or "cli"
+    pid = env.get("CLAUDE_PID") or str(os.getppid())
+    tty = tty_of(pid)
+    target, note = "", ""
+    if env.get("CLAUDE_JOB_DIR"):
+        mode, target = "bg", os.path.basename(env["CLAUDE_JOB_DIR"])
+        if not tmux_bin():
+            mode, note = "manual", "background session, but tmux is not installed"
+    elif ep != "cli":
+        # Desktop app, IDE, SDK: an inherited TMUX_PANE points at ANOTHER session. Never type there.
+        mode = "app"
+    elif env.get("TMUX_PANE") and tmux_bin():
+        mode, target = "tmux", env["TMUX_PANE"]
+    elif tty.startswith("ttys") and is_iterm():
+        mode, target = "iterm", "/dev/" + tty
+    else:
+        mode = "manual"
+        note = "no tmux and no iTerm2 to type into"
+    if mode in ("tmux", "iterm"):
+        if not sid:
+            mode, note = "manual", "no session id to check the target with"
+        else:
+            rc, out = check(mode, target, sid)
+            if rc != 0:
+                mode, note = "manual", out or f"target {target} could not be checked"
+    print(f"save-clear: mode={mode} target={target or 'none'} entrypoint={ep}" + (f" ({note})" if note else ""))
+    if mode in ("app", "manual"):
+        log("arm", f"mode={mode} for session {sid[:8] or '?'}: no automatic /clear{' - ' + note if note else ''}")
+        if mode == "manual":
+            print("No automatic /clear here. Tell the user to type /clear; the summary comes back by itself.")
+        else:
+            print("Not a terminal session. If the clear_session tool exists, call it with session_id \"self\"; "
+                  "otherwise tell the user to type /clear.")
+        return 0
+    ensure_state()
+    write_json(CLEAR_FLAG, {"session_id": sid, "mode": mode, "target": target, "ts": now_ms()})
+    log("arm", f"auto-clear armed: mode={mode} target={target} session {sid[:8]}")
+    print("Automatic /clear armed: end the turn now with one short line.")
+    return 0
+
+
+def cmd_rearm():
+    flag = read_json(CLEAR_FLAG)
+    if not isinstance(flag, dict):
+        print("save-clear: no flag to re-arm", file=sys.stderr)
+        return 1
+    flag["ts"] = flag["armed_at"] = now_ms()
+    flag["deltas"] = flag.get("deltas", 0) + 1
+    write_json(CLEAR_FLAG, flag)
+    print(f"re-armed (round {flag['deltas']} after the save)")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd == "dir":
+        return cmd_dir()
+    if cmd == "arm-resume":
+        return cmd_arm_resume(args)
+    if cmd == "arm-clear":
+        return cmd_arm_clear(args)
+    if cmd == "rearm":
+        return cmd_rearm()
+    if cmd == "status":
+        print(json.dumps({"resume": resume.read_entries(), "clear": read_json(CLEAR_FLAG)}, indent=2))
+        return 0
+    print(f"save-clear: unknown command {cmd!r}\n\n{__doc__.strip()}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
