@@ -823,6 +823,11 @@ class IdleTrigger(Base):
         first = {"type": "assistant", "message": {"usage": {"input_tokens": 100000}}}
         self.session(tokens=110000, rows=[resumed, first])
         self.assertIn("little new since the automatic resume", self.idle("--dry-run").stdout)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_types_again_once_the_session_grew_after_a_resume(self):
+        resumed = {"type": "user", "message": {"content": "save-clear: resuming. Start with the LAST topic"}}
+        first = {"type": "assistant", "message": {"usage": {"input_tokens": 100000}}}
         self.session(tokens=150000, rows=[resumed, first])
         self.assertIn("would-type", self.idle("--dry-run").stdout, "grew 50k since the resume")
 
