@@ -5,9 +5,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: python3 tests/test_hooks.py -v
-      - run: (command -v tmux || sudo apt-get install -y tmux || brew install tmux) && bash tests/run.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tests/test_hooks.py -v
+        shell: bash
+      - if: runner.os != 'Windows'
+        run: (command -v tmux || sudo apt-get install -y tmux || brew install tmux) && bash tests/run.sh
