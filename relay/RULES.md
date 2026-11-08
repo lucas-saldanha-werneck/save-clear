@@ -14,8 +14,11 @@ focus, never open a deep link.
 3. When you wake up, read the background output. For each `JOB <path>` line:
    - load `mcp__ccd_session_mgmt__send_message` with ToolSearch (if not loaded yet) and call it with
      the `session_id` and the `TEXT` it printed, exactly;
-   - write one line to `{STATE}/relay.log`: `<date time> [relay] <file> -> <result>`. The warning
-     "no sign of starting within 20s" is common for a cold session: count it as delivered.
+   - run the job's `ACK:` line (`{RELAY} ack <name> ok`). If `send_message` failed, run
+     `{RELAY} ack <name> failed <reason>` instead. The warning "no sign of starting within 20s" is
+     common for a cold session: count it as delivered (`ok`). A request stays pending until it is
+     acknowledged: without an ack the listener hands it out again after 10 minutes, at most 3 times,
+     then keeps it under `failed` (shown by `{RELAY} status`).
    - `IDLE` line: nothing to deliver.
    - `ALREADY` line: another listener is alive. Do NOT go back to step 1; just end the turn.
 4. Go back to step 1.

@@ -2,11 +2,13 @@
 
 Files (all under the state folder: $SAVE_CLEAR_STATE_DIR, else $CLAUDE_PLUGIN_DATA, else ~/.claude/state/save-clear):
   pending_resume.json  who armed a resume, and which snapshot to deliver (one entry or a list)
-  pending_clear.json   the auto-/clear request the Stop hook acts on
+  pending_resume.lock  held while pending_resume.json is read, changed and written back
+  clear/<key>.json     one auto-/clear request per session (key = session id, or job-<id> for --bg)
   config.json          plugin options, copied here by the SessionStart hook so bin/ commands see them
   save-clear.log       one line per decision
 """
 import calendar
+import contextlib
 import json
 import os
 import re
@@ -15,6 +17,12 @@ import shutil
 import subprocess
 import sys
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "bin")
@@ -66,7 +74,8 @@ def save_pointer():
 CONFIG = os.path.join(STATE, "config.json")
 LOG = os.path.join(STATE, "save-clear.log")
 RESUME_FLAG = os.path.join(STATE, "pending_resume.json")
-CLEAR_FLAG = os.path.join(STATE, "pending_clear.json")
+RESUME_LOCK = os.path.join(STATE, "pending_resume.lock")
+CLEAR_DIR = os.path.join(STATE, "clear")
 
 # Plugin option name -> environment variable name
 OPTIONS = {
@@ -163,6 +172,58 @@ def write_json(path, value):
         json.dump(value, f)
         f.write("\n")
     os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked(path):
+    """Exclusive lock on <path> for the whole block (other processes wait)."""
+    ensure_state()
+    f = open(path, "a+")
+    try:
+        if fcntl:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        else:
+            while True:
+                try:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+        yield
+    finally:
+        try:
+            if fcntl:
+                fcntl.flock(f, fcntl.LOCK_UN)
+            else:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        f.close()
+
+
+def clear_key(session_id="", job=""):
+    """File name of a session's auto-/clear request: the session id, or job-<id> for a --bg job."""
+    key = f"job-{job}" if job else str(session_id or "")
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", key)[:120]
+
+
+def clear_path(key):
+    return os.path.join(CLEAR_DIR, key + ".json")
+
+
+def write_clear(flag):
+    os.makedirs(CLEAR_DIR, exist_ok=True)
+    write_json(clear_path(flag["key"]), flag)
+
+
+def all_clears():
+    try:
+        names = sorted(n for n in os.listdir(CLEAR_DIR) if n.endswith(".json"))
+    except OSError:
+        return []
+    return [f for f in (read_json(os.path.join(CLEAR_DIR, n)) for n in names) if isinstance(f, dict)]
 
 
 def read_json(path):

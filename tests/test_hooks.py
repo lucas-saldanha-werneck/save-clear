@@ -36,6 +36,14 @@ class Base(unittest.TestCase):
         self.env.update(SAVE_CLEAR_STATE_DIR=self.state, SAVE_CLEAR_SNAPSHOT_DIR=self.snaps,
                         SAVE_CLEAR_CLAUDE="/nonexistent/claude", SAVE_CLEAR_POINTER=os.path.join(t, "pointer"),
                         SAVE_CLEAR_APP_LOG=os.path.join(t, "app-main.log"))
+        # A fake tmux first on PATH: no test ever reaches a real tmux server.
+        self.fakebin = os.path.join(t, "fakebin")
+        os.makedirs(self.fakebin)
+        with open(os.path.join(self.fakebin, "tmux"), "w") as f:
+            f.write(f'#!/bin/sh\nexec "{PY}" "{ROOT}/tests/fake_tmux.py" "$@"\n')
+        os.chmod(os.path.join(self.fakebin, "tmux"), 0o755)
+        self.env.update(PATH=self.fakebin + os.pathsep + self.env.get("PATH", ""), FAKE_TMUX_DIR=t)
+        self.t = t
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -127,12 +135,74 @@ class Resume(Base):
         self.assertTrue(os.path.isdir(custom))
 
 
+RACE = r"""
+import os, sys, time
+sys.path.insert(0, os.path.join(sys.argv[1], "lib"))
+import resume
+real = resume.read_entries
+def slow():
+    v = real()
+    time.sleep(float(os.environ["RACE_SLEEP"]))
+    return v
+if os.environ.get("RACE_SLOW") == "1":
+    resume.read_entries = slow
+if sys.argv[2] == "arm":
+    ok, msg = resume.arm(sys.argv[3])
+    print(msg)
+else:
+    e, why = resume.take({"session_id": "x", "source": "clear", "cwd": os.environ["CLAUDE_PROJECT_DIR"]},
+                         os.environ, resume.now_ms())
+    print("took", e and e["snapshot"])
+"""
+
+
+class Concurrency(Base):
+    def race(self, what, snap="", slow=False, **env):
+        e = dict(self.env, RACE_SLEEP="0.8", RACE_SLOW="1" if slow else "0", CLAUDE_PROJECT_DIR=self.proj)
+        e.update({k: str(v) for k, v in env.items()})
+        return subprocess.Popen([PY, "-c", RACE, ROOT, what, snap], env=e, cwd=self.proj,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def entries(self):
+        if not os.path.exists(self.flag_path("pending_resume.json")):
+            return []
+        with open(self.flag_path("pending_resume.json")) as f:
+            v = json.load(f)
+        return v if isinstance(v, list) else [v]
+
+    def test_concurrent_arms_keep_every_entry(self):
+        procs = []
+        for i in range(5):
+            snap = os.path.join(self.snaps, f"S-{i}.md")
+            os.makedirs(self.snaps, exist_ok=True)
+            with open(snap, "w") as f:
+                f.write(f"# session {i}\n")
+            procs.append(self.race("arm", snap, slow=True, CLAUDE_CODE_SESSION_ID=f"sess-{i}", CLAUDE_PID=7000 + i))
+        for p in procs:
+            p.communicate(timeout=60)
+        self.assertEqual(len(self.entries()), 5, "every session's resume survives concurrent arms")
+
+    def test_take_does_not_drop_an_entry_armed_meanwhile(self):
+        self.arm(self.snapshot())                                   # A, pid 4242
+        other = os.path.join(self.snaps, "S-B.md")
+        with open(other, "w") as f:
+            f.write("# B\n")
+        taker = self.race("take", slow=True, CLAUDE_PID=4242)      # A's /clear: reads, then is slow
+        time.sleep(0.3)
+        armer = self.race("arm", other, CLAUDE_CODE_SESSION_ID=SID_B, CLAUDE_PID=5555)
+        out, _ = taker.communicate(timeout=60)
+        armer.communicate(timeout=60)
+        self.assertIn("SESSION-SUMMARY", out, "A got its summary")
+        self.assertEqual([e["snapshot"] for e in self.entries()], [other], "B's entry was not lost")
+
+
 class Stop(Base):
     def write_flag(self, ts=None, **extra):
         os.makedirs(self.state, exist_ok=True)
-        f = {"session_id": SID_A, "mode": "tmux", "target": "%99", "ts": ts or int(time.time() * 1000)}
+        f = {"session_id": SID_A, "mode": "tmux", "target": "%99", "key": SID_A, "ts": ts or int(time.time() * 1000)}
         f.update(extra)
-        with open(self.flag_path("pending_clear.json"), "w") as fh:
+        os.makedirs(self.flag_path("clear"), exist_ok=True)
+        with open(self.flag_path(f"clear/{SID_A}.json"), "w") as fh:
             json.dump(f, fh)
 
     def transcript(self, *entries):
@@ -150,7 +220,7 @@ class Stop(Base):
         self.write_flag(ts=int(time.time() * 1000) - 20 * 60 * 1000)
         r = self.run_py("hooks/stop.py", stdin={"session_id": SID_A}, CLAUDE_CODE_ENTRYPOINT="cli")
         self.assertEqual(r.stdout, "")
-        self.assertFalse(os.path.exists(self.flag_path("pending_clear.json")))
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
 
     def test_message_after_save_blocks_then_rearm(self):
         self.write_flag(mode="manual-test")  # a mode that skips the terminal check
@@ -165,35 +235,139 @@ class Stop(Base):
         self.assertIn("one more thing: rename it", out["reason"])
         self.assertNotIn("old message", out["reason"])
         self.assertIn("## After the save", out["reason"])
-        self.assertTrue(os.path.exists(self.flag_path("pending_clear.json")), "flag kept until the re-arm")
-        r = self.run_py("bin/save-clear", ["rearm"])
+        self.assertTrue(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "flag kept until the re-arm")
+        self.assertIn(f"rearm {SID_A}", out["reason"], "the re-arm command names this session")
+        r = self.run_py("bin/save-clear", ["rearm", SID_A])
         self.assertIn("round 1", r.stdout)
-        with open(self.flag_path("pending_clear.json")) as f:
+        with open(self.flag_path(f"clear/{SID_A}.json")) as f:
             self.assertEqual(json.load(f)["deltas"], 1)
 
 
+class ClearFlags(Base):
+    """Each session has its own automatic-clear request."""
+    def arm_bg(self, sid, job):
+        return self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_SESSION_ID=sid,
+                           CLAUDE_JOB_DIR=os.path.join(self.t, "jobs", job), CLAUDE_CODE_ENTRYPOINT="cli")
+
+    def flags(self):
+        c = json.loads(self.run_py("bin/save-clear", ["status"]).stdout)["clear"]
+        return c if isinstance(c, list) else [c] if c else []
+
+    def stop_with_message(self, sid, job):
+        tp = os.path.join(self.proj, f"t-{sid[:4]}.jsonl")
+        with open(tp, "w") as f:
+            f.write(json.dumps({"type": "user", "timestamp": iso(1),
+                                "message": {"role": "user", "content": "one more thing"}}) + "\n")
+        return self.run_py("hooks/stop.py", stdin={"session_id": sid, "transcript_path": tp},
+                           CLAUDE_JOB_DIR=os.path.join(self.t, "jobs", job))
+
+    def test_second_session_does_not_replace_the_first_request(self):
+        self.assertIn("mode=bg", self.arm_bg(SID_A, "jobA").stdout)
+        self.assertIn("mode=bg", self.arm_bg(SID_B, "jobB").stdout)
+        self.assertEqual(sorted(f["session_id"] for f in self.flags()), [SID_A, SID_B])
+        r = self.stop_with_message(SID_A, "jobA")
+        self.assertIn('"decision": "block"', r.stdout, "A's Stop hook still finds A's request")
+
+    def test_rearm_only_touches_the_callers_request(self):
+        self.arm_bg(SID_A, "jobA")
+        r = self.run_py("bin/save-clear", ["rearm"], CLAUDE_CODE_SESSION_ID=SID_B)
+        self.assertEqual(r.returncode, 1, "B has no request of its own to re-arm")
+        [a] = self.flags()
+        self.assertEqual((a["session_id"], a.get("deltas", 0)), (SID_A, 0), "A's request untouched")
+        r = self.run_py("bin/save-clear", ["rearm", SID_A])
+        self.assertIn("round 1", r.stdout)
+
+
 class ArmClear(Base):
+    def test_iterm_without_tmux_falls_back_to_manual(self):
+        # The helper cannot see whether an iTerm2 prompt is empty or idle, so it must not type there.
+        code = (
+            "import importlib.machinery, importlib.util, sys, os\n"
+            "ld = importlib.machinery.SourceFileLoader('sc', os.path.join(sys.argv[1], 'bin', 'save-clear'))\n"
+            "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('sc', ld))\n"
+            "ld.exec_module(m)\n"
+            "m.tty_of = lambda pid: 'ttys001'\n"
+            "m.is_iterm = lambda: True\n"
+            "m.check = lambda *a: (0, 'ok: target runs this session')\n"
+            "sys.exit(m.cmd_arm_clear([]))\n")
+        e = dict(self.env, CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli", TERM_PROGRAM="iTerm.app")
+        r = subprocess.run([PY, "-c", code, ROOT], capture_output=True, text=True, env=e, cwd=self.proj, timeout=60)
+        self.assertIn("mode=manual", r.stdout, r.stdout + r.stderr)
+        self.assertIn("type /clear", r.stdout)
+        self.assertEqual(json.loads(self.run_py("bin/save-clear", ["status"]).stdout)["clear"] or [], [])
+
+
     def test_plain_terminal_falls_back_to_manual(self):
         r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli",
                         TERM_PROGRAM="Apple_Terminal", CLAUDE_PID=os.getpid())
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("mode=manual", r.stdout)
         self.assertIn("type /clear", r.stdout)
-        self.assertFalse(os.path.exists(self.flag_path("pending_clear.json")))
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
 
     def test_desktop_app_never_types_into_inherited_pane(self):
         r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_SESSION_ID=SID_A,
                         CLAUDE_CODE_ENTRYPOINT="claude-desktop", TMUX_PANE="%0")
         self.assertIn("mode=app", r.stdout)
         self.assertIn("clear_session", r.stdout)
-        self.assertFalse(os.path.exists(self.flag_path("pending_clear.json")))
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
 
     def test_tmux_pane_that_cannot_be_checked_is_not_armed(self):
         # SAVE_CLEAR_CLAUDE points nowhere: the target cannot be confirmed, so no flag.
         r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli",
                         TMUX_PANE="%987654")
         self.assertIn("mode=manual", r.stdout)
-        self.assertFalse(os.path.exists(self.flag_path("pending_clear.json")))
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+
+
+class BgHelper(Base):
+    """`claude --bg` mode of the helper, against a fake tmux and a fake job state file."""
+    JOB = "job12345"
+
+    def run_bg(self, state="idle", messages=(), draft="", clears=False):
+        home = os.path.join(self.t, "home")
+        jd = os.path.join(home, ".claude", "jobs", self.JOB)
+        os.makedirs(jd, exist_ok=True)
+        st = os.path.join(jd, "state.json")
+        with open(st, "w") as f:
+            json.dump({"state": state, "resumeSessionId": SID_A}, f)
+        if draft:
+            with open(os.path.join(self.t, "draft.txt"), "w") as f:
+                f.write(draft)
+        tp = os.path.join(self.proj, "t.jsonl")
+        with open(tp, "w") as f:
+            for m in messages:
+                f.write(json.dumps({"type": "user", "timestamp": iso(1), "message": {"role": "user", "content": m}}) + "\n")
+        flag = {"session_id": SID_A, "mode": "bg", "target": self.JOB, "key": "job-" + self.JOB,
+                "ts": int(time.time() * 1000)}
+        r = self.run_py("bin/save-clear-send", ["bg", self.JOB, SID_A, json.dumps(flag), tp], HOME=home,
+                        FAKE_JOB_STATE=st, FAKE_TMUX_CLEARS="1" if clears else "0", SAVE_CLEAR_BG_WAIT="2")
+        calls = os.path.join(self.t, "tmux-calls.jsonl")
+        keys = []
+        if os.path.exists(calls):
+            with open(calls) as f:
+                keys = [a for a in (json.loads(l) for l in f) if a and a[0] == "send-keys"]
+        return r, " ".join(" ".join(k) for k in keys)
+
+    def test_job_that_never_goes_idle_is_not_typed_into(self):
+        r, keys = self.run_bg(state="working")
+        self.assertNotIn("/clear", keys)
+
+    def test_message_after_the_save_stops_the_clear(self):
+        r, keys = self.run_bg(messages=["wait, one more thing"])
+        self.assertNotIn("/clear", keys)
+
+    def test_draft_in_the_prompt_is_not_submitted(self):
+        r, keys = self.run_bg(draft="half typed")
+        self.assertNotIn("/clear", keys)
+
+    def test_resume_request_only_after_a_confirmed_clear(self):
+        r, keys = self.run_bg(clears=False)
+        self.assertIn("/clear", keys)
+        self.assertNotIn("save-clear: resuming", keys, "clear not confirmed: no resume request typed")
+        os.unlink(os.path.join(self.t, "tmux-calls.jsonl"))
+        r, keys = self.run_bg(clears=True)
+        self.assertIn("save-clear: resuming", keys)
 
 
 class Compact(Base):
@@ -323,6 +497,33 @@ class Relay(Base):
         self.assertIn(f"session_id={APP}", r.stdout)
         self.assertIn("TEXT: hello", r.stdout)
         self.assertEqual(self.inbox(), [])
+
+    def test_listener_keeps_request_until_ack(self):
+        self.relay("setup", RELAY_ID)
+        self.relay("job", "--to", APP, "--message", "hello")
+        fast = dict(SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+        self.assertIn("TEXT: hello", self.relay("listen", **fast).stdout)
+        st = json.loads(self.relay("status").stdout)
+        self.assertEqual(st.get("unacked"), 1, "handed out but not acknowledged: still pending")
+        # the relay turn was lost: after the claim times out, the same request is handed out again
+        r = self.relay("listen", SAVE_CLEAR_RELAY_CLAIM_S="0", **fast)
+        self.assertIn("TEXT: hello", r.stdout)
+        name = [l.split()[-2] for l in r.stdout.splitlines() if l.strip().startswith("ACK:")][0]
+        self.assertEqual(self.relay("ack", name, "ok").returncode, 0)
+        st = json.loads(self.relay("status").stdout)
+        self.assertEqual((st["queued"], st["unacked"], st["failed"]), (0, 0, 0))
+
+    def test_failed_deliveries_are_retried_then_kept_as_failed(self):
+        self.relay("job", "--to", APP, "--message", "hello")
+        fast = dict(SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+        for attempt in range(3):
+            r = self.relay("listen", **fast)
+            self.assertIn("TEXT: hello", r.stdout, f"attempt {attempt + 1}")
+            name = [l.split()[-2] for l in r.stdout.splitlines() if l.strip().startswith("ACK:")][0]
+            self.relay("ack", name, "failed")
+        self.assertEqual(self.relay("listen", **fast).stdout.strip(), "IDLE", "no 4th attempt")
+        st = json.loads(self.relay("status").stdout)
+        self.assertEqual((st["queued"], st["unacked"], st["failed"]), (0, 0, 1))
 
     def test_listener_without_app_log_uses_grace(self):
         self.relay("job", "--to", APP, "--message", "hi", "--after-clear", APP)

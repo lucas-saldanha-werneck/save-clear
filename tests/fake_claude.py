@@ -20,4 +20,6 @@ elif sc == "otherproc":
         pid, sid = child, C
 elif sc == "switch":          # another session takes the pane after the first check
     sid = A if calls == 1 else B
+elif sc == "switchlate":      # another session takes the pane while /clear sits in the prompt
+    sid = A if calls <= 2 else B
 print(json.dumps([{"kind": "interactive", "pid": pid, "sessionId": sid, "status": "idle", "cwd": D, "name": "fake"}]))

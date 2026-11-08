@@ -38,7 +38,7 @@ CSV export works; the open question is whether totals include tax.
 Continue from the point above. If the user brings a completely new topic, ignore this context and do what they ask.
 ```
 
-When the clear was typed for you (tmux, iTerm2 or `claude --bg`), the helper also types
+When the clear was typed for you (tmux or `claude --bg`) and the helper confirmed it took, it also types
 `save-clear: resuming. Start with the LAST topic (where we stopped and what is still open); then, in
 one short paragraph, the rest that was saved and the next steps.` so the new session opens with a
 recap.
@@ -63,7 +63,7 @@ Set them with `/plugin configure save-clear@save-clear`, or with environment var
 | Option | Environment variable | Default | What it does |
 |---|---|---|---|
 | `snapshot_dir` | `SAVE_CLEAR_SNAPSHOT_DIR` | `~/.claude/snapshots` | Where summaries and the compaction backups go |
-| `notify_command` | `SAVE_CLEAR_NOTIFY` | empty (off) | A program called with one line of text when the automatic `/clear` fails or is refused, and when it succeeds in tmux |
+| `notify_command` | `SAVE_CLEAR_NOTIFY` | empty (off) | A program called with one line of text when the automatic `/clear` fails, is refused or stops halfway, and when it succeeds in tmux |
 | `publish_link` | `SAVE_CLEAR_PUBLISH_LINK` | `off` | `on`: the skill publishes the summary as a private claude.ai page (when the Artifact tool is available), and the next session shows that link first |
 | (none) | `SAVE_CLEAR_STATE_DIR` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/state/save-clear` | Flags, relay inbox and the logs `save-clear.log` and `relay.log` |
 
@@ -73,8 +73,6 @@ You need none of these. Without them everything works except the automatic `/cle
 you to type `/clear`, and the summary still comes back by itself.
 
 - tmux: automatic `/clear` in a tmux pane, and for `claude --bg` sessions.
-- iTerm2 on macOS: automatic `/clear` without tmux, through AppleScript. macOS may ask once for
-  permission to control iTerm2.
 - A notifier for `notify_command`, for example a script that sends you a push message.
 - A relay session in the Claude desktop app, so the resume arrives right after the clear instead of
   with your next message. See [Desktop app relay](#desktop-app-relay).
@@ -97,20 +95,26 @@ The skill tells Claude to:
 The SessionStart hook hands the summary only to the session that armed it, after its `/clear`.
 A terminal session is matched by process id, a desktop app session by its app session id, a
 `claude --bg` session by its job id. Other sessions and other folders get nothing. Unclaimed
-entries are dropped after 7 days.
+entries are dropped after 7 days. Arming and handing out a summary each hold a file lock while they
+read and rewrite the list, so sessions that save at the same moment keep each other's entries.
+
+Each session's automatic `/clear` request is its own file in the state folder (`clear/<session
+id>.json`, or `clear/job-<id>.json` for `claude --bg`). One session arming never replaces another's
+request, and `save-clear rearm` only changes the calling session's request.
 
 How the `/clear` happens:
 
 | Where Claude runs | What happens |
 |---|---|
-| tmux pane | The Stop hook starts a helper. Before every key it checks that the pane still runs this session and the same process. It types `/clear` only when the session is idle and the prompt is empty, confirms that the same process now has a new session id, then types the resume request. |
-| iTerm2 tab (macOS), no tmux | The helper checks that the tab's tty runs this session, then types `/clear` and the resume request through AppleScript. It does not wait for an empty prompt and does not confirm the clear. |
-| `claude --bg` session | The helper waits for the job to leave the working state, attaches in a hidden tmux session, waits for an idle prompt, types `/clear` and the resume request, and detaches. Needs tmux. |
+| tmux pane | The Stop hook starts a helper. Before every key it checks that the pane still runs this session and the same process. It types `/clear` only when the session is idle and the prompt is empty. Right before pressing Enter it checks again: same session and process, still idle, and the prompt holds the text it typed and nothing else (spaces and line wraps are ignored). If anything changed, it does not press Enter, leaves the text in the prompt and stops. It confirms that the same process now has a new session id, then types the resume request the same way. |
+| iTerm2 tab (macOS), no tmux | Claude tells you to type `/clear`. Through AppleScript the helper cannot see whether the prompt is empty or the session idle, so it does not type there. |
+| `claude --bg` session | The helper waits up to 60 seconds for the job to leave the working state; if it does not, it types nothing and re-arms. It also types nothing if a message arrived after the save. Otherwise it attaches in a hidden tmux session, waits for an idle, empty prompt, types `/clear`, checks the prompt again before Enter, and detaches. It types the resume request only if the job's state file then shows a new conversation id; otherwise the summary comes with your next message. Needs tmux. |
 | Any other terminal | Claude tells you to type `/clear`. |
 | Claude desktop app | Claude calls the app's `clear_session` tool with `session_id: "self"`. The summary arrives with your next message, or right away if you set up the relay. |
 
 If you send a message after the save, the Stop hook does not clear. It asks Claude to answer it, add
-it to the summary under `## After the save`, and run `save-clear rearm`. This repeats up to 3 times.
+it to the summary under `## After the save`, and run `save-clear rearm <session id>`. This repeats up
+to 3 times.
 In the desktop app, a PreToolUse hook holds the first `clear_session` call the same way.
 
 Two backups run without the skill. Before any compaction, the full transcript is saved gzipped with
@@ -132,9 +136,17 @@ Setup, once:
 
 After that, "save and clear" in another app session queues a request with
 `save-clear-relay request`. If the relay is not listening, that session wakes it with
-`send_message`. Other commands:
+`send_message`.
 
-- `save-clear-relay status`: relay id, whether it is listening, queue size, state folder.
+A request stays pending until the relay acknowledges it with `save-clear-relay ack <name> ok` after
+`send_message`. If the relay reports a failure, or its turn is lost before the ack, the request is
+handed out again (after 10 minutes without an ack), at most 3 times. After that it is kept as failed
+and `status` lists it. A lost ack can make the resume request arrive twice.
+
+Other commands:
+
+- `save-clear-relay status`: relay id, whether it is listening, how many requests are queued,
+  handed out but not acknowledged (`unacked`) or given up (`failed`), and the state folder.
 - `save-clear-relay off` and `on`: while off, requests are refused.
 - `save-clear-relay setup <relay id> <waker id>`: when the relay's own context fills up it saves
   and clears itself (see `relay/RULES.md`), and the second session wakes it after that clear. Without
@@ -158,13 +170,16 @@ state ended up in `~/.claude/state/save-clear`, delete that folder yourself, plu
 
 ## Limits and what was not tested
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 27 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 38 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
-  (`bash tests/run.sh`, 25 checks). CI runs both on Ubuntu and macOS. Install and uninstall were
-  run with the `claude plugin` CLI.
-- Not tested live: the desktop app relay round trip (request, clear, `send_message`, resume), the
-  waker, the iTerm2 path, and `claude --bg` sessions. The unit tests cover their decision logic
-  only. The desktop app session matching relies on the `CLAUDE_CODE_HOST_SESSION_ID` variable,
+  (`bash tests/run.sh`, 29 checks). The `claude --bg` helper is tested against a fake tmux and a
+  fake job state file. CI runs both on Ubuntu and macOS. Install and uninstall were run with the
+  `claude plugin` CLI.
+- Not tested live: the desktop app relay round trip (request, clear, `send_message`, ack, resume),
+  the waker, and `claude --bg` sessions. The unit tests cover their decision logic only. The
+  `claude --bg` clear confirmation reads `resumeSessionId` from `~/.claude/jobs/<id>/state.json`;
+  that field was seen in real state files, but not watched across a real clear. If it does not
+  change, the helper only skips the resume request. The desktop app session matching relies on the `CLAUDE_CODE_HOST_SESSION_ID` variable,
   which was not checked from inside the app here.
 - The app log format was checked against a real macOS log. The Linux and Windows log paths were not.
 - Windows was not tested.

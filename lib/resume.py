@@ -8,7 +8,7 @@ own entry. A global flag would hand the summary to whichever session starts firs
 import os
 import re
 
-from common import RESUME_FLAG, ensure_state, log, now_ms, read_json, write_json
+from common import RESUME_FLAG, RESUME_LOCK, ensure_state, locked, log, now_ms, read_json, write_json
 
 FALLBACK_MS = 30 * 60 * 1000       # no way to tell the session apart: same folder and a recent flag only
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
@@ -118,10 +118,11 @@ def arm(snapshot, session_id=None, env=None):
         "job": os.path.basename(env["CLAUDE_JOB_DIR"]) if env.get("CLAUDE_JOB_DIR") else None,
         "ts": now,
     }
-    old = read_entries() or []
-    keep = [x for x in old if not same_owner(x, e) and not too_old(x, now)]
-    write_entries(keep + [e])
-    back = read_entries() or []
+    with locked(RESUME_LOCK):  # read, change and write back as one step: concurrent arms keep every entry
+        old = read_entries() or []
+        keep = [x for x in old if not same_owner(x, e) and not too_old(x, now)]
+        write_entries(keep + [e])
+        back = read_entries() or []
     if not any(x.get("snapshot") == snap and x.get("ts") == now for x in back):
         return False, f"save-clear: the resume flag was not written (check {RESUME_FLAG})."
     ids = f"session {_short(e['session_id'])}"
@@ -139,6 +140,11 @@ def arm(snapshot, session_id=None, env=None):
 
 def take(hook, env, now):
     """Find and remove this session's entry. Returns (entry or None, why)."""
+    with locked(RESUME_LOCK):  # an arm in another session waits instead of being overwritten
+        return _take(hook, env, now)
+
+
+def _take(hook, env, now):
     entries = read_entries()
     if entries is None or (os.path.exists(RESUME_FLAG) and not entries):
         log("resume", "resume flag unreadable or empty: deleted")

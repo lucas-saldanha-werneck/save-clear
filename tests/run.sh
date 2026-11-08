@@ -40,7 +40,8 @@ new_case() {  # $1 = scenario
 }
 typed() { cat "$D/typed.txt" 2>/dev/null; }
 logf() { cat "$D/state/save-clear.log" 2>/dev/null; }
-flag_now() { printf '{"session_id":"%s","mode":"tmux","target":"%s","ts":%s}' "$A" "$PANE" "$(($(date +%s)*1000))" > "$D/state/pending_clear.json"; }
+FL() { echo "$D/state/clear/$A.json"; }   # session A's own /clear request
+flag_now() { mkdir -p "$D/state/clear"; printf '{"session_id":"%s","mode":"tmux","target":"%s","key":"%s","ts":%s}' "$A" "$PANE" "$A" "$(($(date +%s)*1000))" > "$(FL)"; }
 
 echo "== T1: the pane runs ANOTHER session from the start -> refuse, nothing typed"
 new_case mismatch
@@ -48,7 +49,7 @@ new_case mismatch
 [ $rc -eq 3 ] && ok "exit 3 (refused)" || bad "rc=$rc"
 [ -z "$(typed)" ] && ok "no key reached the pane" || bad "typed: $(typed)"
 logf | grep -q "REFUSED: the pane runs session bbbbbbbb" && ok "log has the refusal" || bad "no REFUSED line: $(logf)"
-[ -f "$D/state/pending_clear.json" ] && bad "re-armed the flag" || ok "flag not re-armed"
+[ -f "$(FL)" ] && bad "re-armed the flag" || ok "flag not re-armed"
 
 echo "== T2: right session -> /clear + resume request; confirmed with the SAME pid"
 new_case match
@@ -75,7 +76,7 @@ new_case match
 flag_now
 OUT=$(echo "{\"session_id\":\"$A\",\"transcript_path\":\"\"}" | CLAUDE_CODE_ENTRYPOINT=claude-desktop "$PY" "$R/hooks/stop.py")
 echo "$OUT" | grep -q 'did NOT clear - this session is claude-desktop' && ok "message: $OUT" || bad "output: $OUT"
-[ -f "$D/state/pending_clear.json" ] && bad "flag left behind" || ok "flag consumed"
+[ -f "$(FL)" ] && bad "flag left behind" || ok "flag consumed"
 sleep 2; [ -z "$(typed)" ] && ok "nothing typed" || bad "typed: $(typed)"
 
 echo "== T6: flag of session A, but session B stops in the same pane -> ignored"
@@ -83,7 +84,7 @@ new_case match
 flag_now
 OUT=$(echo "{\"session_id\":\"$B\",\"transcript_path\":\"\"}" | TMUX_PANE="$PANE" "$PY" "$R/hooks/stop.py")
 [ -z "$OUT" ] && ok "hook stayed quiet" || bad "output: $OUT"
-[ -f "$D/state/pending_clear.json" ] && ok "flag untouched (not this session's)" || bad "consumed another session's flag"
+[ -f "$(FL)" ] && ok "flag untouched (not this session's)" || bad "consumed another session's flag"
 sleep 2; [ -z "$(typed)" ] && ok "nothing typed" || bad "typed: $(typed)"
 
 echo "== T7: terminal Stop hook, but the pane runs another session -> --check refuses"
@@ -101,20 +102,35 @@ echo "$OUT" | grep -q 'automatic /clear' && ok "hook started the helper" || bad 
 for _ in $(seq 1 30); do logf | grep -q 'sent /clear (confirmed)' && break; sleep 1; done
 logf | grep -q "/clear confirmed (sessionId aaaaaaaa -> cccccccc, same process" && ok "helper confirmed in the same process" || bad "log: $(logf)"
 
-echo "== T9: iterm mode with a non-terminal tty ('??', a desktop app process) -> refuse without osascript"
+echo "== T9: iterm mode (removed: the prompt cannot be checked there) -> refuse without osascript"
 new_case match
-"$PY" "$R/bin/save-clear-send" iterm "/dev/??" "$A" "{}" ""; rc=$?
-[ $rc -eq 3 ] && logf | grep -q "REFUSED: target /dev/?? is not a terminal tty" && ok "refused" || bad "rc=$rc; log: $(logf)"
+"$PY" "$R/bin/save-clear-send" iterm "/dev/ttys001" "$A" "{}" ""; rc=$?
+[ $rc -eq 3 ] && logf | grep -q "REFUSED: the iTerm2 mode was removed" && ok "refused" || bad "rc=$rc; log: $(logf)"
 
 echo "== T10: arm-clear inside the test pane with the right session -> mode=tmux, flag written"
 new_case match
 OUT=$(TMUX_PANE="$PANE" CLAUDE_CODE_SESSION_ID=$A CLAUDE_PID=$$ "$PY" "$R/bin/save-clear" arm-clear)
-echo "$OUT" | grep -q "mode=tmux target=$PANE" && [ -f "$D/state/pending_clear.json" ] && ok "$(echo "$OUT" | head -1)" || bad "output: $OUT"
+echo "$OUT" | grep -q "mode=tmux target=$PANE" && [ -f "$(FL)" ] && ok "$(echo "$OUT" | head -1)" || bad "output: $OUT"
 
 echo "== T11: arm-clear in the test pane, but it runs another session -> falls back to manual, no flag"
 new_case mismatch
 OUT=$(TMUX_PANE="$PANE" CLAUDE_CODE_SESSION_ID=$A CLAUDE_PID=$$ "$PY" "$R/bin/save-clear" arm-clear)
-echo "$OUT" | grep -q "mode=manual" && [ ! -f "$D/state/pending_clear.json" ] && ok "$(echo "$OUT" | head -1)" || bad "output: $OUT"
+echo "$OUT" | grep -q "mode=manual" && [ ! -f "$(FL)" ] && ok "$(echo "$OUT" | head -1)" || bad "output: $OUT"
+
+echo "== T12: the pane switches session after /clear was typed, before Enter -> no Enter"
+new_case switchlate
+"$PY" "$R/bin/save-clear-send" tmux "$PANE" "$A" "{\"session_id\":\"$A\",\"ts\":1}" ""; rc=$?
+[ $rc -eq 3 ] && ok "exit 3" || bad "rc=$rc; log: $(logf)"
+typed | grep -q 'clear' && bad "Enter sent: $(typed | tr '\n' '|')" || ok "Enter NOT sent"
+
+echo "== T13: the user types into the prompt after /clear was typed, before Enter -> no Enter"
+new_case match
+"$PY" "$R/bin/save-clear-send" tmux "$PANE" "$A" "{\"session_id\":\"$A\",\"ts\":1}" "" & HP=$!
+for _ in $(seq 1 100); do "$TM" capture-pane -p -t "$PANE" | grep -q '❯ /clear' && break; sleep 0.05; done
+"$TM" send-keys -t "$PANE" -l " and also"
+wait $HP; rc=$?
+typed | grep -q 'clear' && bad "submitted the edited draft: $(typed | tr '\n' '|')" || ok "edited draft NOT submitted"
+logf | grep -q "Enter not sent" && ok "log says Enter not sent" || bad "log: $(logf)"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

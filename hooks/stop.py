@@ -2,9 +2,10 @@
 """Stop hook: if THIS session armed the automatic /clear, start the helper that types it.
 
 No flag: exits at once. Rules:
-- Only a flag from the same session counts (or the same `claude --bg` job). An inherited
+- Each session has its own flag file (clear/<session id>.json, or clear/job-<id>.json for a
+  `claude --bg` job), so one session's request never replaces another's. An inherited
   TMUX_PANE is not proof: desktop app sessions inherit the pane of the terminal that opened them.
-- Modes that type into a terminal (tmux, iterm) only run in a terminal session, and only after
+- Modes that type into a terminal (tmux) only run in a terminal session, and only after
   `save-clear-send --check` confirms the target runs this session.
 - A user message that arrived after the save blocks the stop (up to 3 rounds): Claude answers it,
   adds it to the snapshot and re-arms. The message never vanishes in the /clear.
@@ -16,16 +17,19 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (BIN, CLEAR_FLAG, MARGIN_MS, log, notify, now_ms, read_hook_input,  # noqa: E402
-                    read_json, user_messages_since)
+from common import (BIN, CLEAR_DIR, MARGIN_MS, clear_key, clear_path, log, notify, now_ms,  # noqa: E402
+                    read_hook_input, read_json, user_messages_since)
 
 MAX_DELTAS = 3
 MAX_AGE_MS = 15 * 60 * 1000
 
 
+FLAG = {"path": ""}
+
+
 def drop_flag():
     try:
-        os.unlink(CLEAR_FLAG)
+        os.unlink(FLAG["path"])
     except OSError:
         pass
 
@@ -47,24 +51,41 @@ def my_snapshot(hook):
     return ""
 
 
+def find_flag(hook, job):
+    """This session's flag (by session id, then by --bg job), or None."""
+    sid = hook.get("session_id") or ""
+    for key in ([clear_key(sid)] if sid else []) + ([clear_key(job=job)] if job else []):
+        path = clear_path(key)
+        if not os.path.exists(path):
+            continue
+        flag = read_json(path)
+        FLAG["path"] = path
+        if not isinstance(flag, dict):
+            drop_flag()
+            continue
+        same_session = flag.get("session_id") and flag.get("session_id") == sid
+        same_job = flag.get("mode") == "bg" and flag.get("target") and job == flag.get("target")
+        if same_session or same_job:
+            return flag
+    return None
+
+
 def main():
-    if not os.path.exists(CLEAR_FLAG):
-        return
-    flag = read_json(CLEAR_FLAG)
-    if not isinstance(flag, dict):
-        drop_flag()
+    if not os.path.isdir(CLEAR_DIR) or not os.listdir(CLEAR_DIR):
         return
     hook = read_hook_input()
     job = os.path.basename(os.environ.get("CLAUDE_JOB_DIR") or "")
-    same_session = flag.get("session_id") and flag.get("session_id") == hook.get("session_id")
-    same_job = flag.get("mode") == "bg" and flag.get("target") and job == flag.get("target")
-    if not (same_session or same_job):
+    flag = find_flag(hook, job)
+    if not flag:
         return
     if now_ms() - int(flag.get("armed_at") or flag.get("ts") or 0) > MAX_AGE_MS:
         drop_flag()
         return
 
-    if flag.get("mode") in ("tmux", "iterm") and not job:
+    if flag.get("mode") == "iterm":
+        drop_flag()
+        refuse("the iTerm2 mode was removed: an empty prompt cannot be checked there")
+    if flag.get("mode") == "tmux" and not job:
         ep = os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli"
         if ep != "cli":
             drop_flag()
@@ -85,14 +106,15 @@ def main():
     if fresh and deltas < MAX_DELTAS:
         snap = my_snapshot(hook) or "(the one you wrote; it is this session's entry in the save-clear status output)"
         quoted = "; ".join('"' + " ".join(m[:300].split()) + '"' for m in fresh[-5:])
+        rearm = f"python3 \"{os.path.join(BIN, 'save-clear')}\" rearm {flag.get('session_id') or ''}".strip()
         print(json.dumps({
             "decision": "block",
             "reason": (f"save-clear: a message from the user arrived after the save: {quoted}. Not cleared yet. "
                        "1) If you have not answered it, answer it (if it asks for work, do it). "
                        f"2) Add to the snapshot {snap} a section \"## After the save\" with only what came "
                        "after: the message, your answer, what changed and any open question. Do not rewrite "
-                       f"the rest. 3) Run `python3 \"{os.path.join(BIN, 'save-clear')}\" rearm` and end the "
-                       "turn with one short line. The /clear follows by itself."),
+                       f"the rest. 3) Run `{rearm}` and end the turn with one short line. "
+                       "The /clear follows by itself."),
         }))
         return
 

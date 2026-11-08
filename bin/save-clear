@@ -4,8 +4,8 @@
   save-clear dir                 print (and create) the snapshot folder; also the options in effect
   save-clear arm-resume <file>   the next session started by /clear in THIS session gets <file>
   save-clear arm-clear           pick how the automatic /clear can be sent and arm the Stop hook
-  save-clear rearm               after saving "what came after the save", arm the /clear again
-  save-clear status              print the pending resume entries and the pending /clear flag (JSON)
+  save-clear rearm [session_id]  after saving "what came after the save", arm THIS session's /clear again
+  save-clear status              print the pending resume entries and the pending /clear requests (JSON)
 """
 import json
 import os
@@ -15,8 +15,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (BIN, CLEAR_FLAG, ensure_state, log, now_ms, publish_link, read_json,  # noqa: E402
-                    snapshot_dir, tmux_bin, write_json)
+from common import (BIN, all_clears, clear_key, log, now_ms, publish_link,  # noqa: E402
+                    snapshot_dir, tmux_bin, write_clear)
 
 
 def cmd_dir():
@@ -70,11 +70,13 @@ def cmd_arm_clear(args):
     elif env.get("TMUX_PANE") and tmux_bin():
         mode, target = "tmux", env["TMUX_PANE"]
     elif tty.startswith("ttys") and is_iterm():
-        mode, target = "iterm", "/dev/" + tty
+        # Through AppleScript the helper cannot tell whether the prompt is empty or the session idle,
+        # so it could submit a half-typed draft. It does not type there.
+        mode, note = "manual", "iTerm2 without tmux: an empty prompt cannot be checked there"
     else:
         mode = "manual"
         note = "no tmux and no iTerm2 to type into"
-    if mode in ("tmux", "iterm"):
+    if mode == "tmux":
         if not sid:
             mode, note = "manual", "no session id to check the target with"
         else:
@@ -91,21 +93,33 @@ def cmd_arm_clear(args):
                   "(optional relay), then call clear_session with session_id \"self\"; otherwise tell the user "
                   "to type /clear.")
         return 0
-    ensure_state()
-    write_json(CLEAR_FLAG, {"session_id": sid, "mode": mode, "target": target, "ts": now_ms()})
+    key = clear_key(job=target) if mode == "bg" else clear_key(sid)
+    write_clear({"session_id": sid, "mode": mode, "target": target, "key": key, "ts": now_ms()})
     log("arm", f"auto-clear armed: mode={mode} target={target} session {sid[:8]}")
     print("Automatic /clear armed: end the turn now with one short line.")
     return 0
 
 
-def cmd_rearm():
-    flag = read_json(CLEAR_FLAG)
-    if not isinstance(flag, dict):
-        print("save-clear: no flag to re-arm", file=sys.stderr)
+def own_clear(sid, job):
+    """This session's pending /clear request (same session id, or same --bg job), or None."""
+    for flag in all_clears():
+        if (sid and flag.get("session_id") == sid) or \
+                (job and flag.get("mode") == "bg" and flag.get("target") == job):
+            return flag
+    return None
+
+
+def cmd_rearm(args):
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or (args[0] if args else "")
+    job = os.path.basename(os.environ.get("CLAUDE_JOB_DIR") or "")
+    flag = own_clear(sid, job)
+    if not flag:
+        print(f"save-clear: no /clear request of this session to re-arm (session {sid[:8] or '?'})", file=sys.stderr)
         return 1
     flag["ts"] = flag["armed_at"] = now_ms()
     flag["deltas"] = flag.get("deltas", 0) + 1
-    write_json(CLEAR_FLAG, flag)
+    flag["key"] = flag.get("key") or (clear_key(job=job) if job and flag.get("mode") == "bg" else clear_key(sid))
+    write_clear(flag)
     print(f"re-armed (round {flag['deltas']} after the save)")
     return 0
 
@@ -122,9 +136,9 @@ def main(argv):
     if cmd == "arm-clear":
         return cmd_arm_clear(args)
     if cmd == "rearm":
-        return cmd_rearm()
+        return cmd_rearm(args)
     if cmd == "status":
-        print(json.dumps({"resume": resume.read_entries(), "clear": read_json(CLEAR_FLAG)}, indent=2))
+        print(json.dumps({"resume": resume.read_entries(), "clear": all_clears()}, indent=2))
         return 0
     print(f"save-clear: unknown command {cmd!r}\n\n{__doc__.strip()}", file=sys.stderr)
     return 2
