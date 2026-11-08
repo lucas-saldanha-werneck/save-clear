@@ -106,6 +106,7 @@ OPTIONS = {
     "on_save_command": "SAVE_CLEAR_ON_SAVE",
     "pre_clear_command": "SAVE_CLEAR_PRE_CLEAR",
     "on_resume_command": "SAVE_CLEAR_ON_RESUME",
+    "kill_background_tasks": "SAVE_CLEAR_KILL_BACKGROUND_TASKS",
 }
 
 # Your own settings, outside the plugin folder: they survive plugin updates and reinstalls.
@@ -276,8 +277,34 @@ def snapshot_dir():
     return os.path.abspath(os.path.expanduser(setting("snapshot_dir") or os.path.join(HOME, ".claude", "snapshots")))
 
 
+ON_VALUES = ("1", "on", "true", "yes")
+
+
 def publish_link():
-    return setting("publish_link").lower() in ("1", "on", "true", "yes")
+    return setting("publish_link").lower() in ON_VALUES
+
+
+def kill_background_tasks():
+    """The `kill_background_tasks` option: on = before the automatic /clear, Claude stops the background
+    tasks this session left running. Anything but on/true/yes/1 (empty, null, a typo) = off."""
+    return setting("kill_background_tasks").lower() in ON_VALUES
+
+
+# Snapshot section where Claude lists the background tasks it stopped before the automatic /clear.
+STOPPED_SECTION = "## Stopped background tasks"
+
+
+def stop_tasks_instruction(when, snapshot=""):
+    """What Claude is told to do when kill_background_tasks is on. Only Claude can stop its own
+    background tasks (TaskStop); a hook cannot tell them apart from other processes, so it never kills."""
+    return (f"kill_background_tasks: on. {when} stop every background task THIS session started that is still "
+            "running (Bash commands run with run_in_background, Monitor watches): use the TaskStop tool "
+            "(KillShell in older versions) with each task id. Never stop anything this session did not start "
+            "(other sessions, the user's own programs, servers it did not launch). Then add to the snapshot "
+            + (f"{snapshot} " if snapshot else "") + "a "
+            f"section \"{STOPPED_SECTION}\" (this heading in English, exactly, whatever the snapshot's language) "
+            "with one line per task (id, what it was doing, whether it must be started again), or \"none\" if "
+            "nothing was running.")
 
 
 def claude_bin():

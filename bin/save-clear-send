@@ -130,7 +130,9 @@ def refuse(why):
     sys.exit(3)
 
 
-def rearm(why):
+def rearm(why, busy=False):
+    """Write this session's flag back so the next Stop hook tries again. busy=True: the session stayed
+    busy (with kill_background_tasks on, the Stop hook then asks Claude to stop leftover background tasks)."""
     try:
         flag = json.loads(flag_json)
     except Exception:
@@ -145,6 +147,8 @@ def rearm(why):
         notify(f"save-clear: gave up on the automatic /clear ({why}). Type /clear by hand.")
         return
     flag["key"] = flag.get("key") or (clear_key(job=target) if mode == "bg" else clear_key(flag.get("session_id") or sid))
+    if busy:
+        flag["busy_rearm"] = True
     write_clear(flag)  # this session's own request file only
     log(f"re-armed ({why}); the next end of turn tries again")
 
@@ -277,7 +281,7 @@ def run_bg():
         if st and st != "working":
             break
         if time.time() - t0 > BG_WAIT:
-            rearm(f"the job stayed {st or 'unknown'} for {int(BG_WAIT)} s; typed nothing")
+            rearm(f"the job stayed {st or 'unknown'} for {int(BG_WAIT)} s; typed nothing", busy=True)
             return 0
         time.sleep(1)
     log(f"job state: {st}")
@@ -442,7 +446,7 @@ def run_tmux():
         if why == "busy":
             busy_since = busy_since or time.time()
             if time.time() - busy_since > 8:
-                rearm("the session went back to work: new message or another hook")
+                rearm("the session went back to work: new message, another hook or a background task", busy=True)
                 return 0
         else:
             busy_since = None

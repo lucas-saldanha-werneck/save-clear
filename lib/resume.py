@@ -8,7 +8,8 @@ own entry. A global flag would hand the summary to whichever session starts firs
 import os
 import re
 
-from common import RESUME_FLAG, RESUME_LOCK, ensure_state, language, locked, log, now_ms, read_json, write_json
+from common import (RESUME_FLAG, RESUME_LOCK, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
+                    read_json, write_json)
 
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
 
@@ -162,6 +163,21 @@ def _take(hook, env, now):
     return None, ""
 
 
+STOPPED_RE = re.compile(r"^" + re.escape(STOPPED_SECTION) + r"\b[^\n]*\n(.*?)(?=^#{1,2} |\Z)", re.M | re.S | re.I)
+NONE_WORDS = {"", "none", "nothing", "-", "n/a"}
+
+
+def stopped_tasks(summary):
+    """True when the snapshot's stopped-tasks section lists at least one task (not just "none")."""
+    m = STOPPED_RE.search(summary)
+    if not m:
+        return False
+    heading = summary[m.start():].split("\n", 1)[0]
+    words = [ln.strip(" \t-*").strip(".").lower() for ln in m.group(1).splitlines()]
+    words += [heading[len(STOPPED_SECTION):].strip(" ():.").lower()]  # "## Stopped background tasks (none)"
+    return any(w not in NONE_WORDS for w in words)
+
+
 URL_RE = re.compile(r"^summary_url:\s*(https://\S+)\s*$", re.M)
 
 
@@ -182,6 +198,9 @@ def resume_text(snapshot_path, extra=""):
         lines += [f"Write your replies in {lang}.", ""]
     lines += ["ORDER: write the summary as a TEXT message before asking any question. A question first "
               "ends the turn and the user never sees the summary.", ""]
+    if stopped_tasks(summary):
+        lines += [f'The previous session stopped background tasks before the /clear (section "{STOPPED_SECTION[3:]}" '
+                  "below). Name them in your summary, and say which ones need to be started again.", ""]
     if extra:
         lines += ["## From your on_resume_command (do this first)", "", extra, ""]
     lines += [summary, "", "---",

@@ -115,6 +115,7 @@ it, and an existing file is never overwritten, so edit it freely.
 | `on_save_command` | `SAVE_CLEAR_ON_SAVE` | empty | Runs when the skill arms the resume (before any clear). What it prints is appended to the snapshot, so the next session sees it |
 | `pre_clear_command` | `SAVE_CLEAR_PRE_CLEAR` | empty | Runs right before the automatic `/clear` (tmux, `--bg`) or before `clear_session` goes through (desktop app). Output ignored; it never stops the clear |
 | `on_resume_command` | `SAVE_CLEAR_ON_RESUME` | empty | Runs after the `/clear`, when the summary is delivered (5 s limit). What it prints (exit 0) is added to the new session's context, before the summary |
+| `kill_background_tasks` | `SAVE_CLEAR_KILL_BACKGROUND_TASKS` | `off` | `on`: before the automatic `/clear`, Claude stops the background tasks this session left running (Bash `run_in_background` jobs, Monitor watches) and lists them in the summary, and the next session names them. See [Leftover background tasks](#leftover-background-tasks) |
 | (none) | `SAVE_CLEAR_LAUNCHD_PREFIX` | `com.claude-tools` | Idle trigger only: prefix of the launchd job label (`<prefix>.save-clear-idle`) |
 | (none) | `SAVE_CLEAR_STATE_DIR` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/state/save-clear` | Flags, relay inbox and the logs `save-clear.log` and `relay.log` |
 
@@ -202,6 +203,30 @@ It asks again only after the context grows another 50k tokens, or after the cont
 limit (for example after a compaction) and crosses it again. It skips `claude -p` and SDK sessions,
 a session that already armed its `/clear` or armed a resume in the last 15 minutes, and the desktop
 app relay session.
+
+### Leftover background tasks
+
+A background task this session forgot about (a `run_in_background` Bash job, a Monitor watch) can
+keep the session busy, so the helper never sees it idle and only re-arms the `/clear`. With
+`kill_background_tasks` off (the default) nothing changes. With it on:
+
+- `save-clear dir` and `save-clear arm-clear` print a `kill_background_tasks: on` line, and the skill
+  tells Claude to stop the tasks this session started that are still running, with the TaskStop tool,
+  and to list them under `## Stopped background tasks` in the summary (or "none").
+- If the helper still finds the session busy and re-arms, the next Stop hook blocks once and asks
+  Claude for the same thing; the stop after that goes ahead with the `/clear`. That second chance
+  needs a later end of turn: if a task keeps the session busy while no turn runs at all, no Stop hook
+  comes, so the first step (before the clear is armed) is the one that counts. A re-arm caused by
+  your own message after the save does not count as busy.
+- After the `/clear`, the resume tells the new session to name the stopped tasks and say which ones
+  need to be started again (not when the section only says "none"). The heading stays in English,
+  even with `language` set, because the resume looks for it.
+
+The plugin itself never kills a process. Hooks and the helper cannot tell this session's background
+tasks apart from other processes (MCP servers, other sessions, your own programs), and only Claude
+can stop its own tasks, so this works through instructions to Claude, not from a hook. It was not
+watched in a live session whether a running background task makes `claude agents` report the session
+as busy.
 
 Two backups run without the skill. Before any compaction, the full transcript is saved gzipped with
 an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker. After it, the summary Claude Code wrote is kept as
@@ -314,7 +339,7 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
 
 ## Limits and what was not tested
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 70 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 121 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
   (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. On Windows, CI runs the unit tests

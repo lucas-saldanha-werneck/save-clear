@@ -17,9 +17,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (BIN, all_clears, clear_key, extra_steps, language, log, now_ms,  # noqa: E402
-                    publish_link, run_hook_command, seed_user_config, setting, snapshot_dir, tmux_bin,
-                    write_clear)
+from common import (BIN, all_clears, clear_key, extra_steps, kill_background_tasks, language, log,  # noqa: E402
+                    now_ms, publish_link, run_hook_command, seed_user_config, setting, snapshot_dir,
+                    stop_tasks_instruction, tmux_bin, write_clear)
 
 
 def cmd_dir():
@@ -29,6 +29,8 @@ def cmd_dir():
     print(f"publish_link: {'on' if publish_link() else 'off'}")
     if language():
         print(f"language: {language()}")
+    if kill_background_tasks():
+        print(stop_tasks_instruction("In save-and-clear mode, before writing the snapshot,"))
     steps = extra_steps()
     if steps:
         print("extra steps (from your save-clear config; follow them):")
@@ -132,10 +134,14 @@ def cmd_arm_clear(args):
             print("Not a terminal session. If the clear_session tool exists: run save-clear-relay request "
                   "(optional relay), then call clear_session with session_id \"self\"; otherwise tell the user "
                   "to type /clear.")
+            if kill_background_tasks():
+                print(stop_tasks_instruction("If you have not done it yet, before calling clear_session,"))
         return 0
     key = clear_key(job=target) if mode == "bg" else clear_key(sid)
     write_clear({"session_id": sid, "mode": mode, "target": target, "key": key, "ts": now_ms()})
     log("arm", f"auto-clear armed: mode={mode} target={target} session {sid[:8]}")
+    if kill_background_tasks():
+        print(stop_tasks_instruction("If you have not done it yet, now, before ending the turn,"))
     print("Automatic /clear armed: end the turn now with one short line.")
     return 0
 
@@ -158,6 +164,8 @@ def cmd_rearm(args):
         return 1
     flag["ts"] = flag["armed_at"] = now_ms()
     flag["deltas"] = flag.get("deltas", 0) + 1
+    # This round was the user's message, which is what kept the session busy: not a leftover task.
+    flag.pop("busy_rearm", None)
     flag["key"] = flag.get("key") or (clear_key(job=job) if job and flag.get("mode") == "bg" else clear_key(sid))
     write_clear(flag)
     print(f"re-armed (round {flag['deltas']} after the save)")
