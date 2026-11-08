@@ -98,8 +98,11 @@ The skill tells Claude to:
 6. In "save and clear" mode, run `save-clear arm-clear`, which picks how the `/clear` can be sent.
 
 The SessionStart hook hands the summary only to the session that armed it, after its `/clear`.
-A terminal session is matched by process id, a desktop app session by its app session id, a
-`claude --bg` session by its job id. Other sessions and other folders get nothing. Unclaimed
+A terminal or IDE session is matched by process id (the `/clear` must happen in the same process),
+a desktop app session by its app session id, a `claude --bg` session by its job id. Other sessions
+and other folders get nothing. If none of these ids is available when the resume is armed, the
+summary is not handed out automatically: `arm-resume` prints a warning, and after the `/clear` you
+ask Claude to read the summary file. Unclaimed
 entries are dropped after 7 days. Arming and handing out a summary each hold a file lock while they
 read and rewrite the list, so sessions that save at the same moment keep each other's entries.
 
@@ -119,14 +122,18 @@ How the `/clear` happens:
 
 If you send a message after the save, the Stop hook does not clear. It asks Claude to answer it, add
 it to the summary under `## After the save`, and run `save-clear rearm <session id>`. This repeats up
-to 3 times.
+to 3 times. A message still waiting in the queue counts too. The helper checks for new messages
+again right before it presses Enter on `/clear`; if one arrived, it erases the `/clear` it typed,
+does not press Enter, and re-arms the request for the next end of turn.
 In the desktop app, a PreToolUse hook holds the first `clear_session` call the same way.
 
 A second Stop hook watches the context size. When Claude ends a turn and the last reply used more
 than `context_cap_tokens` (input plus cache tokens, subagents not counted), it blocks the stop once
 and asks Claude to run save-clear in "save and clear" mode. It never acts in the middle of a task.
-It asks again only after the context grows another 50k tokens. It skips `claude -p` and SDK
-sessions, a session that already armed its `/clear`, and the desktop app relay session.
+It asks again only after the context grows another 50k tokens, or after the context drops below the
+limit (for example after a compaction) and crosses it again. It skips `claude -p` and SDK sessions,
+a session that already armed its `/clear` or armed a resume in the last 15 minutes, and the desktop
+app relay session.
 
 Two backups run without the skill. Before any compaction, the full transcript is saved gzipped with
 an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker. After it, the summary Claude Code wrote is kept as
@@ -181,9 +188,9 @@ state ended up in `~/.claude/state/save-clear`, delete that folder yourself, plu
 
 ## Limits and what was not tested
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 43 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 54 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
-  (`bash tests/run.sh`, 29 checks). The `claude --bg` helper is tested against a fake tmux and a
+  (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. Install and uninstall were run with the
   `claude plugin` CLI.
 - Not tested live: the desktop app relay round trip (request, clear, `send_message`, ack, resume),
@@ -191,7 +198,8 @@ state ended up in `~/.claude/state/save-clear`, delete that folder yourself, plu
   `claude --bg` clear confirmation reads `resumeSessionId` from `~/.claude/jobs/<id>/state.json`;
   that field was seen in real state files, but not watched across a real clear. If it does not
   change, the helper only skips the resume request. The desktop app session matching relies on the `CLAUDE_CODE_HOST_SESSION_ID` variable,
-  which was not checked from inside the app here.
+  which was not checked from inside the app here. IDE sessions were not tested live; matching them
+  by process id assumes `/clear` there keeps the same process, as in the terminal.
 - The app log format was checked against a real macOS log. The Linux and Windows log paths were not.
 - Windows was not tested.
 - The tmux helper reads the screen to see an empty prompt. If colors are off in tmux, it may treat

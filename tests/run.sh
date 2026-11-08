@@ -132,6 +132,18 @@ wait $HP; rc=$?
 typed | grep -q 'clear' && bad "submitted the edited draft: $(typed | tr '\n' '|')" || ok "edited draft NOT submitted"
 logf | grep -q "Enter not sent" && ok "log says Enter not sent" || bad "log: $(logf)"
 
+echo "== T14: a message is queued while /clear sits in the prompt, before Enter -> no Enter, re-armed"
+new_case match
+TP="$D/transcript.jsonl"; : > "$TP"
+NOW=$(($(date +%s)*1000))
+"$PY" "$R/bin/save-clear-send" tmux "$PANE" "$A" "{\"session_id\":\"$A\",\"mode\":\"tmux\",\"target\":\"$PANE\",\"key\":\"$A\",\"ts\":$NOW}" "$TP" & HP=$!
+for _ in $(seq 1 100); do "$TM" capture-pane -p -t "$PANE" | grep -q '❯ /clear' && break; sleep 0.05; done
+printf '{"type":"queue-operation","operation":"enqueue","timestamp":"%s","content":"wait, do not clear"}\n' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> "$TP"
+wait $HP; rc=$?
+typed | grep -q 'clear' && bad "Enter sent: $(typed | tr '\n' '|')" || ok "Enter NOT sent"
+[ -f "$(FL)" ] && ok "request re-armed" || bad "not re-armed; log: $(logf)"
+"$TM" capture-pane -p -t "$PANE" | grep '❯' | tail -1 | grep -q '/clear' && bad "/clear left in the prompt" || ok "typed /clear erased from the prompt"
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

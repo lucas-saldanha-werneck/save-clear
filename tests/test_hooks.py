@@ -110,6 +110,21 @@ class Resume(Base):
         self.assertEqual(self.start(source="startup", CLAUDE_CODE_HOST_SESSION_ID="local_two").stdout.strip(), "")
         self.assertIn("we were testing", self.start(source="startup", CLAUDE_CODE_HOST_SESSION_ID="local_one").stdout)
 
+    def test_ide_session_needs_the_same_process(self):
+        # An IDE session has no app session id: only a /clear in the same process may take the summary.
+        self.arm(self.snapshot(), CLAUDE_CODE_ENTRYPOINT="claude-vscode")
+        self.assertEqual(self.start(source="startup", sid=SID_B, CLAUDE_CODE_ENTRYPOINT="claude-vscode",
+                                    CLAUDE_PID=9999).stdout.strip(), "", "another IDE session in the same folder")
+        self.assertEqual(self.start(CLAUDE_CODE_ENTRYPOINT="claude-vscode", CLAUDE_PID=9999).stdout.strip(), "")
+        self.assertIn("we were testing", self.start(CLAUDE_CODE_ENTRYPOINT="claude-vscode", CLAUDE_PID=4242).stdout)
+
+    def test_no_stable_identity_is_never_delivered_automatically(self):
+        snap = self.snapshot()
+        r = self.arm(snap, CLAUDE_PID="", CLAUDE_CODE_SESSION_ID="")
+        self.assertIn("NOT delivered automatically", r.stdout)
+        self.assertEqual(self.start(CLAUDE_PID=9999).stdout.strip(), "", "another session's /clear in the same folder")
+        self.assertTrue(os.path.exists(self.flag_path("pending_resume.json")), "entry kept for its owner")
+
     def test_two_sessions_queue(self):
         self.arm(self.snapshot())
         other = os.path.join(self.snaps, "SESSION-SUMMARY-other.md")
@@ -243,6 +258,25 @@ class Stop(Base):
             self.assertEqual(json.load(f)["deltas"], 1)
 
 
+    def test_queued_message_blocks_the_clear(self):
+        self.write_flag(mode="manual-test")
+        tp = self.transcript({"type": "queue-operation", "operation": "enqueue", "timestamp": iso(1),
+                              "content": "Wait: do not clear"})
+        r = self.run_py("hooks/stop.py", stdin={"session_id": SID_A, "transcript_path": tp})
+        self.assertIn('"decision": "block"', r.stdout, r.stdout)
+        self.assertIn("Wait: do not clear", r.stdout)
+
+    def test_cancelled_queued_message_and_notifications_do_not_block(self):
+        self.write_flag(mode="manual-test")
+        tp = self.transcript(
+            {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(1), "content": "<task-notification>x"},
+            {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(1), "content": "never mind"},
+            {"type": "queue-operation", "operation": "remove", "timestamp": iso(2), "content": "never mind",
+             "reason": "cancelled"})
+        r = self.run_py("hooks/stop.py", stdin={"session_id": SID_A, "transcript_path": tp})
+        self.assertNotIn('"decision": "block"', r.stdout, r.stdout)
+
+
 class ClearFlags(Base):
     """Each session has its own automatic-clear request."""
     def arm_bg(self, sid, job):
@@ -324,7 +358,7 @@ class BgHelper(Base):
     """`claude --bg` mode of the helper, against a fake tmux and a fake job state file."""
     JOB = "job12345"
 
-    def run_bg(self, state="idle", messages=(), draft="", clears=False):
+    def run_bg(self, state="idle", messages=(), draft="", clears=False, raw=(), **env):
         home = os.path.join(self.t, "home")
         jd = os.path.join(home, ".claude", "jobs", self.JOB)
         os.makedirs(jd, exist_ok=True)
@@ -338,10 +372,14 @@ class BgHelper(Base):
         with open(tp, "w") as f:
             for m in messages:
                 f.write(json.dumps({"type": "user", "timestamp": iso(1), "message": {"role": "user", "content": m}}) + "\n")
+            for e in raw:
+                f.write(json.dumps(e) + "\n")
+        self.tp = tp
         flag = {"session_id": SID_A, "mode": "bg", "target": self.JOB, "key": "job-" + self.JOB,
                 "ts": int(time.time() * 1000)}
         r = self.run_py("bin/save-clear-send", ["bg", self.JOB, SID_A, json.dumps(flag), tp], HOME=home,
-                        FAKE_JOB_STATE=st, FAKE_TMUX_CLEARS="1" if clears else "0", SAVE_CLEAR_BG_WAIT="2")
+                        FAKE_JOB_STATE=st, FAKE_TMUX_CLEARS="1" if clears else "0", SAVE_CLEAR_BG_WAIT="2",
+                        **{k: v.replace("{tp}", tp) for k, v in env.items()})
         calls = os.path.join(self.t, "tmux-calls.jsonl")
         keys = []
         if os.path.exists(calls):
@@ -368,6 +406,39 @@ class BgHelper(Base):
         os.unlink(os.path.join(self.t, "tmux-calls.jsonl"))
         r, keys = self.run_bg(clears=True)
         self.assertIn("save-clear: resuming", keys)
+
+
+    def test_queued_message_stops_the_clear(self):
+        r, keys = self.run_bg(raw=[{"type": "queue-operation", "operation": "enqueue", "timestamp": iso(1),
+                                    "content": "Wait: do not clear"}])
+        self.assertNotIn("/clear", keys)
+
+    def test_message_during_the_pre_enter_delay_withholds_enter(self):
+        r, keys = self.run_bg(clears=True, FAKE_TMUX_QUEUE_ON_CLEAR="{tp}")
+        self.assertIn("/clear", keys, "typed /clear, then the message arrived")
+        self.assertNotIn("/clear Enter", keys.replace("-l /clear send-keys", "/clear"))
+        with open(os.path.join(self.t, "tmux-calls.jsonl")) as f:
+            calls = [json.loads(l) for l in f]
+        sends = [c for c in calls if c[0] == "send-keys"]
+        i = next(n for n, c in enumerate(sends) if c[-1] == "/clear")
+        self.assertNotIn("Enter", [c[-1] for c in sends[i:]], "Enter not pressed after /clear")
+        self.assertTrue(os.path.exists(self.flag_path("clear/job-" + self.JOB + ".json")), "request re-armed")
+
+    def test_attach_command_survives_spaces_and_shell_characters(self):
+        tools = os.path.join(self.t, "my tools;touch PWNED")
+        os.makedirs(tools)
+        fake = os.path.join(tools, "claude")
+        out = os.path.join(self.t, "attach-args")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/sh\necho "$@" > "{out}"\n')
+        os.chmod(fake, 0o755)
+        self.run_bg(SAVE_CLEAR_CLAUDE=fake)
+        with open(os.path.join(self.t, "tmux-calls.jsonl")) as f:
+            [new] = [json.loads(l) for l in f if json.loads(l)[0] == "new-session"]
+        subprocess.run(["sh", "-c", new[-1]], cwd=self.t, timeout=10)  # what tmux does with the command string
+        self.assertFalse(os.path.exists(os.path.join(self.t, "PWNED")), "no shell syntax ran from the path")
+        with open(out) as f:
+            self.assertEqual(f.read().strip(), "attach " + self.JOB)
 
 
 class Compact(Base):
@@ -592,6 +663,31 @@ class ContextCap(Base):
         with open(self.flag_path("relay.json"), "w") as f:
             json.dump({"local_id": "relay-1"}, f)
         self.assertEqual(self.cap(400000, sid=SID_B, CLAUDE_CODE_HOST_SESSION_ID="relay-1").stdout, "")
+
+    def test_no_second_ask_right_after_a_save(self):
+        # The save-clear turn just armed the resume; stop.py already consumed the /clear request.
+        self.arm(self.snapshot())
+        self.assertEqual(self.cap(400000).stdout, "", "this session just saved")
+
+    def test_bg_job_request_counts_as_armed(self):
+        os.makedirs(self.flag_path("clear"), exist_ok=True)
+        with open(self.flag_path("clear/job-j1.json"), "w") as f:
+            json.dump({"session_id": SID_A, "mode": "bg", "target": "j1"}, f)
+        self.assertEqual(self.cap(400000, CLAUDE_JOB_DIR=os.path.join(self.t, "jobs", "j1")).stdout, "")
+
+    def test_asks_again_after_the_context_shrinks(self):
+        self.assertIn('"block"', self.cap(310000).stdout)
+        self.assertEqual(self.cap(100000).stdout, "", "after a compaction")
+        self.assertIn('"block"', self.cap(310000).stdout, "past the limit again: ask again")
+
+    def test_zero_usage_row_is_skipped(self):
+        p = self.transcript(400000)
+        with open(p, "a") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"model": "<synthetic>", "usage": {
+                "input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}) + "\n")
+        r = self.run_py("hooks/context_cap.py", stdin={"session_id": SID_A, "transcript_path": p},
+                        CLAUDE_CODE_ENTRYPOINT="cli")
+        self.assertIn('"block"', r.stdout, "a synthetic reply with zero usage is not the context size")
 
     def test_ignores_subagent_usage_and_bad_input(self):
         p = self.transcript(100000, sidechain_tokens=900000)

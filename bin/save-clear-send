@@ -26,6 +26,7 @@ Test knobs: SAVE_CLEAR_STATE_DIR, SAVE_CLEAR_CLAUDE (a fake `claude`), SAVE_CLEA
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -237,6 +238,12 @@ def bg_type(s, before):
         log(f"REFUSED: check before Enter failed ({why}). Enter not sent; '/clear' is still in the prompt")
         notify("save-clear: did not clear the background session. Type /clear yourself.")
         return 3
+    msgs = new_messages()  # a message can arrive during the pause between typing and Enter
+    if msgs:
+        sh([TMUX, "send-keys", "-t", s, *["BSpace"] * len("/clear")])
+        rearm(f"new message while /clear was in the prompt ({msgs[-1][:40]!r}); Enter not sent")
+        notify("save-clear: a message arrived after the save, so the session was not cleared.")
+        return 0
     sh([TMUX, "send-keys", "-t", s, "Enter"])
     after = ""
     for _ in range(10):
@@ -296,7 +303,7 @@ def run_bg():
     s = f"save-clear-{target}"
     sh([TMUX, "kill-session", "-t", s])
     if subprocess.run([TMUX, "new-session", "-d", "-s", s, "-x", "200", "-y", "50",
-                       f"{CLAUDE} attach {target}"]).returncode != 0:
+                       f"{shlex.quote(CLAUDE)} attach {shlex.quote(target)}"]).returncode != 0:
         log("tmux/attach failed")
         return 1
     try:
@@ -401,6 +408,13 @@ def press_enter(text):
     ok, why = ready_for_enter(text)
     if not ok:
         refuse(f"check before Enter failed ({why}). Enter not sent; {text[:30]!r} is still in the prompt")
+    if text == "/clear":
+        msgs = new_messages()  # a message can arrive during the pause between typing and Enter
+        if msgs:
+            keys(*["BSpace"] * len(text))  # the prompt holds exactly our text (just checked): erase it
+            rearm(f"new message while /clear was in the prompt ({msgs[-1][:40]!r}); Enter not sent")
+            notify("save-clear: a message arrived after the save, so the session was not cleared.")
+            sys.exit(0)
     keys("Enter")
 
 

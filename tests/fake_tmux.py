@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import time
 
 D = os.environ.get("FAKE_TMUX_DIR")
 if not D:
@@ -40,8 +41,16 @@ elif cmd == "send-keys":
             draft = ""
         elif k == "C-z" and not literal:
             pass
+        elif k == "BSpace" and not literal:
+            draft = draft[:-1]
         else:
             draft += k
+            queue = os.environ.get("FAKE_TMUX_QUEUE_ON_CLEAR")
+            if queue and literal and draft.strip() == "/clear":  # a remote message lands during the pre-Enter delay
+                with open(queue, "a") as f:
+                    f.write(json.dumps({"type": "queue-operation", "operation": "enqueue",
+                                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 1)),
+                                        "content": "wait, do not clear yet"}) + "\n")
     with open(draft_file, "w") as f:
         f.write(draft)
 sys.exit(0)

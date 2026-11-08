@@ -74,8 +74,9 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
 
    Check that it prints `auto-resume armed: ...`; a non-zero exit means it did not arm (say so). The
    SessionStart hook delivers the summary only to THIS session after its /clear (terminal: same
-   process; desktop app: same folder and same app session). Other sessions get nothing. If the user
-   says they will NOT continue this topic, skip this step.
+   process; desktop app: same folder and same app session). Other sessions get nothing. If it prints
+   a warning that the summary is NOT delivered automatically, tell the user to ask you to read the
+   snapshot after the /clear. If the user says they will NOT continue this topic, skip this step.
 
 7. **Reply in this fixed, short format:**
 

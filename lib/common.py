@@ -289,10 +289,21 @@ def tail_lines(path, max_bytes=3 * 1024 * 1024):
 
 
 def user_messages_since(transcript, since_ms):
-    """The user's own messages (typed or queued) in the transcript after since_ms."""
-    out = []
+    """The user's own messages (typed or queued) in the transcript after since_ms.
+
+    Queued messages count from their `queue-operation` enqueue record, even before Claude reads them.
+    A later `remove` with a reason other than absorbed_mid_turn (the user took it back) cancels it."""
+    out, cancelled = [], set()
     if not transcript:
         return out
+    for line in tail_lines(transcript):
+        if '"queue-operation"' in line and '"remove"' in line:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("operation") == "remove" and d.get("reason") not in (None, "absorbed_mid_turn"):
+                cancelled.add(str(d.get("content") or "").strip())
     for line in tail_lines(transcript):
         if '"timestamp"' not in line:
             continue
@@ -309,6 +320,9 @@ def user_messages_since(transcript, since_ms):
         att = d.get("attachment") or {}
         if d.get("type") == "attachment" and att.get("type") == "queued_command":
             txt = att.get("prompt", "")
+        elif d.get("type") == "queue-operation" and d.get("operation") == "enqueue":
+            c = d.get("content")
+            txt = c if isinstance(c, str) and c.strip() not in cancelled else ""
         elif d.get("type") == "user":
             c = (d.get("message") or {}).get("content")
             if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
