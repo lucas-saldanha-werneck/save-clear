@@ -43,7 +43,8 @@ class Base(unittest.TestCase):
                     if not k.startswith(("CLAUDE", "TMUX", "SAVE_CLEAR", "TERM_PROGRAM", "LC_TERMINAL"))}
         self.env.update(SAVE_CLEAR_STATE_DIR=self.state, SAVE_CLEAR_SNAPSHOT_DIR=self.snaps,
                         SAVE_CLEAR_CLAUDE="/nonexistent/claude", SAVE_CLEAR_POINTER=os.path.join(t, "pointer"),
-                        SAVE_CLEAR_APP_LOG=os.path.join(t, "app-main.log"))
+                        SAVE_CLEAR_APP_LOG=os.path.join(t, "app-main.log"),
+                        SAVE_CLEAR_CONFIG=os.path.join(t, "user-config.json"))
         # A fake tmux first on PATH: no test ever reaches a real tmux server.
         self.fakebin = os.path.join(t, "fakebin")
         os.makedirs(self.fakebin)
@@ -457,6 +458,22 @@ class BgHelper(Base):
         self.assertFalse(os.path.exists(os.path.join(self.t, "PWNED")), "no shell syntax ran from the path")
         with open(out) as f:
             self.assertEqual(f.read().strip(), "attach " + self.JOB)
+
+    def test_custom_resume_message_and_pre_clear_in_bg_mode(self):
+        log = os.path.join(self.t, "hook-log.jsonl")
+        script = os.path.join(self.t, "hook.py")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(HOOK_SCRIPT)
+        with open(self.env["SAVE_CLEAR_CONFIG"], "w", encoding="utf-8") as f:
+            json.dump({"resume_message": PT_RESUME, "pre_clear_command": f'"{PY}" "{script}"'}, f,
+                      ensure_ascii=False)
+        r, keys = self.run_bg(clears=True, HOOK_LOG=log)
+        self.assertIn(PT_RESUME, keys)
+        self.assertNotIn("save-clear: resuming", keys)
+        with open(log, encoding="utf-8") as f:
+            [call] = [json.loads(l) for l in f]
+        self.assertEqual((call["SAVE_CLEAR_EVENT"], call["SAVE_CLEAR_MODE"], call["SAVE_CLEAR_TARGET"]),
+                         ("pre_clear", "bg", self.JOB))
 
 
 class Compact(Base):
@@ -1079,6 +1096,166 @@ exit 0
         self.assertEqual(self.install().returncode, 2)
         self.assertEqual(self.install("--idle", "--interval", "5").returncode, 2)
         self.assertEqual(self.install("--bogus").returncode, 2)
+
+
+PT_RESUME = "salvalimpa: retomando. Comece pelo ÚLTIMO assunto (onde paramos e o que está em aberto)."
+# A command a user could plug in: logs the save-clear variables it got, prints HOOK_PRINT, exits HOOK_EXIT.
+HOOK_SCRIPT = r"""
+import json, os, sys
+NAMES = ("SAVE_CLEAR_EVENT", "SAVE_CLEAR_SNAPSHOT", "SAVE_CLEAR_SESSION_ID", "SAVE_CLEAR_PREVIOUS_SESSION_ID",
+         "SAVE_CLEAR_MODE", "SAVE_CLEAR_TARGET", "SAVE_CLEAR_PROJECT_DIR", "CLAUDE_PID")
+with open(os.environ["HOOK_LOG"], "a", encoding="utf-8") as f:
+    f.write(json.dumps({k: os.environ[k] for k in NAMES if k in os.environ}) + "\n")
+sys.stdout.write(os.environ.get("HOOK_PRINT", "").replace("|", "\n"))
+sys.exit(int(os.environ.get("HOOK_EXIT", "0")))
+"""
+
+
+class UserConfig(Base):
+    """Options in ~/.config/save-clear/config.json (SAVE_CLEAR_CONFIG) and the commands users plug in."""
+
+    def setUp(self):
+        super().setUp()
+        self.hook_log = os.path.join(self.t, "hook-log.jsonl")
+        script = os.path.join(self.t, "hook script.py")  # a space in the path on purpose
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(HOOK_SCRIPT)
+        self.cmd = f'"{PY}" "{script}"'
+        self.env["HOOK_LOG"] = self.hook_log
+
+    def config(self, **values):
+        with open(self.env["SAVE_CLEAR_CONFIG"], "w", encoding="utf-8") as f:
+            json.dump(values, f, ensure_ascii=False)
+
+    def hook_calls(self):
+        if not os.path.exists(self.hook_log):
+            return []
+        with open(self.hook_log, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def test_config_file_is_read_and_env_wins(self):
+        custom = os.path.join(self.t, "from-file")
+        self.config(snapshot_dir=custom, language="Portuguese", extra_steps="Call plan_steps before clear_session.")
+        r = self.run_py("bin/save-clear", ["dir"])
+        lines = r.stdout.splitlines()
+        self.assertEqual(lines[0], self.snaps, "the env var beats the config file")
+        self.assertIn("language: Portuguese", lines)
+        self.assertIn("Call plan_steps before clear_session.", r.stdout)
+        self.env.pop("SAVE_CLEAR_SNAPSHOT_DIR")
+        self.assertEqual(self.run_py("bin/save-clear", ["dir"]).stdout.splitlines()[0], custom)
+        r = self.run_py("bin/save-clear", ["dir"], CLAUDE_PLUGIN_OPTION_LANGUAGE="German")
+        self.assertIn("language: German", r.stdout, "a plugin option beats the config file")
+
+    def test_extra_steps_from_a_file_and_bad_config(self):
+        steps = os.path.join(self.t, "steps.md")
+        with open(steps, "w", encoding="utf-8") as f:
+            f.write("1. Passo próprio do usuário\n2. Outro passo\n")
+        self.config(extra_steps=steps)
+        r = self.run_py("bin/save-clear", ["dir"])
+        self.assertIn("extra steps", r.stdout)
+        self.assertIn("2. Outro passo", r.stdout)
+        with open(self.env["SAVE_CLEAR_CONFIG"], "w") as f:
+            f.write("{not json")
+        r = self.run_py("bin/save-clear", ["dir"])
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("extra steps", r.stdout)
+
+    def test_on_save_output_is_appended_once(self):
+        self.config(on_save_command=self.cmd)
+        snap = self.snapshot()
+        r = self.arm(snap, HOOK_PRINT="## Open pages (restart first)|- /tmp/page.html")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("on_save_command: added 2 line(s)", r.stdout)
+        self.assertIn("auto-resume armed", r.stdout)
+        with open(snap, encoding="utf-8") as f:
+            body = f.read()
+        self.assertIn("we were testing\n\n## Open pages (restart first)\n- /tmp/page.html\n", body)
+        [call] = self.hook_calls()
+        self.assertEqual((call["SAVE_CLEAR_EVENT"], call["SAVE_CLEAR_SNAPSHOT"], call["SAVE_CLEAR_SESSION_ID"]),
+                         ("save", snap, SID_A))
+        self.assertEqual(call["CLAUDE_PID"], "4242", "the script can find the session's own processes")
+        self.arm(snap, HOOK_PRINT="## Open pages (restart first)|- /tmp/page.html")
+        with open(snap, encoding="utf-8") as f:
+            self.assertEqual(f.read().count("## Open pages"), 1, "not appended twice")
+
+    def test_failing_on_save_never_blocks_the_arm(self):
+        self.config(on_save_command=self.cmd)
+        snap = self.snapshot()
+        r = self.arm(snap, HOOK_PRINT="half output", HOOK_EXIT="3")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("exited 3", r.stdout)
+        with open(snap, encoding="utf-8") as f:
+            self.assertNotIn("half output", f.read())
+        self.config(on_save_command=os.path.join(self.t, "missing-program"))
+        r = self.arm(snap)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("failed to run", r.stdout)
+        self.assertIn("auto-resume armed", r.stdout)
+
+    def test_on_resume_output_and_language_reach_the_new_session(self):
+        self.config(on_resume_command=self.cmd, language="Portuguese")
+        snap = self.snapshot()
+        self.arm(snap)
+        out = self.start(CLAUDE_PID=4242, HOOK_PRINT="Run the page poll again in the background.")
+        ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Write your replies in Portuguese.", ctx)
+        self.assertIn("Run the page poll again in the background.", ctx)
+        self.assertLess(ctx.index("page poll again"), ctx.index("we were testing"), "before the summary")
+        [call] = self.hook_calls()
+        self.assertEqual((call["SAVE_CLEAR_EVENT"], call["SAVE_CLEAR_SNAPSHOT"], call["SAVE_CLEAR_SESSION_ID"],
+                          call["SAVE_CLEAR_PREVIOUS_SESSION_ID"]), ("resume", snap, SID_NEW, SID_A))
+
+    def test_failing_on_resume_still_delivers_the_summary(self):
+        self.config(on_resume_command=self.cmd)
+        self.arm(self.snapshot())
+        out = self.start(CLAUDE_PID=4242, HOOK_PRINT="should not show", HOOK_EXIT="1")
+        ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("we were testing", ctx)
+        self.assertNotIn("should not show", ctx)
+
+    def test_custom_resume_message_is_not_a_user_message(self):
+        self.config(resume_message=PT_RESUME)
+        os.makedirs(self.flag_path("clear"), exist_ok=True)
+        with open(self.flag_path(f"clear/{SID_A}.json"), "w") as f:
+            json.dump({"session_id": SID_A, "mode": "manual-test", "target": "", "key": SID_A,
+                       "ts": int(time.time() * 1000)}, f)
+        tp = os.path.join(self.proj, "t.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user", "timestamp": iso(1),
+                                "message": {"role": "user", "content": PT_RESUME}}) + "\n")
+        r = self.run_py("hooks/stop.py", stdin={"session_id": SID_A, "transcript_path": tp})
+        self.assertNotIn('"block"', r.stdout, "the resume request does not hold the clear")
+
+    def test_relay_sends_the_custom_resume_message(self):
+        self.config(resume_message=PT_RESUME)
+        self.run_py("bin/save-clear-relay", ["setup", RELAY_ID])
+        self.run_py("bin/save-clear-relay", ["request"], CLAUDE_CODE_HOST_SESSION_ID=APP)
+        d = os.path.join(self.state, "relay-inbox")
+        [name] = [n for n in os.listdir(d) if n.endswith(".json")]
+        with open(os.path.join(d, name), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["message"], PT_RESUME)
+
+    def test_pre_clear_runs_before_clear_session_goes_through(self):
+        self.config(pre_clear_command=self.cmd)
+        hook = {"tool_input": {"session_id": "self"}, "session_id": SID_A,
+                "transcript_path": os.path.join(self.proj, "none.jsonl")}
+        r = self.run_py("hooks/clear_guard.py", stdin=hook, CLAUDE_CODE_HOST_SESSION_ID=APP, HOOK_PRINT="noise")
+        self.assertEqual(r.stdout, "", "the command's output never reaches the hook output")
+        [call] = self.hook_calls()
+        self.assertEqual((call["SAVE_CLEAR_EVENT"], call["SAVE_CLEAR_MODE"], call["SAVE_CLEAR_TARGET"],
+                          call["SAVE_CLEAR_SESSION_ID"]), ("pre_clear", "app", APP, SID_A))
+
+    def test_pre_clear_not_run_when_the_clear_is_held(self):
+        self.config(pre_clear_command=self.cmd)
+        tp = os.path.join(self.proj, "t.jsonl")
+        skill = "Base directory for this skill: /x/plugins/save-clear/skills/save-clear\n..."
+        with open(tp, "w") as f:
+            for e in ({"type": "user", "timestamp": iso(-60), "message": {"role": "user", "content": skill}},
+                      {"type": "user", "timestamp": iso(-30), "message": {"role": "user", "content": "wait, X"}}):
+                f.write(json.dumps(e) + "\n")
+        r = self.run_py("hooks/clear_guard.py", stdin={"tool_input": {"session_id": "self"}, "transcript_path": tp})
+        self.assertIn("deny", r.stdout)
+        self.assertEqual(self.hook_calls(), [])
 
 
 if __name__ == "__main__":

@@ -31,11 +31,12 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import (BIN, MARGIN_MS, RESUME_MSG, ancestors, claude_bin, clear_key, draft_why,  # noqa: E402
-                    log as _log, notify, now_ms, prompt_block, prompt_text, ps_parents, short, squash, tmux_bin,
-                    user_messages_since, write_clear)
+from common import (BIN, MARGIN_MS, ancestors, claude_bin, clear_key, draft_why,  # noqa: E402
+                    log as _log, notify, now_ms, prompt_block, prompt_text, ps_parents, resume_msg,
+                    run_hook_command, short, squash, tmux_bin, user_messages_since, write_clear)
 
 CLAUDE = claude_bin()
+RESUME_MSG = resume_msg()  # the resume_message option, else the default text
 TMUX = tmux_bin() or "tmux"
 DRY = os.environ.get("SAVE_CLEAR_DRY_RUN") == "1"
 MAX_WAIT = int(os.environ.get("SAVE_CLEAR_MAX_WAIT", "1200"))  # 20 min waiting for the session to be free
@@ -148,6 +149,15 @@ def rearm(why):
     log(f"re-armed ({why}); the next end of turn tries again")
 
 
+def pre_clear():
+    """The user's pre_clear_command, once, right before /clear is typed. It never stops the clear."""
+    if DRY:
+        return
+    run_hook_command("pre_clear_command", "pre_clear",
+                     {"SAVE_CLEAR_SESSION_ID": sid, "SAVE_CLEAR_MODE": mode, "SAVE_CLEAR_TARGET": target},
+                     timeout=20)
+
+
 def new_messages():
     try:
         since = json.loads(flag_json).get("ts", 0) - MARGIN_MS
@@ -210,6 +220,7 @@ def bg_type(s, before):
         rearm(f"new message after the save ({msgs[-1][:40]!r}); typed nothing")
         notify("save-clear: a message arrived after the save, so the session was not cleared.")
         return 0
+    pre_clear()
     sh([TMUX, "send-keys", "-t", s, "-l", "/clear"])
     time.sleep(1)
     ok, why = bg_ready_for_enter(s, "/clear")
@@ -446,6 +457,8 @@ def run_tmux():
 
     # 2) /clear, then confirm the sessionId changed in the same process
     new_sid = None
+    stop_if_new("before /clear")
+    pre_clear()
     for attempt in (1, 2):
         stop_if_new("before /clear")
         sent, why = False, ""

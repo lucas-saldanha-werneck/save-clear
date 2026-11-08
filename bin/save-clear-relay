@@ -35,7 +35,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import RESUME_MSG, ROOT, STATE, ensure_state, read_json, write_json  # noqa: E402
+from common import ROOT, resume_msg, STATE, ensure_state, read_json, write_json  # noqa: E402
 
 try:
     import fcntl
@@ -159,7 +159,7 @@ def cmd_request():
     if me == rid:
         print(f"this session IS the relay: follow the \"Context full\" part of `{CMD} rules` instead", file=sys.stderr)
         return 1
-    return enqueue(me, RESUME_MSG, after_clear=me, why="save-clear")
+    return enqueue(me, resume_msg(), after_clear=me, why="save-clear")
 
 
 def cmd_setup(args):

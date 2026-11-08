@@ -49,7 +49,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (HOME, RESUME_MSG, STATE, ancestors, claude_bin, clear_key, clear_path,  # noqa: E402
+from common import (HOME, RESUME_MSG, STATE, resume_msg, ancestors, claude_bin, clear_key, clear_path,  # noqa: E402
                     draft_why, log as _log, now_ms, prompt_block, ps_parents, setting, short, squash, tail_lines,
                     tmux_bin)
 
@@ -167,7 +167,9 @@ def last_context(tp):
 def is_resume_request(line):
     """A top-level user message whose text is the resume request save-clear types (not a tool result
     or a file that merely quotes it)."""
-    if RESUME_MSG[:20] not in line:
+    custom = resume_msg()
+    # quick filter on the raw line (non-ASCII text may be \u-escaped there, so only ASCII prefixes filter)
+    if RESUME_MSG[:20] not in line and custom[:20].isascii() and custom[:20] not in line:
         return False
     try:
         d = json.loads(line)
@@ -177,7 +179,7 @@ def is_resume_request(line):
         return False
     msg = d.get("message")
     content = msg.get("content") if isinstance(msg, dict) else None
-    return isinstance(content, str) and content.lstrip().startswith(RESUME_MSG)
+    return isinstance(content, str) and content.lstrip().startswith((RESUME_MSG, custom))
 
 
 def resume_baseline(tp):

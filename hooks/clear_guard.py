@@ -12,7 +12,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import STATE, ensure_state, log as _log, read_hook_input, read_json, write_json  # noqa: E402
+from common import (STATE, ensure_state, log as _log, read_hook_input, read_json, run_hook_command,  # noqa: E402
+                    write_json)
 
 GUARD_STATE = os.path.join(STATE, "clear-guard.json")  # transcript -> number of messages already asked about
 SKILL_MARK = "/skills/save-clear"
@@ -78,22 +79,30 @@ def main():
     data = read_hook_input()
     if (data.get("tool_input") or {}).get("session_id") != "self":
         return
+    if decide(data):  # the clear goes through: run the user's pre_clear_command first (never blocks)
+        run_hook_command("pre_clear_command", "pre_clear",
+                         {"SAVE_CLEAR_SESSION_ID": data.get("session_id") or "", "SAVE_CLEAR_MODE": "app",
+                          "SAVE_CLEAR_TARGET": os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or ""}, timeout=10)
+
+
+def decide(data):
+    """True = allow the clear; False = denied once (the reason was printed)."""
     path = data.get("transcript_path") or ""
     try:
         with open(path, encoding="utf8") as f:
             entries = [json.loads(line) for line in f if line.strip()]
     except Exception as e:
         log(f"no transcript ({e}); clear allowed")
-        return
+        return True
     found = new_messages(entries)
     name = os.path.basename(path)[:8]
     if not found:
         log(f"{name}: no new messages; clear allowed")
-        return
+        return True
     state = read_json(GUARD_STATE) or {}
     if state.get(path, 0) >= len(found):
         log(f"{name}: {len(found)} message(s) already asked about; clear allowed")
-        return
+        return True
     state[path] = len(found)
     try:
         ensure_state()
@@ -109,6 +118,7 @@ def main():
               "a message still waiting to run; note in the snapshot that it was queued at clear time.")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                              "permissionDecisionReason": reason}}))
+    return False
 
 
 if __name__ == "__main__":

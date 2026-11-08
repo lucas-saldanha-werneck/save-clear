@@ -67,7 +67,23 @@ On Windows, save and resume work, but the automatic `/clear` does not (see below
 
 ## Settings
 
-Set them with `/plugin configure save-clear@save-clear`, or with environment variables.
+Set them with `/plugin configure save-clear@save-clear` (or the `/config` panel), with environment
+variables, or in your own file `~/.config/save-clear/config.json` (`$XDG_CONFIG_HOME/save-clear/` if
+set; another path with `SAVE_CLEAR_CONFIG`). Same keys as the option names:
+
+```json
+{
+  "language": "Portuguese",
+  "notify_command": "my-notify",
+  "on_save_command": "~/.config/save-clear/on-save.sh"
+}
+```
+
+**Your values survive plugin updates.** Plugin options are stored by Claude Code under
+`pluginConfigs` in your `settings.json`, and the config file lives outside the plugin folder; an
+update replaces only the plugin's code. Precedence: plugin option, then environment variable, then
+the config file. Keep your personal behavior in small scripts next to that file instead of editing
+the plugin.
 
 | Option | Environment variable | Default | What it does |
 |---|---|---|---|
@@ -77,8 +93,33 @@ Set them with `/plugin configure save-clear@save-clear`, or with environment var
 | `context_cap_tokens` | `SAVE_CLEAR_CAP_TOKENS` | `300000` | When the context passes this many tokens, Claude runs save-clear at the end of the turn. `0` = off. With a 200k window, set it lower (e.g. `150000`), or compaction comes first |
 | `idle_minutes` | `SAVE_CLEAR_IDLE_MINUTES` | `50` | Idle trigger only (after `./install.sh --idle`): minutes a session must be idle before it runs save-clear. `0` = off |
 | `idle_min_tokens` | `SAVE_CLEAR_IDLE_MIN_TOKENS` | `80000` | Idle trigger only: sessions with a smaller context are left alone |
+| `language` | `SAVE_CLEAR_LANGUAGE` | empty | Language of the snapshot and of the first reply after the resume (e.g. `Portuguese`) |
+| `resume_message` | `SAVE_CLEAR_RESUME_MESSAGE` | built-in English request | Text typed after the automatic `/clear` (tmux, `--bg`) and sent by the relay in the desktop app. It is never counted as a message from you |
+| `extra_steps` | `SAVE_CLEAR_EXTRA_STEPS` | empty | Your own steps for the ritual, as text or as the path of a file. `save-clear dir` prints them and the skill follows them (e.g. "call plan_steps before clear_session") |
+| `on_save_command` | `SAVE_CLEAR_ON_SAVE` | empty | Runs when the skill arms the resume (before any clear). What it prints is appended to the snapshot, so the next session sees it |
+| `pre_clear_command` | `SAVE_CLEAR_PRE_CLEAR` | empty | Runs right before the automatic `/clear` (tmux, `--bg`) or before `clear_session` goes through (desktop app). Output ignored; it never stops the clear |
+| `on_resume_command` | `SAVE_CLEAR_ON_RESUME` | empty | Runs after the `/clear`, when the summary is delivered (5 s limit). What it prints (exit 0) is added to the new session's context, before the summary |
 | (none) | `SAVE_CLEAR_LAUNCHD_PREFIX` | `com.claude-tools` | Idle trigger only: prefix of the launchd job label (`<prefix>.save-clear-idle`) |
 | (none) | `SAVE_CLEAR_STATE_DIR` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/state/save-clear` | Flags, relay inbox and the logs `save-clear.log` and `relay.log` |
+
+### Commands you plug in
+
+The three `*_command` options are split like a shell line (no shell runs them; put pipes in a
+script) and get these environment variables:
+
+| Variable | on_save | pre_clear | on_resume |
+|---|---|---|---|
+| `SAVE_CLEAR_EVENT` | `save` | `pre_clear` | `resume` |
+| `SAVE_CLEAR_SNAPSHOT` | yes | | yes |
+| `SAVE_CLEAR_SESSION_ID` | the saving session | the session being cleared | the new session |
+| `SAVE_CLEAR_PREVIOUS_SESSION_ID` | | | the session that saved |
+| `SAVE_CLEAR_MODE`, `SAVE_CLEAR_TARGET` | | `tmux` + pane, `bg` + job, or `app` + app session | |
+| `SAVE_CLEAR_PROJECT_DIR` | yes | | yes |
+
+`on_save_command` runs from the skill's Bash call, so `CLAUDE_PID` is set too: a script can find
+the session's own background processes (for example a long-running poll that `/clear` will stop)
+and print a note telling the next session to start them again. Failures and timeouts are written to
+`save-clear.log` and never block the save or the clear.
 
 ## Optional requirements
 

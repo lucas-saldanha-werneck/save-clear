@@ -8,6 +8,9 @@ Files (all under the state folder: $SAVE_CLEAR_STATE_DIR, else $CLAUDE_PLUGIN_DA
   idle/<session>.done  last idle stretch the idle trigger (bin/save-clear-idle) already handled
   config.json          plugin options, copied here by the SessionStart hook so bin/ commands see them
   save-clear.log       one line per decision
+
+Your own settings can also live in ~/.config/save-clear/config.json ($SAVE_CLEAR_CONFIG), outside the
+plugin folder, so they survive updates. Precedence: plugin option > env var > that file.
 """
 import calendar
 import contextlib
@@ -95,7 +98,18 @@ OPTIONS = {
     "context_cap_tokens": "SAVE_CLEAR_CAP_TOKENS",
     "idle_minutes": "SAVE_CLEAR_IDLE_MINUTES",
     "idle_min_tokens": "SAVE_CLEAR_IDLE_MIN_TOKENS",
+    "language": "SAVE_CLEAR_LANGUAGE",
+    "resume_message": "SAVE_CLEAR_RESUME_MESSAGE",
+    "extra_steps": "SAVE_CLEAR_EXTRA_STEPS",
+    "on_save_command": "SAVE_CLEAR_ON_SAVE",
+    "pre_clear_command": "SAVE_CLEAR_PRE_CLEAR",
+    "on_resume_command": "SAVE_CLEAR_ON_RESUME",
 }
+
+# Your own settings, outside the plugin folder: they survive plugin updates and reinstalls.
+# Same keys as the plugin options. Lowest precedence (plugin option and env var win).
+USER_CONFIG = os.path.expanduser(os.environ.get("SAVE_CLEAR_CONFIG") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "save-clear", "config.json"))
 
 RESUME_MSG = ("save-clear: resuming. Start with the LAST topic (where we stopped and what is still open); "
               "then, in one short paragraph, the rest that was saved and the next steps.")
@@ -119,13 +133,88 @@ def _saved_config():
         return {}
 
 
+def user_config():
+    """~/.config/save-clear/config.json (or $SAVE_CLEAR_CONFIG); {} if missing or unreadable."""
+    try:
+        with open(USER_CONFIG, encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
 def setting(name, default=""):
-    """Plugin option (CLAUDE_PLUGIN_OPTION_<NAME>), then env var, then the copy in config.json."""
+    """Plugin option (CLAUDE_PLUGIN_OPTION_<NAME>), then env var, then the copy in config.json,
+    then the user's own config file."""
     for var in ("CLAUDE_PLUGIN_OPTION_" + name.upper(), OPTIONS.get(name, "")):
         value = (os.environ.get(var) or "").strip() if var else ""
         if value:
             return value
-    return str(_saved_config().get(name) or "").strip() or default
+    return (str(_saved_config().get(name) or "").strip() or str(user_config().get(name) or "").strip()
+            or default)
+
+
+def resume_msg():
+    """The resume request typed after /clear: the `resume_message` option, else the default."""
+    return " ".join(setting("resume_message").split()) or RESUME_MSG
+
+
+def is_resume_text(txt):
+    """True for the default resume request or the configured one (the start of it is enough)."""
+    t = (txt or "").lstrip()
+    custom = resume_msg()
+    return t.startswith(RESUME_MSG[:20]) or bool(custom) and t.startswith(custom[:20])
+
+
+def language():
+    return setting("language")
+
+
+def extra_steps():
+    """The `extra_steps` option: inline text, or the content of the file it names."""
+    value = setting("extra_steps")
+    if not value:
+        return ""
+    path = os.path.expanduser(value)
+    if len(value) < 1024 and "\n" not in value and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError as e:
+            log("config", f"extra_steps file unreadable: {e}")
+            return ""
+    return value
+
+
+def split_command(cmd):
+    """Words of a command line. On Windows backslashes stay as they are and quotes are removed."""
+    if os.name != "nt":
+        return [os.path.expanduser(w) if w.startswith("~") else w for w in shlex.split(cmd)]
+    words = shlex.split(cmd, posix=False)
+    return [w[1:-1] if len(w) > 1 and w[0] == w[-1] and w[0] in "\"'" else w for w in words]
+
+
+def run_hook_command(name, event, extra_env=None, timeout=20, args=()):
+    """Run the user's <name> command (an option such as on_save_command). Never raises.
+
+    The command gets SAVE_CLEAR_EVENT=<event> plus extra_env. Returns (exit code or None, stdout)."""
+    cmd = setting(name)
+    if not cmd:
+        return None, ""
+    env = dict(os.environ)
+    env["SAVE_CLEAR_EVENT"] = event
+    env.update({k: str(v) for k, v in (extra_env or {}).items() if v is not None})
+    try:
+        r = subprocess.run(split_command(cmd) + list(args), env=env, timeout=timeout, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
+    except Exception as e:
+        log(event, f"{name} failed: {e!r}")
+        return None, ""
+    if r.returncode != 0:
+        log(event, f"{name} exited {r.returncode}: {(r.stderr or '').strip()[:200]}")
+    else:
+        log(event, f"{name} ran ({len(r.stdout or '')} bytes of output)")
+    return r.returncode, (r.stdout or "").strip()
 
 
 def save_config():
@@ -261,7 +350,7 @@ def notify(msg):
     if not cmd:
         return
     try:
-        subprocess.run(shlex.split(cmd) + [msg], timeout=20, capture_output=True)
+        subprocess.run(split_command(cmd) + [msg], timeout=20, capture_output=True)
     except Exception as e:
         log("notify", f"notify command failed: {e}")
 
@@ -340,7 +429,7 @@ def user_messages_since(transcript, since_ms):
                 continue
             txt = _text_of(c)
         txt = (txt or "").strip()
-        if txt and not NOT_HUMAN.match(txt) and txt not in out:
+        if txt and not NOT_HUMAN.match(txt) and not is_resume_text(txt) and txt not in out:
             out.append(txt)
     return out
 

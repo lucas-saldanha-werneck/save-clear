@@ -32,7 +32,9 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    Do not edit `CLAUDE.md` unless the user asked.
 
 3. **Write the snapshot.** Run `save-clear dir`; it prints the snapshot folder (first line) and
-   whether `publish_link` is on. Write `<folder>/SESSION-SUMMARY-<YYYYMMDD-HHMMSS>-<short-slug>.md`:
+   whether `publish_link` is on. If it also prints `language: <L>`, write the snapshot (headings
+   included) and your replies in <L>. If it prints an `extra steps` block, those are the user's own
+   steps for this ritual: follow them, at the point they name (no point named = before step 6). Write `<folder>/SESSION-SUMMARY-<YYYYMMDD-HHMMSS>-<short-slug>.md`:
 
    ```markdown
    ---
@@ -72,7 +74,9 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    save-clear arm-resume "<absolute path of the snapshot>"
    ```
 
-   Check that it prints `auto-resume armed: ...`; a non-zero exit means it did not arm (say so). The
+   Check that it prints `auto-resume armed: ...`; a non-zero exit means it did not arm (say so). If the
+   user set an `on_save_command`, it runs first and a line `on_save_command: ...` says what it added
+   to the snapshot (a failure there is only noted; the resume is still armed). The
    SessionStart hook delivers the summary only to THIS session after its /clear (terminal: same
    process; desktop app: same folder and same app session). Other sessions get nothing. If it prints
    a warning that the summary is NOT delivered automatically, tell the user to ask you to read the
