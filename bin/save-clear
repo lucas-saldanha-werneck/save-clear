@@ -5,6 +5,7 @@
   save-clear arm-resume <file>   the next session started by /clear in THIS session gets <file>
   save-clear arm-clear           pick how the automatic /clear can be sent and arm the Stop hook
   save-clear rearm               after saving "what came after the save", arm the /clear again
+  save-clear status              print the pending resume entries and the pending /clear flag (JSON)
 """
 import json
 import os

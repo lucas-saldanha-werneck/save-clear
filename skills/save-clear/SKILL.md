@@ -93,8 +93,10 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
 
    It prints `save-clear: mode=<mode> ...`. What to do per mode:
    - **`tmux`, `iterm` or `bg`**: armed. End the turn right away with the short reply from step 7. Run
-     nothing else after it. The Stop hook waits until the session is idle with an empty prompt, types
-     `/clear`, confirms it took (same process, new session id) and then types the resume request.
+     nothing else after it. The Stop hook starts a helper that types `/clear` and then the resume
+     request. In `tmux` it first waits until the session is idle with an empty prompt and confirms
+     the clear took (same process, new session id); `iterm` only checks that the tty runs this session;
+     `bg` attaches in a hidden tmux and waits for an idle prompt.
    - **`manual`** (a terminal without tmux or iTerm2): nothing can type for you. Reply with the
      "save" form of step 7: "You can /clear now." The summary comes back by itself after the /clear.
    - **`app`** (Claude desktop app, IDE, SDK): the flag is NOT written, because nothing must type into a

@@ -9,6 +9,7 @@ its own, and nothing is ever typed into a text box.
 
   save-clear-relay setup [local_<id>]   run IN the relay session: record it (default: its own id)
   save-clear-relay rules                the rules the relay session follows (paths filled in)
+  save-clear-relay waker-rules          the rules the waker session follows (paths filled in)
   save-clear-relay status               relay id, listening or not, inbox size
   save-clear-relay off | on             turn the relay off on purpose / back on
   save-clear-relay request              the calling app session asks for its resume after its clear
