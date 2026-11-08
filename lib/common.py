@@ -1,6 +1,6 @@
 """Shared code for the save-clear hooks and commands. Standard-library Python 3.8+.
 
-Files (all under the state folder, default ~/.claude/state/save-clear):
+Files (all under the state folder: $SAVE_CLEAR_STATE_DIR, else $CLAUDE_PLUGIN_DATA, else ~/.claude/state/save-clear):
   pending_resume.json  who armed a resume, and which snapshot to deliver (one entry or a list)
   pending_clear.json   the auto-/clear request the Stop hook acts on
   config.json          plugin options, copied here by the SessionStart hook so bin/ commands see them
@@ -20,7 +20,49 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "bin")
 HOME = os.path.expanduser("~")
 
-STATE = os.path.expanduser(os.environ.get("SAVE_CLEAR_STATE_DIR") or os.path.join(HOME, ".claude", "state", "save-clear"))
+DEFAULT_STATE = os.path.join(HOME, ".claude", "state", "save-clear")
+# Hooks get $CLAUDE_PLUGIN_DATA; commands run from Bash may not. The SessionStart hook records the
+# folder it used in this pointer file so every caller ends up in the same place.
+POINTER = os.path.expanduser(os.environ.get("SAVE_CLEAR_POINTER") or os.path.join(HOME, ".claude", "state", "save-clear.path"))
+
+
+def _resolve_state():
+    for value in (os.environ.get("SAVE_CLEAR_STATE_DIR"), os.environ.get("CLAUDE_PLUGIN_DATA")):
+        if value and value.strip():
+            return os.path.expanduser(value.strip())
+    try:
+        with open(POINTER) as f:
+            value = f.read().strip()
+        if value and os.path.isdir(value):
+            return value
+    except OSError:
+        pass
+    return DEFAULT_STATE
+
+
+STATE = _resolve_state()
+
+
+def save_pointer():
+    """SessionStart: remember $CLAUDE_PLUGIN_DATA for callers that do not have it."""
+    data = (os.environ.get("CLAUDE_PLUGIN_DATA") or "").strip()
+    if not data or os.environ.get("SAVE_CLEAR_STATE_DIR"):
+        return
+    try:
+        with open(POINTER) as f:
+            if f.read().strip() == data:
+                return
+    except OSError:
+        pass
+    try:
+        os.makedirs(data, exist_ok=True)
+        os.makedirs(os.path.dirname(POINTER), exist_ok=True)
+        with open(POINTER, "w") as f:
+            f.write(data + "\n")
+    except OSError:
+        pass
+
+
 CONFIG = os.path.join(STATE, "config.json")
 LOG = os.path.join(STATE, "save-clear.log")
 RESUME_FLAG = os.path.join(STATE, "pending_resume.json")

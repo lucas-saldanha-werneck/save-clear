@@ -10,10 +10,11 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import RESUME_FLAG, log, now_ms, read_hook_input, save_config  # noqa: E402
+from common import RESUME_FLAG, log, now_ms, read_hook_input, save_config, save_pointer  # noqa: E402
 
 
 def main():
+    save_pointer()
     save_config()
     if not os.path.exists(RESUME_FLAG):
         return

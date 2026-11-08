@@ -86,8 +86,9 @@ def cmd_arm_clear(args):
         if mode == "manual":
             print("No automatic /clear here. Tell the user to type /clear; the summary comes back by itself.")
         else:
-            print("Not a terminal session. If the clear_session tool exists, call it with session_id \"self\"; "
-                  "otherwise tell the user to type /clear.")
+            print("Not a terminal session. If the clear_session tool exists: run save-clear-relay request "
+                  "(optional relay), then call clear_session with session_id \"self\"; otherwise tell the user "
+                  "to type /clear.")
         return 0
     ensure_state()
     write_json(CLEAR_FLAG, {"session_id": sid, "mode": mode, "target": target, "ts": now_ms()})

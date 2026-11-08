@@ -62,10 +62,36 @@ Requires `python3` (3.8+) and the `claude` CLI on `PATH`. macOS or Linux.
 | iTerm2 tab (macOS), no tmux | Automatic `/clear` + resume request, through AppleScript by tty |
 | `claude --bg` background session | Attaches in a hidden tmux, types, detaches (needs tmux) |
 | Any other terminal | Claude tells you to type `/clear`; the summary comes back by itself |
-| Claude desktop app | Claude calls the app's `clear_session` tool on itself; the summary arrives with your next message |
+| Claude desktop app | Claude calls the app's `clear_session` tool on itself; the summary arrives with your next message, or right away with a relay (below) |
 
 If a message from you arrives after the save, the Stop hook doesn't clear: Claude answers it, adds
 it to the snapshot under `## After the save`, and re-arms.
+
+### Desktop app: the optional relay
+
+A desktop app session can clear itself but can't send itself a message, so without help the
+resume waits for your next message. The relay is one cheap app session that serves all the others:
+it listens on an inbox folder, waits for a session's clear, and sends it the resume prompt with
+`send_message`. Nothing is typed into a text box.
+
+Setup, once:
+
+1. Open a new desktop app session in any folder (a small model is enough), name it "relay", and
+   don't use it for anything else.
+2. In it, ask Claude to run `python3 <plugin folder>/bin/save-clear-relay setup`. It records the
+   session's id in the state folder and prints the message that starts the listener.
+3. Send that message (`RELAY listen. Run ... rules and follow the cycle from step 1.`).
+
+From then on, "save and clear" in another app session queues the resume and the relay delivers it
+after the clear. If the relay isn't listening, the session wakes it with `send_message`. To pause
+it: `save-clear-relay off` (requests are refused until `on`); `save-clear-relay status` shows its
+state. When the relay's own context fills up, it saves and clears itself (see `relay/RULES.md`);
+add a second session id to `setup` (`setup <relay id> <waker id>`) and that session wakes the relay
+after its clear. Without a waker, requests wait in the inbox until someone messages the relay.
+
+The relay notices a clear in the app's log (macOS: `~/Library/Logs/Claude/main.log`; elsewhere set
+`SAVE_CLEAR_APP_LOG`). With no readable log it delivers 60 s after the request
+(`SAVE_CLEAR_RELAY_GRACE`). Only the macOS path has been checked against a real app log.
 
 Safety nets that run without the ritual: before any compaction the full transcript is saved
 gzipped (`EMERGENCY-COMPACT-*`), and the compaction summary is kept (`COMPACT-SUMMARY-*`).
@@ -81,8 +107,9 @@ gzipped (`EMERGENCY-COMPACT-*`), and the compaction summary is kept (`COMPACT-SU
   Artifact tool is available) and the next session shows the link first. Default `off`.
 
 The same as environment variables: `SAVE_CLEAR_SNAPSHOT_DIR`, `SAVE_CLEAR_NOTIFY`,
-`SAVE_CLEAR_PUBLISH_LINK`. Also `SAVE_CLEAR_STATE_DIR` (flags and log, default
-`~/.claude/state/save-clear`). Log: `~/.claude/state/save-clear/save-clear.log`.
+`SAVE_CLEAR_PUBLISH_LINK`. Also `SAVE_CLEAR_STATE_DIR` (flags, relay inbox and logs). Default:
+the plugin's data folder (`$CLAUDE_PLUGIN_DATA`), else `~/.claude/state/save-clear`. Logs:
+`save-clear.log` and `relay.log` there.
 
 ## Optional requirements
 
@@ -90,12 +117,14 @@ None of these are needed. Without them, everything works except the automatic `/
 Claude tells you to type it.
 
 - **tmux**: automatic `/clear` in a tmux pane, and for `claude --bg` sessions.
-- **iTerm2** (macOS): automatic `/clear` without tmux. macOS may ask once for Automation permission to control
-  iTerm2.
+- **iTerm2** (macOS): automatic `/clear` without tmux. macOS may ask once for Automation
+  permission to control iTerm2.
 - **A notifier** for `notify_command`, e.g. a script that sends a push or chat message, so you know
   the clear happened when you're away from the screen.
 - **Remote Control**: works as long as the session runs in tmux or iTerm2 on your computer. The
   phone keeps the old screen until the next message, which is why `publish_link` exists.
+- **A relay session** (desktop app): the resume arrives right after the clear instead of with your
+  next message. See [Desktop app: the optional relay](#desktop-app-the-optional-relay).
 - **Auto memory**: if the project has a `~/.claude/projects/<project>/memory/` folder, Claude
   updates it too. Otherwise that step is skipped.
 
@@ -105,8 +134,9 @@ Claude tells you to type it.
 /plugin uninstall save-clear@save-clear
 ```
 
-Snapshots stay in your snapshot folder. Remove `~/.claude/state/save-clear` to drop the flags and
-the log.
+Snapshots stay in your snapshot folder. To drop the flags, relay inbox and logs, remove the state
+folder (`save-clear-relay status` prints it) and `~/.claude/state/save-clear.path`. Archive the
+relay session if you made one.
 
 ## Test
 

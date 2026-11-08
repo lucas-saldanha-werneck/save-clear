@@ -99,10 +99,23 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
      "save" form of step 7: "You can /clear now." The summary comes back by itself after the /clear.
    - **`app`** (Claude desktop app, IDE, SDK): the flag is NOT written, because nothing must type into a
      terminal that may belong to another session. If the `mcp__ccd_session_mgmt__clear_session` tool
-     exists (load it with ToolSearch if it is only listed): write the step 7 reply first, then call it
-     with `session_id: "self"` as the very last action. The app clears only this session when the turn
-     ends; the resume arrives with the user's next message. If the tool is missing or refuses, reply
-     "You can /clear now."
+     is missing (load it with ToolSearch if it is only listed), reply "You can /clear now." and stop.
+     Otherwise:
+     1. **Ask the relay for the resume (optional helper).** A session cannot message itself, so without
+        help the resume only arrives with the user's next message. Run
+        `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear-relay" request`:
+        - exit **0**: the relay is listening; it sends the resume right after the clear.
+        - exit **2**: queued, but the relay is not listening. Wake it: `send_message` to the relay id
+          with the exact text printed on stderr ("no sign of starting within 20s" is a false alarm on a
+          cold start). If that fails, say the resume arrives with the user's next message.
+        - exit **3**: the relay was turned off on purpose. Do not wake it; say the resume arrives with
+          the user's next message.
+        - exit **4**: no relay configured. Same: the resume arrives with the user's next message; say so.
+        - exit **1** saying "this session IS the relay": stop here and follow only the "Context full"
+          part of `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear-relay" rules`.
+     2. Write the step 7 reply, then call `clear_session` with `session_id: "self"` as the very last
+        action. The app clears only this session when the turn ends. If it refuses, change the reply to
+        "You can /clear now."
 
    **A user message during the save.** If one arrives while you save, answer it and put it in the
    snapshot before step 8. If it arrives after step 8, the Stop hook does not clear: it blocks and asks

@@ -34,7 +34,8 @@ class Base(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("CLAUDE", "TMUX", "SAVE_CLEAR", "TERM_PROGRAM", "LC_TERMINAL"))}
         self.env.update(SAVE_CLEAR_STATE_DIR=self.state, SAVE_CLEAR_SNAPSHOT_DIR=self.snaps,
-                        SAVE_CLEAR_CLAUDE="/nonexistent/claude")
+                        SAVE_CLEAR_CLAUDE="/nonexistent/claude", SAVE_CLEAR_POINTER=os.path.join(t, "pointer"),
+                        SAVE_CLEAR_APP_LOG=os.path.join(t, "app-main.log"))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -231,6 +232,117 @@ class ClearGuard(Base):
     def test_other_targets_ignored(self):
         r = self.run_py("hooks/clear_guard.py", stdin={"tool_input": {"session_id": "local_x"}})
         self.assertEqual(r.stdout, "")
+
+
+class StateDir(Base):
+    def test_plugin_data_reaches_bash_through_pointer(self):
+        data = os.path.join(os.path.dirname(self.state), "plugin-data")
+        self.env.pop("SAVE_CLEAR_STATE_DIR")
+        self.start(CLAUDE_PLUGIN_DATA=data)                      # hook env has it
+        self.arm(self.snapshot())                                # Bash env does not
+        self.assertTrue(os.path.exists(os.path.join(data, "pending_resume.json")))
+
+
+APP = "local_11111111-1111-1111-1111-111111111111"
+RELAY_ID = "local_22222222-2222-2222-2222-222222222222"
+
+
+class Relay(Base):
+    def relay(self, *args, **env):
+        return self.run_py("bin/save-clear-relay", args, **env)
+
+    def inbox(self):
+        d = os.path.join(self.state, "relay-inbox")
+        return sorted(f for f in os.listdir(d) if f.endswith(".json")) if os.path.isdir(d) else []
+
+    def heartbeat(self, age=0):
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "relay-listener.alive"), "w") as f:
+            f.write(f"{os.getpid()} {int(time.time() - age)}\n")
+
+    def app_log(self, *lines):
+        with open(self.env["SAVE_CLEAR_APP_LOG"], "w") as f:
+            f.write("".join(l + "\n" for l in lines))
+
+    def test_no_relay_falls_back(self):
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("next message", r.stderr)
+        self.assertEqual(self.inbox(), [])
+
+    def test_app_mode_points_to_relay_and_fallback(self):
+        r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_ENTRYPOINT="claude-desktop",
+                        CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertIn("mode=app", r.stdout)
+        self.assertIn("save-clear-relay request", r.stdout)
+
+    def test_request_queues_and_reports_listening(self):
+        self.assertEqual(self.relay("setup", RELAY_ID).returncode, 0)
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)          # no heartbeat
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn(f"send_message to {RELAY_ID}", r.stderr)
+        self.assertIn("RELAY listen", r.stderr)
+        [name] = self.inbox()
+        with open(os.path.join(self.state, "relay-inbox", name)) as f:
+            job = json.load(f)
+        self.assertEqual((job["to"], job["after_clear"]), (APP, APP))
+        self.assertTrue(job["message"].startswith("save-clear: resuming"))
+        self.heartbeat()
+        self.assertEqual(self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP).returncode, 0)
+        self.heartbeat(age=120)                                              # stale heartbeat
+        self.assertEqual(self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP).returncode, 2)
+
+    def test_off_file_refuses(self):
+        self.relay("setup", RELAY_ID)
+        self.relay("off")
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(self.inbox(), [])
+        self.relay("on")
+        self.assertEqual(self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP).returncode, 2)
+
+    def test_bad_ids_and_relay_itself(self):
+        self.assertEqual(self.relay("job", "--to", "nope", "--message", "x").returncode, 1)
+        self.assertEqual(self.relay("job", "--to", APP).returncode, 1)  # no message
+        self.relay("setup", RELAY_ID)
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=RELAY_ID)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Context full", r.stderr)
+
+    def test_listener_waits_for_the_clear(self):
+        self.relay("setup", RELAY_ID)
+        self.relay("job", "--to", APP, "--message", "hello", "--after-clear", APP)
+        self.app_log("2026-01-01 00:00:00 [info] something else")
+        fast = dict(SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+        r = self.relay("listen", **fast)
+        self.assertEqual(r.stdout.strip(), "IDLE")                          # no clear yet
+        self.assertEqual(len(self.inbox()), 1)
+        self.app_log(time.strftime("%Y-%m-%d %H:%M:%S") + f" [info] Clearing session {APP}")
+        r = self.relay("listen", **fast)
+        self.assertIn("JOB ", r.stdout)
+        self.assertIn(f"session_id={APP}", r.stdout)
+        self.assertIn("TEXT: hello", r.stdout)
+        self.assertEqual(self.inbox(), [])
+
+    def test_listener_without_app_log_uses_grace(self):
+        self.relay("job", "--to", APP, "--message", "hi", "--after-clear", APP)
+        r = self.relay("listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="2",
+                       SAVE_CLEAR_RELAY_GRACE="0", SAVE_CLEAR_APP_LOG=os.path.join(self.proj, "missing.log"))
+        self.assertIn("TEXT: hi", r.stdout)
+
+    def test_waker_sees_relay_clear(self):
+        self.relay("setup", RELAY_ID)
+        self.app_log(f"2026-01-01 00:00:00 [info] Clearing session {RELAY_ID}")
+        self.assertEqual(self.relay("clear-count").stdout.strip(), "1")
+        self.app_log(*[f"2026-01-01 00:00:0{i} [info] Clearing session {RELAY_ID}" for i in range(2)])
+        r = self.relay("wait-clear", "--base", "1", "--timeout", "5", SAVE_CLEAR_RELAY_POLL="0.1")
+        self.assertTrue(r.stdout.startswith("CLEARED"), r.stdout)
+
+    def test_rules_have_paths_filled_in(self):
+        out = self.relay("rules").stdout
+        self.assertIn("save-clear-relay\" listen", out)
+        self.assertNotIn("{RELAY}", out)
+        self.assertIn("## Context full", out)
 
 
 if __name__ == "__main__":

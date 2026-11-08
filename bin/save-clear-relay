@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""save-clear relay: optional helper for the Claude desktop app.
+
+Why: in the desktop app a session clears itself with clear_session("self"), but it cannot send a
+message to itself, so the resume would only arrive with the user's next message. The relay is one
+long-lived, cheap app session that serves every session: it listens on an inbox folder, waits for
+the target's clear, and sends the resume prompt with send_message. The cleared session restarts on
+its own, and nothing is ever typed into a text box.
+
+  save-clear-relay setup [local_<id>]   run IN the relay session: record it (default: its own id)
+  save-clear-relay rules                the rules the relay session follows (paths filled in)
+  save-clear-relay status               relay id, listening or not, inbox size
+  save-clear-relay off | on             turn the relay off on purpose / back on
+  save-clear-relay request              the calling app session asks for its resume after its clear
+  save-clear-relay job --to local_<id> [--message TEXT] [--after-clear local_<id>] [--in S] [--why W]
+  save-clear-relay listen               the relay's listener (run in the background by the relay)
+  save-clear-relay clear-count          how many clears of the relay the app log shows
+  save-clear-relay wait-clear --base N  the waker waits until the relay's clear shows up in the app log
+
+Exit codes of `job` and `request`:
+  0  queued, the relay is listening
+  2  queued, but the relay is NOT listening: wake it with send_message (text printed on stderr)
+  3  the relay is turned off on purpose (OFF file): nothing queued
+  4  `request` only: no relay configured (fallback: the resume arrives with the user's next message)
+  1  bad arguments
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from common import RESUME_MSG, ROOT, STATE, ensure_state, read_json, write_json  # noqa: E402
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
+RELAY = os.path.join(STATE, "relay.json")
+OFF = os.path.join(STATE, "relay-OFF")
+INBOX = os.path.join(STATE, "relay-inbox")
+OUT = os.path.join(INBOX, "out")
+ALIVE = os.path.join(STATE, "relay-listener.alive")
+LOCK = os.path.join(STATE, "relay-listener.lock")
+RLOG = os.path.join(STATE, "relay.log")
+SELF = os.path.abspath(__file__)
+CMD = f'python3 "{SELF}"'
+ID_RE = re.compile(r"local_[0-9a-f-]{36}")
+ALIVE_S = 60          # a heartbeat older than this = not listening
+AFTER_CLEAR_MAX = 900  # 15 min without the target's clear: drop the request
+POLL = float(os.environ.get("SAVE_CLEAR_RELAY_POLL", "3"))
+MAXWAIT = float(os.environ.get("SAVE_CLEAR_RELAY_MAXWAIT", str(6 * 3600)))  # exit so the relay re-arms
+GRACE = float(os.environ.get("SAVE_CLEAR_RELAY_GRACE", "60"))  # app log missing: deliver after this
+
+
+def app_log():
+    """The desktop app's main log, where it writes 'Clearing session <id>'."""
+    env = os.environ.get("SAVE_CLEAR_APP_LOG")
+    if env:
+        return os.path.expanduser(env)
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Logs/Claude/main.log")
+    if os.name == "nt":
+        return os.path.join(os.environ.get("APPDATA", ""), "Claude", "logs", "main.log")
+    return os.path.expanduser("~/.config/Claude/logs/main.log")
+
+
+def rlog(msg):
+    try:
+        ensure_state()
+        with open(RLOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [relay {os.getpid()}] {msg}\n")
+    except OSError:
+        pass
+
+
+def relay_id():
+    v = read_json(RELAY)
+    return v.get("local_id", "") if isinstance(v, dict) else ""
+
+
+def listening():
+    try:
+        with open(ALIVE) as f:
+            pid, t = f.read().split()
+        if os.name != "nt":
+            os.kill(int(pid), 0)
+        return time.time() - int(t) < ALIVE_S
+    except Exception:
+        return False
+
+
+def wake_text():
+    return f"RELAY listen. Run `{CMD} rules` and follow the cycle from step 1."
+
+
+def enqueue(to, message, after_clear=None, delay=0.0, why=""):
+    if os.path.exists(OFF):
+        print(f"relay turned off on purpose ({OFF}); nothing queued", file=sys.stderr)
+        return 3
+    now = time.time()
+    job = {"to": to, "message": message, "due": now + delay, "after_clear": after_clear, "why": why, "created": now}
+    os.makedirs(INBOX, exist_ok=True)
+    name = f"{int(now * 1000)}-{why or 'job'}-{to[6:14]}.json"
+    tmp = os.path.join(INBOX, "." + name)
+    with open(tmp, "w") as f:
+        json.dump(job, f)
+    os.replace(tmp, os.path.join(INBOX, name))  # appears only when complete
+    print(os.path.join(INBOX, name))
+    if not listening():
+        rid = relay_id()
+        print("WARNING: the relay is not listening; the request waits in the inbox. Wake it: send_message to "
+              f"{rid or '(relay id)'} with exactly: {wake_text()}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_job(args):
+    ap = argparse.ArgumentParser(prog="save-clear-relay job")
+    ap.add_argument("--to", required=True)
+    ap.add_argument("--message", default="")
+    ap.add_argument("--after-clear", default=None)
+    ap.add_argument("--in", dest="delay", type=float, default=0)
+    ap.add_argument("--why", default="")
+    try:
+        a = ap.parse_args(args)
+    except SystemExit:
+        return 1
+    if not a.message:
+        print("needs --message", file=sys.stderr)
+        return 1
+    if not ID_RE.fullmatch(a.to) or (a.after_clear and not ID_RE.fullmatch(a.after_clear)):
+        print("invalid id (expected local_<uuid>)", file=sys.stderr)
+        return 1
+    return enqueue(a.to, a.message, a.after_clear, a.delay, re.sub(r"[^a-z0-9-]", "", a.why.lower())[:20])
+
+
+def cmd_request():
+    me = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", "")
+    rid = relay_id()
+    if not rid:
+        print("no relay configured: after clear_session the resume arrives with the user's next message. "
+              "Say so in the reply.", file=sys.stderr)
+        return 4
+    if not ID_RE.fullmatch(me):
+        print("this is not a desktop app session (no CLAUDE_CODE_HOST_SESSION_ID); the relay cannot help",
+              file=sys.stderr)
+        return 4
+    if me == rid:
+        print(f"this session IS the relay: follow the \"Context full\" part of `{CMD} rules` instead", file=sys.stderr)
+        return 1
+    return enqueue(me, RESUME_MSG, after_clear=me, why="save-clear")
+
+
+def cmd_setup(args):
+    rid = args[0] if args else os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", "")
+    if not ID_RE.fullmatch(rid or ""):
+        print("run this inside the relay app session, or pass its id: setup local_<uuid>", file=sys.stderr)
+        return 1
+    waker = args[1] if len(args) > 1 and ID_RE.fullmatch(args[1]) else None
+    ensure_state()
+    v = {"local_id": rid, "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    if waker:
+        v["waker"] = waker
+    write_json(RELAY, v)
+    print(f"relay recorded: {rid}{' (waker ' + waker + ')' if waker else ''} in {RELAY}")
+    print(f"Now, in the relay session, send: {wake_text()}")
+    return 0
+
+
+def cmd_status():
+    rid = relay_id()
+    v = read_json(RELAY) or {}
+    print(json.dumps({"relay": rid or None, "waker": v.get("waker"), "listening": listening(),
+                      "off": os.path.exists(OFF), "queued": len(glob.glob(os.path.join(INBOX, "*.json"))),
+                      "state": STATE, "app_log": app_log(), "rules": f"{CMD} rules"}, indent=2))
+    return 0
+
+
+def cmd_rules():
+    with open(os.path.join(ROOT, "relay", "RULES.md"), encoding="utf8") as f:
+        text = f.read()
+    print(text.replace("{RELAY}", CMD).replace("{SAVE_CLEAR}", f'python3 "{os.path.join(ROOT, "bin", "save-clear")}"')
+          .replace("{WAKER_RULES}", f'{CMD} waker-rules').replace("{STATE}", STATE))
+    return 0
+
+
+def cmd_waker_rules():
+    with open(os.path.join(ROOT, "relay", "WAKER.md"), encoding="utf8") as f:
+        print(f.read().replace("{RELAY}", CMD).replace("{STATE}", STATE))
+    return 0
+
+
+# ---------- listener ----------
+def _log_lines():
+    path = app_log()
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - 4_000_000))
+            return f.read().decode("utf8", "replace").splitlines()
+    except OSError:
+        return None
+
+
+def cleared(sid, since):
+    """(True/False, or None when the app log cannot be read)."""
+    lines = _log_lines()
+    if lines is None:
+        return None
+    needle = f"Clearing session {sid}"
+    for line in lines:
+        if needle in line:
+            try:  # "2026-10-17 14:25:02 [info] ..."
+                t = time.mktime(time.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                continue
+            if t >= since - 1:
+                return True
+    return False
+
+
+def ready(path):
+    try:
+        with open(path) as f:
+            job = json.load(f)
+    except Exception as e:
+        rlog(f"unreadable request {path}: {e}")
+        os.replace(path, path + ".bad")
+        return False
+    if time.time() < float(job.get("due") or 0):
+        return False
+    ac = job.get("after_clear")
+    if ac:
+        created = float(job.get("created") or os.path.getmtime(path))
+        done = cleared(ac, created)
+        if done is None:  # no app log on this system: the clear happens when the turn ends; wait a margin
+            if time.time() - created >= GRACE:
+                rlog(f"{os.path.basename(path)}: app log not found ({app_log()}); delivered after {int(GRACE)} s")
+                return True
+            return False
+        if not done:
+            if time.time() - created > AFTER_CLEAR_MAX:
+                rlog(f"{os.path.basename(path)}: no clear of {ac} in 15 min; dropped")
+                os.replace(path, path + ".timeout")
+            return False
+    return True
+
+
+def cmd_listen():
+    ensure_state()
+    os.makedirs(OUT, exist_ok=True)
+    lock = open(LOCK, "w")
+    if fcntl:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("ALREADY")  # another listener is alive: the relay does NOT start one again
+            return 0
+    rlog("listening")
+    start = time.time()
+    while True:
+        with open(ALIVE, "w") as f:
+            f.write(f"{os.getpid()} {int(time.time())}\n")
+        done = []
+        for p in sorted(glob.glob(os.path.join(INBOX, "*.json"))):
+            if ready(p):
+                dst = os.path.join(OUT, os.path.basename(p))
+                os.replace(p, dst)
+                done.append(dst)
+        if done:
+            for d in done:
+                with open(d) as f:
+                    job = json.load(f)
+                print(f"JOB {d}")
+                print(f"  DO: mcp__ccd_session_mgmt__send_message session_id={job['to']} message=<the text below, exactly>")
+                print("  TEXT: " + job["message"])
+                rlog(f"handed to the relay: {os.path.basename(d)}")
+            print(f"  THEN: one line per job in {RLOG}; start the listener again in the background")
+            return 0
+        if time.time() - start > MAXWAIT:
+            print("IDLE")
+            return 0
+        time.sleep(POLL)
+
+
+def clear_count(rid):
+    lines = _log_lines() or []
+    return sum(1 for line in lines if f"Clearing session {rid}" in line)
+
+
+def cmd_wait_clear(args):
+    ap = argparse.ArgumentParser(prog="save-clear-relay wait-clear")
+    ap.add_argument("--base", type=int, default=0)
+    ap.add_argument("--timeout", type=float, default=900)
+    a = ap.parse_args(args)
+    rid = relay_id()
+    end = time.time() + a.timeout
+    while time.time() < end:
+        n = clear_count(rid)
+        if n > a.base:
+            time.sleep(min(5, POLL))
+            print(f"CLEARED relay={rid} base={a.base} now={n}")
+            return 0
+        time.sleep(POLL)
+    print(f"TIMEOUT relay={rid} base={a.base} (no clear in the app log; wake it anyway)")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd == "job":
+        return cmd_job(args)
+    if cmd == "request":
+        return cmd_request()
+    if cmd == "setup":
+        return cmd_setup(args)
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "off":
+        ensure_state()
+        open(OFF, "w").close()
+        print(f"relay turned off ({OFF}). Requests are refused with exit 3 until `on`.")
+        return 0
+    if cmd == "on":
+        try:
+            os.unlink(OFF)
+        except OSError:
+            pass
+        print(f"relay turned on. If it is not listening, send it: {wake_text()}")
+        return 0
+    if cmd == "rules":
+        return cmd_rules()
+    if cmd == "waker-rules":
+        return cmd_waker_rules()
+    if cmd == "listen":
+        return cmd_listen()
+    if cmd == "clear-count":
+        print(clear_count(relay_id()))
+        return 0
+    if cmd == "wait-clear":
+        return cmd_wait_clear(args)
+    print(f"unknown command {cmd!r}\n\n{__doc__.strip()}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
