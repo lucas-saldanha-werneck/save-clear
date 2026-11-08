@@ -343,3 +343,73 @@ def user_messages_since(transcript, since_ms):
         if txt and not NOT_HUMAN.match(txt) and txt not in out:
             out.append(txt)
     return out
+
+
+# ----- tmux screen and process tree (shared by bin/save-clear-send and bin/save-clear-idle) -----
+DIM = re.compile(r"\x1b\[2m.*?(\x1b\[(0|22)m|$)")    # the empty-prompt hint is dim; a real draft is not
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+BORDER = re.compile(r"^[\s\u2500-\u257f]*$")          # box-drawing lines around the prompt
+
+
+def clean(line):
+    return ANSI.sub("", DIM.sub("", line)).replace("\u00a0", " ")
+
+
+def prompt_text(text):
+    """Text typed after the last \u276f prompt (without the dim hint); None if there is no prompt."""
+    for ln in reversed(text.splitlines()):
+        if "\u276f" in ln:
+            return clean(ln.split("\u276f", 1)[1]).strip().strip("\u2502").strip()
+    return None
+
+
+def prompt_block(text):
+    """Everything after the \u276f prompt, wrapped lines included; None if there is no prompt."""
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if "\u276f" in lines[i]:
+            parts = [clean(lines[i].split("\u276f", 1)[1])]
+            for ln in lines[i + 1:]:
+                c = clean(ln)
+                if not c.strip() or BORDER.match(c):
+                    break
+                parts.append(c)
+            return " ".join(p.strip().strip("\u2502").strip() for p in parts).strip()
+    return None
+
+
+def squash(t):
+    return "".join((t or "").split())
+
+
+def draft_why(screen_text):
+    """Reason string for a non-empty prompt. Without colors (NO_COLOR in tmux) the dim hint cannot be
+    told apart from a draft, so say so."""
+    if "\x1b" not in screen_text:
+        return "draft (screen has no colors: may be only the hint; check NO_COLOR in tmux)"
+    return "draft"
+
+
+def ps_parents():
+    par = {}
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        out = ""
+    for ln in out.splitlines():
+        try:
+            a, b = ln.split()
+            par[int(a)] = int(b)
+        except ValueError:
+            pass
+    return par
+
+
+def ancestors(pid, par):
+    out = []
+    for _ in range(30):
+        out.append(pid)
+        pid = par.get(pid, 0)
+        if pid in (0, 1):
+            break
+    return out

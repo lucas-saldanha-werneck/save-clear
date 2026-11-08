@@ -152,9 +152,11 @@ an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker. After it, the summary Claude 
 
 ### Idle trigger (optional)
 
-Anthropic's prompt cache keeps a session's context for up to 60 minutes. Coming back to a big
-session before that reads the context cheaply from the cache; after that, the whole context is
-written to the cache again at full price. The idle trigger runs save-clear in a session you left
+The idle trigger targets the **1-hour prompt cache**. While a session's context is in that cache,
+coming back to a big session reads it cheaply; once the cache expires, the whole context is written
+to the cache again at full price. It does not check which cache length your account or setup gets:
+if your sessions use the 5-minute cache, the cache is already cold at 50 minutes and the trigger
+only saves you from re-sending a big context, not from a cache write. The idle trigger runs save-clear in a session you left
 idle for `idle_minutes` (default 50), so the next time you come back the session holds a short
 summary instead of the big context.
 
@@ -174,26 +176,36 @@ Every run, `bin/save-clear-idle` asks `claude agents --json` for interactive, id
 types this into a session's tmux pane:
 
 ```
-save-clear (automatic: session idle for 52 min, context 120k; the prompt cache expires at 60 min). Run the save-clear skill now in "save and clear" mode. ...
+save-clear (automatic: session idle for 52 min, context 120k; saving before the prompt cache expires). Run the save-clear skill now in "save and clear" mode. ...
 ```
 
 only when all of these hold:
 
 - nothing in the session changed (transcript, subagents, background task output) for between
-  `idle_minutes` and `idle_minutes` + 8 minutes. Later than that the cache is gone anyway, so it
-  leaves old sessions alone;
+  `idle_minutes` and `idle_minutes` + 8 minutes, and never more than 59. Later than that the cache
+  is gone anyway, so it leaves old sessions alone. With `idle_minutes` 59 or more there is no window
+  and it logs an error and does nothing;
 - the context is at least `idle_min_tokens` (default 80000);
 - the session has not armed its own `/clear`, and did not arm a resume in the last 15 minutes;
 - after an automatic resume, the context grew 40k tokens or more (a freshly resumed session is not
   saved again every hour);
-- it did not already act during this idle stretch;
+- it did not already act during this idle stretch. A stretch ends when the transcript changes, so
+  if the session later sits idle again without having cleared, it asks again. If it pressed Enter
+  and the session wrote nothing at all, it logs `no-response` once and does not type again;
 - the session runs in a tmux pane, that pane runs exactly this session, and the prompt is empty.
   Right before Enter it checks again that the session is idle and the prompt holds exactly the typed
-  text. If not, it does not press Enter and does not type again during that idle stretch.
+  text. If not, it does not press Enter, erases its text if the prompt still holds exactly that, and
+  does not type again during that idle stretch.
 
 Sessions outside tmux (a plain terminal, iTerm2 without tmux, the desktop app, an IDE) are skipped:
 there is no safe way to check for an empty prompt there. Decisions go to `save-clear.log` with the
 tag `[idle]`. See what it would do right now with `bin/save-clear-idle --dry-run`.
+
+Most runs start no process: it looks at transcript times first and asks `claude agents --json` only
+when one is in the window. The job gets the `PATH` and `CLAUDE_CONFIG_DIR` (if set) of the shell you
+ran `install.sh` from; if your sessions use another config folder, set it and run `install.sh` again
+(no transcripts found is logged once). The job's own errors go to `idle-job.log` in the state folder.
+On Linux, `--interval` must be a multiple of 60 seconds, at most 3540 (cron counts in minutes).
 
 ### Desktop app relay
 

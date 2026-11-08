@@ -52,7 +52,7 @@
     "idle_minutes": {
       "type": "string",
       "title": "Idle trigger: minutes idle before an automatic save-clear",
-      "description": "Used only if you scheduled the idle trigger (./install.sh --idle). A session idle this long (and under ~60 min, while the prompt cache is warm) runs save-clear by itself. Empty = 50. 0 = off.",
+      "description": "Used only if you scheduled the idle trigger (./install.sh --idle). A session idle this long (and under 59 min, while the 1-hour prompt cache is warm) runs save-clear by itself. Empty = 50. 0 = off.",
       "default": ""
     },
     "idle_min_tokens": {
