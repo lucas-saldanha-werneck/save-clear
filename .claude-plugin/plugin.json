@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "End-of-session ritual: Claude saves memory and a verified session summary, clears the context by itself, and the next session starts from the summary.",
   "author": {
     "name": "Lucas Saldanha Werneck",
@@ -17,7 +17,8 @@
     "summary",
     "resume",
     "hooks",
-    "tmux"
+    "tmux",
+    "idle"
   ],
   "userConfig": {
     "snapshot_dir": {
@@ -46,6 +47,18 @@
       "type": "string",
       "title": "Context limit for an automatic save-clear (tokens)",
       "description": "When the context passes this many tokens, Claude runs save-clear at the end of the turn. Empty = 300000 (30% of a 1M window). 0 = off.",
+      "default": ""
+    },
+    "idle_minutes": {
+      "type": "string",
+      "title": "Idle trigger: minutes idle before an automatic save-clear",
+      "description": "Used only if you scheduled the idle trigger (./install.sh --idle). A session idle this long (and under ~60 min, while the prompt cache is warm) runs save-clear by itself. Empty = 50. 0 = off.",
+      "default": ""
+    },
+    "idle_min_tokens": {
+      "type": "string",
+      "title": "Idle trigger: smallest context worth saving (tokens)",
+      "description": "The idle trigger skips sessions with a smaller context. Empty = 80000.",
       "default": ""
     }
   }

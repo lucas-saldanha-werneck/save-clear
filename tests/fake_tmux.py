@@ -16,7 +16,10 @@ with open(calls, "a") as f:
 draft_file = os.path.join(D, "draft.txt")
 draft = open(draft_file).read() if os.path.exists(draft_file) else ""
 cmd = args[0] if args else ""
-if cmd == "capture-pane":
+if cmd == "list-panes":
+    # FAKE_TMUX_PANES: "<pane_pid> <pane_id>" lines, e.g. "4242 %7"
+    sys.stdout.write(os.environ.get("FAKE_TMUX_PANES", "").replace(";", "\n") + "\n")
+elif cmd == "capture-pane":
     sys.stdout.write("\x1b[0m\n❯ " + draft + "\n")
 elif cmd == "send-keys":
     rest, literal, i = [], False, 1

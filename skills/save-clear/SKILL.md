@@ -1,6 +1,6 @@
 ---
 name: save-clear
-description: End-of-session ritual. Saves persistent memory and a verified SESSION-SUMMARY snapshot, arms the auto-resume, and (in "save and clear" mode) clears the context by itself so the next session starts from the summary. Use whenever the user says "save and clear", "save-clear", "salvalimpa", "checkpoint", "save the session", "wrap up the session", "prepare for /clear", "can I clear?", or when the context is close to full and state must be preserved. Also for "what needs to survive this session?".
+description: End-of-session ritual. Saves persistent memory and a verified SESSION-SUMMARY snapshot, arms the auto-resume, and (in "save and clear" mode) clears the context by itself so the next session starts from the summary. Use whenever the user says "save and clear", "save-clear", "salvalimpa", "checkpoint", "save the session", "wrap up the session", "prepare for /clear", "can I clear?", or when the context is close to full and state must be preserved. Also when a message starts with "save-clear (automatic" (the context limit or the idle trigger asking for it): run it in "save and clear" mode. Also for "what needs to survive this session?".
 ---
 
 # save-clear

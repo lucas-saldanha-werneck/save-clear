@@ -5,6 +5,7 @@ Files (all under the state folder: $SAVE_CLEAR_STATE_DIR, else $CLAUDE_PLUGIN_DA
   pending_resume.lock  held while pending_resume.json is read, changed and written back
   clear/<key>.json     one auto-/clear request per session (key = session id, or job-<id> for --bg)
   cap/<session>.json   context size when the token-limit hook last asked for a save-clear
+  idle/<session>.done  last idle stretch the idle trigger (bin/save-clear-idle) already handled
   config.json          plugin options, copied here by the SessionStart hook so bin/ commands see them
   save-clear.log       one line per decision
 """
@@ -92,6 +93,8 @@ OPTIONS = {
     "notify_command": "SAVE_CLEAR_NOTIFY",
     "publish_link": "SAVE_CLEAR_PUBLISH_LINK",
     "context_cap_tokens": "SAVE_CLEAR_CAP_TOKENS",
+    "idle_minutes": "SAVE_CLEAR_IDLE_MINUTES",
+    "idle_min_tokens": "SAVE_CLEAR_IDLE_MIN_TOKENS",
 }
 
 RESUME_MSG = ("save-clear: resuming. Start with the LAST topic (where we stopped and what is still open); "

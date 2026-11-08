@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""save-clear-idle: a Claude Code session left idle for N minutes runs save-clear by itself.
+
+Opt-in. Nothing runs this until you schedule it (`./install.sh --idle` on macOS writes a launchd
+job that runs it every 2 minutes; on Linux, add the cron line that `./install.sh --idle` prints).
+
+Why: Anthropic's prompt cache lasts up to 60 minutes. Until then, coming back to a big session reads
+the context cheaply from the cache; after that, the whole context is written to the cache again at
+full price. At ~50 minutes idle, save-clear swaps a big context for a short summary while the
+cache is still warm.
+
+It types a save-clear request into a session only when ALL of these hold:
+  - the setting idle_minutes is not 0 ($SAVE_CLEAR_IDLE_MINUTES, plugin option, or --idle-min);
+  - `claude agents --json` lists the session as interactive and idle;
+  - nothing in the session changed for idle_minutes .. idle_minutes+8 minutes (transcript,
+    subagent files, background task output). Past that window the cache is gone anyway;
+  - the context is at least idle_min_tokens (default 80000);
+  - the session has not armed its own /clear and did not arm a resume in the last 15 minutes;
+  - after an automatic resume, the context grew at least 40k tokens (no save loop on a session that
+    only re-read its summary);
+  - it did not act already during this same idle stretch;
+  - the session runs in a tmux pane, the pane runs exactly that session, the prompt is empty, and
+    right before Enter the prompt holds exactly the typed text and the session is still idle.
+    Otherwise it types nothing (or leaves the text and does not press Enter).
+
+Sessions outside tmux (plain terminal, iTerm2 without tmux, desktop app, IDE) are skipped and
+logged: there is no safe way to check for an empty prompt there.
+
+Usage: save-clear-idle [--dry-run] [--only <session id>] [--idle-min N] [--max-min N] [--min-tokens N]
+Log:   save-clear.log in the state folder, tag [idle]. With --dry-run or --only it also prints JSON lines.
+Test knobs: SAVE_CLEAR_CLAUDE (a fake `claude`; a .py file runs with this Python),
+            SAVE_CLEAR_PROJECTS_DIR (default ~/.claude/projects), SAVE_CLEAR_IDLE_TYPE_DELAY.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+import resume  # noqa: E402
+from common import (HOME, STATE, claude_bin, clear_key, clear_path, log as _log, now_ms,  # noqa: E402
+                    setting, short, tail_lines, tmux_bin)
+
+DEFAULT_IDLE_MIN = 50
+WINDOW_MIN = 8            # act between idle_min and idle_min + 8 minutes
+DEFAULT_MIN_TOKENS = 80000
+GROWTH_AFTER_RESUME = 40000
+RECENT_SAVE_MS = 15 * 60 * 1000
+RESUME_MARKS = ("save-clear: resuming",)
+IDLE_DIR = os.path.join(STATE, "idle")
+MSG = ("save-clear (automatic: session idle for {m} min, context {k}k; the prompt cache expires at 60 min). "
+       "Run the save-clear skill now in \"save and clear\" mode. If your last message was a question to the "
+       "user, put that question under next steps.")
+
+
+def number(name, default):
+    raw = setting(name, str(default)).replace("_", "").replace(",", "")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        _log("idle", f"bad {name} {raw!r}; using {default}")
+        return float(default)
+
+
+ap = argparse.ArgumentParser(description="Run save-clear in sessions left idle (opt-in).")
+ap.add_argument("--dry-run", action="store_true", help="only print what it would do")
+ap.add_argument("--only", help="look at this session id only")
+ap.add_argument("--idle-min", type=float, default=None, help="minutes idle before acting (0 = off)")
+ap.add_argument("--max-min", type=float, default=None, help="do not act after this many idle minutes")
+ap.add_argument("--min-tokens", type=int, default=None, help="skip sessions with a smaller context")
+a = ap.parse_args()
+IDLE_MIN = a.idle_min if a.idle_min is not None else number("idle_minutes", DEFAULT_IDLE_MIN)
+MAX_MIN = a.max_min if a.max_min is not None else IDLE_MIN + WINDOW_MIN
+MIN_TOKENS = a.min_tokens if a.min_tokens is not None else int(number("idle_min_tokens", DEFAULT_MIN_TOKENS))
+CLAUDE = claude_bin()
+TMUX = tmux_bin()
+PROJECTS = os.path.expanduser(os.environ.get("SAVE_CLEAR_PROJECTS_DIR") or os.path.join(
+    os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude"), "projects"))
+TYPE_DELAY = float(os.environ.get("SAVE_CLEAR_IDLE_TYPE_DELAY", "1"))
+
+
+def log(**kw):
+    kw = {k: v for k, v in kw.items() if v is not None}
+    _log("idle", json.dumps(kw, ensure_ascii=False))
+    if a.dry_run or a.only:
+        print(json.dumps(kw, ensure_ascii=False))
+
+
+def sh(cmd, timeout=30):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def agents():
+    cmd = ([sys.executable, CLAUDE] if CLAUDE.endswith(".py") else [CLAUDE]) + ["agents", "--json"]
+    try:
+        v = json.loads(sh(cmd) or "null")
+    except Exception:
+        return None
+    return v if isinstance(v, list) else None
+
+
+def task_dirs(sid):
+    """Background task output of a session (Claude Code keeps it in a per-user temp folder)."""
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    roots = {tempfile.gettempdir()}
+    if sys.platform == "darwin":
+        roots.add("/private/tmp")
+    out = []
+    for r in roots:
+        pattern = os.path.join(r, f"claude-{uid}" if uid is not None else "claude-*", "*", sid, "tasks", "*")
+        out += glob.glob(pattern)
+    return out
+
+
+def last_change(sid, transcript):
+    """Newest mtime among the transcript, the session folder (subagents) and background tasks."""
+    paths = [transcript] + glob.glob(transcript[:-len(".jsonl")] + "/**/*", recursive=True) + task_dirs(sid)
+    m = 0.0
+    for p in paths:
+        try:
+            m = max(m, os.path.getmtime(p))
+        except OSError:
+            pass
+    return m
+
+
+def usage_total(line):
+    try:
+        d = json.loads(line)
+    except Exception:
+        return None
+    if not isinstance(d, dict) or d.get("isSidechain"):
+        return None
+    msg = d.get("message")
+    u = msg.get("usage") if isinstance(msg, dict) else None
+    if not isinstance(u, dict):
+        return None
+    total = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    return total or None  # a synthetic reply has all zeros
+
+
+def last_context(tp):
+    for line in reversed(tail_lines(tp, 4 * 1024 * 1024)):
+        if '"usage"' in line:
+            t = usage_total(line)
+            if t:
+                return t
+    return 0
+
+
+def resume_baseline(tp):
+    """Context size right after the last automatic resume, or None if there was none."""
+    base, seen = None, False
+    for line in tail_lines(tp, 8 * 1024 * 1024):
+        if '"type":"user"' in line.replace(" ", "") and any(m in line for m in RESUME_MARKS):
+            seen, base = True, None
+            continue
+        if seen and base is None and '"usage"' in line:
+            base = usage_total(line)
+    return base
+
+
+def armed_or_saving(sid):
+    if os.path.exists(clear_path(clear_key(sid))):
+        return "this session already armed its /clear"
+    now = now_ms()
+    for e in resume.read_entries() or []:
+        if e.get("session_id") == sid and now - int(e.get("ts") or 0) < RECENT_SAVE_MS:
+            return "this session armed a resume in the last 15 minutes"
+    return ""
+
+
+def mark_path(sid):
+    return os.path.join(IDLE_DIR, re.sub(r"[^A-Za-z0-9_-]", "", sid)[:120] + ".done")
+
+
+def read_mark(sid):
+    try:
+        with open(mark_path(sid), encoding="utf-8") as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def write_mark(sid, value):
+    if a.dry_run:
+        return
+    os.makedirs(IDLE_DIR, exist_ok=True)
+    with open(mark_path(sid), "w", encoding="utf-8") as f:
+        f.write(str(value))
+
+
+# ----- tmux -----
+def ps_parents():
+    par = {}
+    for ln in sh(["ps", "-A", "-o", "pid=,ppid="]).splitlines():
+        try:
+            x, y = ln.split()
+            par[int(x)] = int(y)
+        except ValueError:
+            pass
+    return par
+
+
+def ancestors(pid, par):
+    out = []
+    for _ in range(30):
+        out.append(pid)
+        pid = par.get(pid, 0)
+        if pid in (0, 1):
+            break
+    return out
+
+
+def pane_of(pid):
+    if not TMUX:
+        return None
+    panes = {}
+    for ln in sh([TMUX, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}"]).splitlines():
+        parts = ln.split()
+        if len(parts) == 2 and parts[0].isdigit():
+            panes[int(parts[0])] = parts[1]
+    if not panes:
+        return None
+    for p in ancestors(int(pid), ps_parents()):
+        if p in panes:
+            return panes[p]
+    return None
+
+
+def pane_agent(pane):
+    """The single interactive Claude in the pane, or None."""
+    ags = agents() or []
+    pp = None
+    for ln in sh([TMUX, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}"]).splitlines():
+        parts = ln.split()
+        if len(parts) == 2 and parts[1] == pane and parts[0].isdigit():
+            pp = int(parts[0])
+    if pp is None:
+        return None
+    par = ps_parents()
+    found = [g for g in ags if isinstance(g, dict) and g.get("kind") == "interactive" and g.get("pid")
+             and pp in ancestors(int(g["pid"]), par)]
+    return found[0] if len(found) == 1 else None
+
+
+DIM = re.compile(r"\x1b\[2m.*?(\x1b\[(0|22)m|$)")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+BORDER = re.compile(r"^[\s─-╿]*$")
+
+
+def screen(pane):
+    return sh([TMUX, "capture-pane", "-p", "-e", "-t", pane])
+
+
+def clean(line):
+    return ANSI.sub("", DIM.sub("", line)).replace(" ", " ")
+
+
+def prompt_block(text):
+    """Everything after the ❯ prompt (dim hint removed, wrapped lines joined); None = no prompt."""
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if "❯" in lines[i]:
+            parts = [clean(lines[i].split("❯", 1)[1])]
+            for ln in lines[i + 1:]:
+                c = clean(ln)
+                if not c.strip() or BORDER.match(c):
+                    break
+                parts.append(c)
+            return " ".join(p.strip().strip("│").strip() for p in parts).strip()
+    return None
+
+
+def squash(t):
+    return "".join((t or "").split())
+
+
+def pane_state(pane, sid, pid):
+    """'' when the pane runs session sid in process pid, idle; else the reason."""
+    ag = pane_agent(pane)
+    if not ag:
+        return "no single Claude in the pane"
+    if ag.get("sessionId") != sid or int(ag.get("pid") or 0) != int(pid):
+        return f"the pane now runs session {short(ag.get('sessionId'))}"
+    if ag.get("status") != "idle":
+        return "busy"
+    return ""
+
+
+def type_into(pane, sid, pid, msg):
+    """Type msg and press Enter, with the checks described at the top. Returns (sent, why)."""
+    why = pane_state(pane, sid, pid)
+    if why:
+        return False, why
+    s = screen(pane)
+    if "esc to interrupt" in s:
+        return False, "busy"
+    p = prompt_block(s)
+    if p is None:
+        return False, "no prompt on screen"
+    if p:
+        return False, "the prompt has a draft"
+    sh([TMUX, "send-keys", "-t", pane, "-l", msg])
+    time.sleep(TYPE_DELAY)  # separate Enter: long text arrives as a paste and swallows the Enter
+    why = pane_state(pane, sid, pid)
+    s = screen(pane)
+    if not why and "esc to interrupt" in s:
+        why = "busy"
+    if not why and squash(prompt_block(s)) != squash(msg):
+        why = "the prompt changed while typing"
+    if why:
+        return False, f"check before Enter failed ({why}); Enter not sent, the text stays in the prompt"
+    sh([TMUX, "send-keys", "-t", pane, "Enter"])
+    return True, ""
+
+
+def main():
+    if not IDLE_MIN:
+        if a.dry_run or a.only:
+            print("save-clear-idle: off (idle_minutes = 0)")
+        return 0
+    ags = agents()
+    if ags is None:
+        log(event="error", why=f"`{CLAUDE} agents --json` failed")
+        return 1
+    now = time.time()
+    for ag in ags:
+        if not isinstance(ag, dict):
+            continue
+        sid = str(ag.get("sessionId") or "")
+        if not sid or (a.only and sid != a.only):
+            continue
+        if ag.get("kind") != "interactive" or ag.get("status") != "idle":
+            continue
+        tps = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl"))
+        if not tps:
+            continue
+        tp = tps[0]
+        mt = last_change(sid, tp)
+        idle = (now - mt) / 60
+        if not (IDLE_MIN <= idle <= MAX_MIN):
+            if a.only:
+                log(event="skipped", session=sid, why=f"idle {idle:.0f} min, outside {IDLE_MIN:g}-{MAX_MIN:g}")
+            continue
+        if read_mark(sid) >= mt:
+            continue  # already acted (or decided to skip) during this idle stretch
+        ctx = last_context(tp)
+        info = dict(session=sid, name=ag.get("name"), cwd=ag.get("cwd"), idle_min=round(idle), ctx=ctx)
+        if ctx < MIN_TOKENS:
+            log(event="skipped", why=f"context below {MIN_TOKENS}", **info)
+            write_mark(sid, mt)
+            continue
+        busy = armed_or_saving(sid)
+        if busy:
+            log(event="skipped", why=busy, **info)
+            write_mark(sid, mt)
+            continue
+        base = resume_baseline(tp)
+        if base is not None and ctx - base < GROWTH_AFTER_RESUME:
+            log(event="skipped", why=f"little new since the automatic resume ({base // 1000}k -> {ctx // 1000}k)", **info)
+            write_mark(sid, mt)
+            continue
+        pane = pane_of(ag.get("pid") or 0)
+        if not pane:
+            log(event="skipped", why="not in a tmux pane (no safe way to check the prompt)", **info)
+            write_mark(sid, mt)
+            continue
+        if a.dry_run:
+            log(event="would-type", target=pane, **info)
+            continue
+        sent, why = type_into(pane, sid, ag.get("pid"), MSG.format(m=round(idle), k=round(ctx / 1000)))
+        if sent:
+            write_mark(sid, now + 3600)  # no second request during this idle stretch
+            log(event="sent", target=pane, **info)
+        else:
+            log(event="skipped", target=pane, why=why, **info)
+            if "Enter not sent" in why:
+                write_mark(sid, now + 3600)  # do not type a second copy next to the first
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
