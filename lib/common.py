@@ -178,8 +178,16 @@ def setting(name, default=""):
         value = (os.environ.get(var) or "").strip() if var else ""
         if value:
             return value
-    return (str(_saved_config().get(name) or "").strip() or str(user_config().get(name) or "").strip()
-            or default)
+    return _as_text(_saved_config().get(name)) or _as_text(user_config().get(name)) or default
+
+
+def _as_text(value):
+    """A config value as text. A JSON number 0 or false is a real value ("0" = off), not "unset"."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value).strip()
 
 
 def resume_msg():
@@ -187,11 +195,14 @@ def resume_msg():
     return " ".join(setting("resume_message").split()) or RESUME_MSG
 
 
-def is_resume_text(txt):
-    """True for the default resume request or the configured one (the start of it is enough)."""
+def is_resume_text(txt, custom=None):
+    """True for the default resume request (its distinctive start is enough) or the configured one
+    (the whole text: a short custom request like "go on" must not swallow "go on with the refactor")."""
     t = (txt or "").lstrip()
-    custom = resume_msg()
-    return t.startswith(RESUME_MSG[:20]) or bool(custom) and t.startswith(custom[:20])
+    if t.startswith(RESUME_MSG[:20]):
+        return True
+    custom = resume_msg() if custom is None else custom
+    return " ".join(t.split()) == custom
 
 
 def language():
@@ -424,6 +435,7 @@ def user_messages_since(transcript, since_ms):
     out, cancelled = [], set()
     if not transcript:
         return out
+    custom = resume_msg()
     for line in tail_lines(transcript):
         if '"queue-operation"' in line and '"remove"' in line:
             try:
@@ -457,7 +469,7 @@ def user_messages_since(transcript, since_ms):
                 continue
             txt = _text_of(c)
         txt = (txt or "").strip()
-        if txt and not NOT_HUMAN.match(txt) and not is_resume_text(txt) and txt not in out:
+        if txt and not NOT_HUMAN.match(txt) and not is_resume_text(txt, custom) and txt not in out:
             out.append(txt)
     return out
 

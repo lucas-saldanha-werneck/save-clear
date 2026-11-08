@@ -1146,6 +1146,47 @@ class UserConfig(Base):
         r = self.run_py("bin/save-clear", ["dir"], CLAUDE_PLUGIN_OPTION_LANGUAGE="German")
         self.assertIn("language: German", r.stdout, "a plugin option beats the config file")
 
+    def py(self, code, *args):
+        """Run `code` with lib/ and bin/save-clear-idle importable, in this test's environment.
+        `args` reach the code as ARGS (a JSON list): the idle script parses sys.argv when imported."""
+        pre = ("import importlib.machinery, importlib.util, json, os, sys\n"
+               "ARGS = json.loads(os.environ['TEST_ARGS'])\n"
+               f"sys.path.insert(0, {os.path.join(ROOT, 'lib')!r})\n"
+               f"ld = importlib.machinery.SourceFileLoader('idle', {os.path.join(ROOT, 'bin', 'save-clear-idle')!r})\n"
+               "idle = importlib.util.module_from_spec(importlib.util.spec_from_loader('idle', ld))\n"
+               "ld.exec_module(idle)\n"
+               "import common\n")
+        r = subprocess.run([PY, "-c", pre + code], capture_output=True, text=True, encoding="utf-8",
+                           cwd=self.proj, env=dict(self.env, TEST_ARGS=json.dumps(args)), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def test_number_zero_and_false_in_the_file_are_values(self):
+        self.config(context_cap_tokens=0, idle_minutes=0, publish_link=False)
+        out = self.py("print(common.setting('context_cap_tokens', '300000'), common.setting('idle_minutes', '50'),"
+                      " common.setting('publish_link', 'x'))")
+        self.assertEqual(out, "0 0 false", "0 = off must not fall back to the default")
+
+    def test_short_custom_resume_message_does_not_hide_the_users_own_words(self):
+        self.config(resume_message="go on")
+        tp = os.path.join(self.t, "t.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            for txt in ("go on", "go on with the refactor, please"):
+                f.write(json.dumps({"type": "user", "timestamp": iso(5), "message": {"role": "user", "content": txt}}) + "\n")
+        out = self.py("print(json.dumps(common.user_messages_since(ARGS[0], 0)))", tp)
+        self.assertEqual(json.loads(out), ["go on with the refactor, please"])
+        out = self.py("print(common.is_resume_text('go on'), common.is_resume_text('  go   on '),"
+                      " common.is_resume_text(ARGS[0][:30] + ' extra'))", RESUME_MSG)
+        self.assertEqual(out, "True True True", "the exact custom text and the default's start still count")
+
+    def test_idle_finds_a_custom_resume_message_with_quotes(self):
+        custom = 'Say "resumed" then go on'
+        self.config(resume_message=custom)
+        lines = [json.dumps({"type": "user", "message": {"role": "user", "content": custom}}),
+                 json.dumps({"type": "user", "message": {"role": "user", "content": custom + " and more"}})]
+        out = self.py("c = common.resume_msg(); print([idle.is_resume_request(l, c) for l in ARGS])", *lines)
+        self.assertEqual(out, "[True, False]")
+
     def test_extra_steps_from_a_file_and_bad_config(self):
         steps = os.path.join(self.t, "steps.md")
         with open(steps, "w", encoding="utf-8") as f:
