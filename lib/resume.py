@@ -8,9 +8,8 @@ own entry. A global flag would hand the summary to whichever session starts firs
 import os
 import re
 
-from common import RESUME_FLAG, ensure_state, log, now_ms, read_json, write_json
+from common import RESUME_FLAG, RESUME_LOCK, ensure_state, locked, log, now_ms, read_json, write_json
 
-FALLBACK_MS = 30 * 60 * 1000       # no way to tell the session apart: same folder and a recent flag only
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
 
 
@@ -75,8 +74,6 @@ def match(e, hook, env, now):
         return False, f"source {src}: old conversation, still has its context"
     if e.get("session_id") and hook.get("session_id") == e.get("session_id"):
         return False, "same conversation, still has its context"
-    age = now - int(e.get("ts") or 0)
-    mins = round(age / 60000)
     # Desktop app: a clear opens a new transcript in a new process; the host session id stays
     if e.get("app_session"):
         host = env.get("CLAUDE_CODE_HOST_SESSION_ID")
@@ -86,19 +83,13 @@ def match(e, hook, env, now):
     if e.get("job"):
         job = os.path.basename(env.get("CLAUDE_JOB_DIR") or "")
         return (True, f"same job {job}") if job == e["job"] else (False, f"armed by job {e['job']}")
-    ep = env.get("CLAUDE_CODE_ENTRYPOINT") or "cli"
-    if (e.get("entrypoint") or "cli") != "cli":
-        if ep == e.get("entrypoint") and age < FALLBACK_MS:
-            return True, f"same folder, {ep} without a session id, flag {mins} min old"
-        return False, f"{e.get('entrypoint')} without a session id: this is {ep}, flag {mins} min old"
-    # Terminal: /clear happens in the SAME process (a recycled pid with source startup does not pass)
+    # Terminal or IDE: /clear happens in the SAME process (a recycled pid with source startup does not pass)
     if e.get("pid"):
         if src == "clear" and str(env.get("CLAUDE_PID") or "") == str(e["pid"]):
             return True, f"/clear in the same process (pid {e['pid']})"
         return False, f"armed by process {e['pid']}; this is {env.get('CLAUDE_PID') or '?'} with source {src}"
-    if src == "clear" and age < FALLBACK_MS:
-        return True, f"/clear in the same folder, flag without pid, {mins} min old"
-    return False, f"terminal without pid: source {src}, flag {mins} min old"
+    # No process id, app session or job: a folder and an age cannot tell two sessions apart
+    return False, f"armed without a process id ({e.get('entrypoint') or 'cli'}): not delivered automatically"
 
 
 def arm(snapshot, session_id=None, env=None):
@@ -118,10 +109,11 @@ def arm(snapshot, session_id=None, env=None):
         "job": os.path.basename(env["CLAUDE_JOB_DIR"]) if env.get("CLAUDE_JOB_DIR") else None,
         "ts": now,
     }
-    old = read_entries() or []
-    keep = [x for x in old if not same_owner(x, e) and not too_old(x, now)]
-    write_entries(keep + [e])
-    back = read_entries() or []
+    with locked(RESUME_LOCK):  # read, change and write back as one step: concurrent arms keep every entry
+        old = read_entries() or []
+        keep = [x for x in old if not same_owner(x, e) and not too_old(x, now)]
+        write_entries(keep + [e])
+        back = read_entries() or []
     if not any(x.get("snapshot") == snap and x.get("ts") == now for x in back):
         return False, f"save-clear: the resume flag was not written (check {RESUME_FLAG})."
     ids = f"session {_short(e['session_id'])}"
@@ -132,13 +124,19 @@ def arm(snapshot, session_id=None, env=None):
     queued = f"; {len(keep)} from other sessions queued" if keep else ""
     log("resume", f"armed {os.path.basename(snap)} by {ids}, folder {e['cwd']}, {e['entrypoint']}{queued}")
     msg = f"auto-resume armed: {os.path.basename(snap)} for this session only ({ids}; folder {e['cwd']})."
-    if not (e["session_id"] or e["app_session"] or e["pid"] or e["job"]):
-        msg += "\nwarning: no session id; it is delivered to a /clear in the same folder within 30 min."
+    if not (e["app_session"] or e["pid"] or e["job"]):
+        msg += (f"\nwarning: no process id or app session id, so this summary is NOT delivered automatically. "
+                f"After the /clear, ask Claude to read {snap}.")
     return True, msg
 
 
 def take(hook, env, now):
     """Find and remove this session's entry. Returns (entry or None, why)."""
+    with locked(RESUME_LOCK):  # an arm in another session waits instead of being overwritten
+        return _take(hook, env, now)
+
+
+def _take(hook, env, now):
     entries = read_entries()
     if entries is None or (os.path.exists(RESUME_FLAG) and not entries):
         log("resume", "resume flag unreadable or empty: deleted")

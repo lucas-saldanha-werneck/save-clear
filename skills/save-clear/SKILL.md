@@ -74,8 +74,9 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
 
    Check that it prints `auto-resume armed: ...`; a non-zero exit means it did not arm (say so). The
    SessionStart hook delivers the summary only to THIS session after its /clear (terminal: same
-   process; desktop app: same folder and same app session). Other sessions get nothing. If the user
-   says they will NOT continue this topic, skip this step.
+   process; desktop app: same folder and same app session). Other sessions get nothing. If it prints
+   a warning that the summary is NOT delivered automatically, tell the user to ask you to read the
+   snapshot after the /clear. If the user says they will NOT continue this topic, skip this step.
 
 7. **Reply in this fixed, short format:**
 
@@ -92,12 +93,11 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    ```
 
    It prints `save-clear: mode=<mode> ...`. What to do per mode:
-   - **`tmux`, `iterm` or `bg`**: armed. End the turn right away with the short reply from step 7. Run
+   - **`tmux` or `bg`**: armed. End the turn right away with the short reply from step 7. Run
      nothing else after it. The Stop hook starts a helper that types `/clear` and then the resume
-     request. In `tmux` it first waits until the session is idle with an empty prompt and confirms
-     the clear took (same process, new session id); `iterm` only checks that the tty runs this session;
-     `bg` attaches in a hidden tmux and waits for an idle prompt.
-   - **`manual`** (a terminal without tmux or iTerm2): nothing can type for you. Reply with the
+     request. It types only into an idle session with an empty prompt, checks again right before
+     each Enter, and types the resume request only after it confirmed the clear took.
+   - **`manual`** (a terminal without tmux, including iTerm2): nothing can type for you. Reply with the
      "save" form of step 7: "You can /clear now." The summary comes back by itself after the /clear.
    - **`app`** (Claude desktop app, IDE, SDK): the flag is NOT written, because nothing must type into a
      terminal that may belong to another session. If the `mcp__ccd_session_mgmt__clear_session` tool
@@ -122,7 +122,7 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    **A user message during the save.** If one arrives while you save, answer it and put it in the
    snapshot before step 8. If it arrives after step 8, the Stop hook does not clear: it blocks and asks
    for three things: (1) answer it; (2) add to the snapshot a section `## After the save` with only what
-   came after; (3) run `save-clear rearm`. In the desktop app the clear-guard hook holds the first
+   came after; (3) run the `save-clear rearm <session id>` command it gives. In the desktop app the clear-guard hook holds the first
    `clear_session` call the same way; answer, add the section, and call `clear_session` again in the
    same turn (the second call goes through).
 

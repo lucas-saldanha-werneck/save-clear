@@ -10,11 +10,12 @@ its own, and nothing is ever typed into a text box.
   save-clear-relay setup [local_<id>]   run IN the relay session: record it (default: its own id)
   save-clear-relay rules                the rules the relay session follows (paths filled in)
   save-clear-relay waker-rules          the rules the waker session follows (paths filled in)
-  save-clear-relay status               relay id, listening or not, inbox size
+  save-clear-relay status               relay id, listening or not, queued, unacknowledged and failed requests
   save-clear-relay off | on             turn the relay off on purpose / back on
   save-clear-relay request              the calling app session asks for its resume after its clear
   save-clear-relay job --to local_<id> [--message TEXT] [--after-clear local_<id>] [--in S] [--why W]
   save-clear-relay listen               the relay's listener (run in the background by the relay)
+  save-clear-relay ack <name> ok|failed the relay reports a delivery; a request stays pending until then
   save-clear-relay clear-count          how many clears of the relay the app log shows
   save-clear-relay wait-clear --base N  the waker waits until the relay's clear shows up in the app log
 
@@ -44,7 +45,9 @@ except ImportError:  # Windows
 RELAY = os.path.join(STATE, "relay.json")
 OFF = os.path.join(STATE, "relay-OFF")
 INBOX = os.path.join(STATE, "relay-inbox")
-OUT = os.path.join(INBOX, "out")
+OUT = os.path.join(INBOX, "out")          # delivered (acknowledged)
+CLAIMED = os.path.join(INBOX, "claimed")  # handed to the relay, waiting for its ack
+FAILED = os.path.join(INBOX, "failed")    # gave up: shown by status
 ALIVE = os.path.join(STATE, "relay-listener.alive")
 LOCK = os.path.join(STATE, "relay-listener.lock")
 RLOG = os.path.join(STATE, "relay.log")
@@ -56,6 +59,8 @@ AFTER_CLEAR_MAX = 900  # 15 min without the target's clear: drop the request
 POLL = float(os.environ.get("SAVE_CLEAR_RELAY_POLL", "3"))
 MAXWAIT = float(os.environ.get("SAVE_CLEAR_RELAY_MAXWAIT", str(6 * 3600)))  # exit so the relay re-arms
 GRACE = float(os.environ.get("SAVE_CLEAR_RELAY_GRACE", "60"))  # app log missing: deliver after this
+CLAIM_S = float(os.environ.get("SAVE_CLEAR_RELAY_CLAIM_S", "600"))  # no ack after this: hand it out again
+MAX_ATTEMPTS = 3
 
 
 def app_log():
@@ -73,7 +78,7 @@ def app_log():
 def rlog(msg):
     try:
         ensure_state()
-        with open(RLOG, "a") as f:
+        with open(RLOG, "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [relay {os.getpid()}] {msg}\n")
     except OSError:
         pass
@@ -86,7 +91,7 @@ def relay_id():
 
 def listening():
     try:
-        with open(ALIVE) as f:
+        with open(ALIVE, encoding="utf-8") as f:
             pid, t = f.read().split()
         if os.name != "nt":
             os.kill(int(pid), 0)
@@ -108,7 +113,7 @@ def enqueue(to, message, after_clear=None, delay=0.0, why=""):
     os.makedirs(INBOX, exist_ok=True)
     name = f"{int(now * 1000)}-{why or 'job'}-{to[6:14]}.json"
     tmp = os.path.join(INBOX, "." + name)
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(job, f)
     os.replace(tmp, os.path.join(INBOX, name))  # appears only when complete
     print(os.path.join(INBOX, name))
@@ -173,12 +178,19 @@ def cmd_setup(args):
     return 0
 
 
+def names(folder):
+    return sorted(os.path.basename(p) for p in glob.glob(os.path.join(folder, "*.json*")))
+
+
 def cmd_status():
     rid = relay_id()
     v = read_json(RELAY) or {}
+    unacked, failed = names(CLAIMED), names(FAILED)
     print(json.dumps({"relay": rid or None, "waker": v.get("waker"), "listening": listening(),
                       "off": os.path.exists(OFF), "queued": len(glob.glob(os.path.join(INBOX, "*.json"))),
-                      "state": STATE, "app_log": app_log(), "rules": f"{CMD} rules"}, indent=2))
+                      "unacked": len(unacked), "failed": len(failed), "unacked_requests": unacked,
+                      "failed_requests": failed, "state": STATE, "app_log": app_log(),
+                      "rules": f"{CMD} rules"}, indent=2))
     return 0
 
 
@@ -226,11 +238,12 @@ def cleared(sid, since):
 
 def ready(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             job = json.load(f)
     except Exception as e:
         rlog(f"unreadable request {path}: {e}")
-        os.replace(path, path + ".bad")
+        os.makedirs(FAILED, exist_ok=True)
+        os.replace(path, os.path.join(FAILED, os.path.basename(path) + ".bad"))
         return False
     if time.time() < float(job.get("due") or 0):
         return False
@@ -246,15 +259,69 @@ def ready(path):
         if not done:
             if time.time() - created > AFTER_CLEAR_MAX:
                 rlog(f"{os.path.basename(path)}: no clear of {ac} in 15 min; dropped")
-                os.replace(path, path + ".timeout")
+                os.makedirs(FAILED, exist_ok=True)
+                os.replace(path, os.path.join(FAILED, os.path.basename(path) + ".timeout"))
             return False
     return True
 
 
+def write_job(path, job):
+    tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path))
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(job, f)
+    os.replace(tmp, path)
+
+
+def give_back(path, job, why):
+    """A request that was not delivered: back to the inbox, or to failed/ after MAX_ATTEMPTS."""
+    name = os.path.basename(path)
+    if int(job.get("attempts") or 0) >= MAX_ATTEMPTS:
+        write_job(os.path.join(FAILED, name), job)
+        rlog(f"{name}: {why}; gave up after {MAX_ATTEMPTS} attempts (see status)")
+    else:
+        write_job(os.path.join(INBOX, name), job)
+        rlog(f"{name}: {why}; back in the queue (attempt {job.get('attempts')} of {MAX_ATTEMPTS})")
+    os.unlink(path)
+
+
+def reclaim():
+    """Requests handed out but never acknowledged (relay turn lost): retry them."""
+    for p in glob.glob(os.path.join(CLAIMED, "*.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                job = json.load(f)
+        except Exception:
+            continue
+        if time.time() - float(job.get("claimed") or 0) >= CLAIM_S:
+            give_back(p, job, f"no ack within {int(CLAIM_S)} s")
+
+
+def cmd_ack(args):
+    if len(args) < 2 or args[1] not in ("ok", "failed"):
+        print("usage: ack <name> ok|failed [reason]", file=sys.stderr)
+        return 1
+    name = os.path.basename(args[0])
+    path = os.path.join(CLAIMED, name)
+    try:
+        with open(path, encoding="utf-8") as f:
+            job = json.load(f)
+    except Exception:
+        print(f"{name}: not waiting for an ack (already acknowledged, or retried)", file=sys.stderr)
+        return 1
+    if args[1] == "ok":
+        os.makedirs(OUT, exist_ok=True)
+        os.replace(path, os.path.join(OUT, name))
+        rlog(f"{name}: delivered (ack)")
+    else:
+        give_back(path, job, "delivery failed: " + " ".join(args[2:])[:200])
+    return 0
+
+
 def cmd_listen():
     ensure_state()
-    os.makedirs(OUT, exist_ok=True)
-    lock = open(LOCK, "w")
+    for d in (OUT, CLAIMED, FAILED):
+        os.makedirs(d, exist_ok=True)
+    lock = open(LOCK, "w", encoding="utf-8")
     if fcntl:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -264,23 +331,32 @@ def cmd_listen():
     rlog("listening")
     start = time.time()
     while True:
-        with open(ALIVE, "w") as f:
+        with open(ALIVE, "w", encoding="utf-8") as f:
             f.write(f"{os.getpid()} {int(time.time())}\n")
+        reclaim()
         done = []
         for p in sorted(glob.glob(os.path.join(INBOX, "*.json"))):
             if ready(p):
-                dst = os.path.join(OUT, os.path.basename(p))
-                os.replace(p, dst)
-                done.append(dst)
-        if done:
-            for d in done:
-                with open(d) as f:
+                with open(p, encoding="utf-8") as f:
                     job = json.load(f)
+                job["attempts"] = int(job.get("attempts") or 0) + 1
+                job["claimed"] = time.time()
+                dst = os.path.join(CLAIMED, os.path.basename(p))
+                write_job(dst, job)  # pending until the relay acknowledges it
+                os.unlink(p)
+                done.append((dst, job))
+        if done:
+            for d, job in done:
+                name = os.path.basename(d)
                 print(f"JOB {d}")
                 print(f"  DO: mcp__ccd_session_mgmt__send_message session_id={job['to']} message=<the text below, exactly>")
                 print("  TEXT: " + job["message"])
-                rlog(f"handed to the relay: {os.path.basename(d)}")
-            print(f"  THEN: one line per job in {RLOG}; start the listener again in the background")
+                print(f"  ACK: {CMD} ack {name} ok")
+                print(f"  (if send_message failed: {CMD} ack {name} failed <reason>)")
+                rlog(f"handed to the relay: {name} (attempt {job['attempts']} of {MAX_ATTEMPTS})")
+            print(f"  THEN: run the ACK line of each job; start the listener again in the background. "
+                  f"Without an ack a request is handed out again after {int(CLAIM_S)} s, "
+                  f"at most {MAX_ATTEMPTS} times.")
             return 0
         if time.time() - start > MAXWAIT:
             print("IDLE")
@@ -326,7 +402,7 @@ def main(argv):
         return cmd_status()
     if cmd == "off":
         ensure_state()
-        open(OFF, "w").close()
+        open(OFF, "w", encoding="utf-8").close()
         print(f"relay turned off ({OFF}). Requests are refused with exit 3 until `on`.")
         return 0
     if cmd == "on":
@@ -342,6 +418,8 @@ def main(argv):
         return cmd_waker_rules()
     if cmd == "listen":
         return cmd_listen()
+    if cmd == "ack":
+        return cmd_ack(args)
     if cmd == "clear-count":
         print(clear_count(relay_id()))
         return 0

@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.1.0",
+  "version": "0.4.1",
   "description": "End-of-session ritual: Claude saves memory and a verified session summary, clears the context by itself, and the next session starts from the summary.",
   "author": {
     "name": "Lucas Saldanha Werneck",
@@ -9,7 +9,16 @@
   "homepage": "https://github.com/lucas-saldanha-werneck/save-clear",
   "repository": "https://github.com/lucas-saldanha-werneck/save-clear",
   "license": "MIT",
-  "keywords": ["context", "clear", "checkpoint", "session", "summary", "resume", "hooks", "tmux"],
+  "keywords": [
+    "context",
+    "clear",
+    "checkpoint",
+    "session",
+    "summary",
+    "resume",
+    "hooks",
+    "tmux"
+  ],
   "userConfig": {
     "snapshot_dir": {
       "type": "string",
@@ -27,8 +36,17 @@
       "type": "string",
       "title": "Publish the summary as a link (optional)",
       "description": "on: when the Artifact tool is available, the skill publishes the summary as a private claude.ai page and the next session shows the link first. Useful from a phone, where /clear wipes the screen.",
-      "options": ["off", "on"],
+      "options": [
+        "off",
+        "on"
+      ],
       "default": "off"
+    },
+    "context_cap_tokens": {
+      "type": "string",
+      "title": "Context limit for an automatic save-clear (tokens)",
+      "description": "When the context passes this many tokens, Claude runs save-clear at the end of the turn. Empty = 300000 (30% of a 1M window). 0 = off.",
+      "default": ""
     }
   }
 }

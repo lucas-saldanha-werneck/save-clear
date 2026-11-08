@@ -3,38 +3,43 @@
 
 Started detached by the Stop hook. Modes:
   tmux  <pane>       the session runs in a tmux pane (needs tmux)
-  iterm <dev/tty>    the session runs in an iTerm2 tab on macOS (needs iTerm2 + osascript)
   bg    <job id>     a `claude --bg` background session (needs tmux: attaches in a hidden tmux)
+(iTerm2 without tmux is not typed into: the prompt cannot be checked there.)
 
 Safety rules:
 - Types only when the session is idle (`claude agents --json` says idle, no "esc to interrupt")
   and the prompt is EMPTY. It never erases a draft.
-- Before EVERY key, the Claude process in the target must be the session from the flag (same
-  sessionId) and the same pid as at the first check. Otherwise it refuses, logs REFUSED, exits 3.
-- /clear is confirmed only when the SAME pid shows a NEW sessionId. Only then is the resume
-  request typed.
-- If the session goes back to work (a new message arrived), it re-arms the flag and exits: the
-  next Stop hook decides.
+- tmux: before every key, the Claude process in the target must be the session from the flag
+  (same sessionId) and the same pid as at the first check. Otherwise it refuses, logs REFUSED,
+  exits 3. Right before each Enter it checks again: same session and pid, idle, and the prompt
+  holds the text it typed and nothing else. If not, it does not press Enter and leaves the text there.
+- /clear is confirmed only when the SAME pid shows a NEW sessionId (tmux) or the job's state
+  file shows a new conversation id (bg). Only then is the resume request typed.
+- A user message after the save, or a session that goes back to work: it does not clear. It
+  re-arms the flag and exits: the next Stop hook decides.
 
-Usage: save-clear-send <tmux|iterm|bg> <target> <session_id> <flag-json> <transcript>
+Usage: save-clear-send <tmux|bg> <target> <session_id> <flag-json> <transcript>
        save-clear-send --check <tmux|iterm> <target> <session_id>   (0 ok, 1 refused, 2 unknown)
-Test knobs: SAVE_CLEAR_STATE_DIR, SAVE_CLEAR_CLAUDE (a fake `claude`), SAVE_CLEAR_DRY_RUN=1.
+Test knobs: SAVE_CLEAR_STATE_DIR, SAVE_CLEAR_CLAUDE (a fake `claude`), SAVE_CLEAR_DRY_RUN=1,
+            SAVE_CLEAR_BG_WAIT (seconds to wait for a --bg job to go idle, default 60).
 """
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import (BIN, CLEAR_FLAG, MARGIN_MS, RESUME_MSG, claude_bin, log as _log, notify, now_ms,  # noqa: E402
-                    short, tmux_bin, user_messages_since, write_json)
+from common import (BIN, MARGIN_MS, RESUME_MSG, claude_bin, clear_key, log as _log, notify, now_ms,  # noqa: E402
+                    short, tmux_bin, user_messages_since, write_clear)
 
 CLAUDE = claude_bin()
 TMUX = tmux_bin() or "tmux"
 DRY = os.environ.get("SAVE_CLEAR_DRY_RUN") == "1"
 MAX_WAIT = int(os.environ.get("SAVE_CLEAR_MAX_WAIT", "1200"))  # 20 min waiting for the session to be free
+BG_WAIT = float(os.environ.get("SAVE_CLEAR_BG_WAIT", "60"))
 
 CHECK = len(sys.argv) > 1 and sys.argv[1] == "--check"
 flag_json, transcript = "{}", ""
@@ -159,7 +164,8 @@ def rearm(why):
         log(f"gave up ({why}): already re-armed 5 times")
         notify(f"save-clear: gave up on the automatic /clear ({why}). Type /clear by hand.")
         return
-    write_json(CLEAR_FLAG, flag)
+    flag["key"] = flag.get("key") or (clear_key(job=target) if mode == "bg" else clear_key(flag.get("session_id") or sid))
+    write_clear(flag)  # this session's own request file only
     log(f"re-armed ({why}); the next end of turn tries again")
 
 
@@ -172,91 +178,142 @@ def new_messages():
 
 
 # ----- bg mode: no terminal of its own; attach in a hidden tmux, type, detach -----
+def job_state():
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".claude", "jobs", target, "state.json"), encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def conversation(st):
+    """The job's current conversation: a /clear starts a new one."""
+    return st.get("resumeSessionId") or st.get("linkScanPath") or ""
+
+
+def bg_free(s):
+    if job_state().get("state") == "working":
+        return False, "busy"
+    p = screen(s)
+    if "esc to interrupt" in p:
+        return False, "busy"
+    d = prompt_text(p)
+    if d is None:
+        return False, "no-prompt"
+    return (False, "draft") if d else (True, "")
+
+
+def bg_ready_for_enter(s, text):
+    if job_state().get("state") == "working":
+        return False, "the job went back to work"
+    p = screen(s)
+    if "esc to interrupt" in p:
+        return False, "busy"
+    d = prompt_block(p)
+    if d is None or squash(d) != squash(text):
+        return False, f"the prompt holds {d!r}, not the typed text"
+    return True, ""
+
+
+def bg_type(s, before):
+    ok, why = False, ""
+    for _ in range(40):  # 2) idle, empty prompt in the client
+        time.sleep(1)
+        ok, why = bg_free(s)
+        if ok or why == "draft":
+            break
+    if not ok:
+        rearm(f"the background prompt was not free ({why}); typed nothing")
+        return 0
+    msgs = new_messages()
+    if msgs:
+        rearm(f"new message after the save ({msgs[-1][:40]!r}); typed nothing")
+        notify("save-clear: a message arrived after the save, so the session was not cleared.")
+        return 0
+    sh([TMUX, "send-keys", "-t", s, "-l", "/clear"])
+    time.sleep(1)
+    ok, why = bg_ready_for_enter(s, "/clear")
+    if not ok:
+        log(f"REFUSED: check before Enter failed ({why}). Enter not sent; '/clear' is still in the prompt")
+        notify("save-clear: did not clear the background session. Type /clear yourself.")
+        return 3
+    msgs = new_messages()  # a message can arrive during the pause between typing and Enter
+    if msgs:
+        sh([TMUX, "send-keys", "-t", s, *["BSpace"] * len("/clear")])
+        rearm(f"new message while /clear was in the prompt ({msgs[-1][:40]!r}); Enter not sent")
+        notify("save-clear: a message arrived after the save, so the session was not cleared.")
+        return 0
+    sh([TMUX, "send-keys", "-t", s, "Enter"])
+    after = ""
+    for _ in range(10):
+        time.sleep(1)
+        after = conversation(job_state())
+        if before and after and after != before:
+            break
+    if not (before and after and after != before):
+        log("/clear sent, but the job's state file shows no new conversation id: not confirmed, "
+            "resume request not typed")
+        notify("save-clear: /clear sent to the background session; the summary comes with your next message.")
+        sh([TMUX, "send-keys", "-t", s, "C-z"])
+        return 0
+    log(f"/clear confirmed (conversation {short(before)} -> {short(after)})")
+    for _ in range(15):
+        ok, why = bg_free(s)
+        if ok or why == "draft":
+            break
+        time.sleep(1)
+    if ok:
+        sh([TMUX, "send-keys", "-t", s, "-l", RESUME_MSG])
+        time.sleep(1)
+        ok, why = bg_ready_for_enter(s, RESUME_MSG)
+        if ok:
+            sh([TMUX, "send-keys", "-t", s, "Enter"])
+            time.sleep(2)
+    if not ok:
+        log(f"resume request not sent ({why}); the summary comes with the next message")
+    sh([TMUX, "send-keys", "-t", s, "C-z"])
+    time.sleep(1)
+    log("sent /clear (confirmed)" + (" + resume request" if ok else "") + "; client closed")
+    return 0
+
+
 def run_bg():
     if not tmux_bin():
         refuse("bg mode needs tmux, which is not installed")
-    job_state = os.path.join(os.path.expanduser("~"), ".claude", "jobs", target, "state.json")
-    st = ""
-    for _ in range(60):  # 1) the job leaves "working" (the turn ended)
-        try:
-            with open(job_state) as f:
-                st = json.load(f).get("state", "")
-        except Exception:
-            st = ""
+    t0, st = time.time(), ""
+    while True:  # 1) the job leaves "working" (the turn ended)
+        st = job_state().get("state", "")
         if st and st != "working":
             break
+        if time.time() - t0 > BG_WAIT:
+            rearm(f"the job stayed {st or 'unknown'} for {int(BG_WAIT)} s; typed nothing")
+            return 0
         time.sleep(1)
-    log(f"job state: {st or '?'}")
+    log(f"job state: {st}")
+    msgs = new_messages()
+    if msgs:
+        rearm(f"new message after the save ({msgs[-1][:40]!r}); typed nothing")
+        notify("save-clear: a message arrived after the save, so the session was not cleared.")
+        return 0
+    before = conversation(job_state())
+    if DRY:
+        log(f"dry-run: would attach {target} and type /clear")
+        return 0
     s = f"save-clear-{target}"
     sh([TMUX, "kill-session", "-t", s])
-    if DRY:
-        log(f"dry-run: would attach {target} and type /clear + resume")
-        return 0
     if subprocess.run([TMUX, "new-session", "-d", "-s", s, "-x", "200", "-y", "50",
-                       f"{CLAUDE} attach {target}"]).returncode != 0:
+                       f"{shlex.quote(CLAUDE)} attach {shlex.quote(target)}"]).returncode != 0:
         log("tmux/attach failed")
         return 1
-    ok = False
-    for _ in range(40):  # 2) idle prompt in the client
-        time.sleep(1)
-        p = sh([TMUX, "capture-pane", "-p", "-t", s])
-        if "❯" in p and "esc to interrupt" not in p:
-            ok = True
-            break
-    if not ok:
-        log("prompt never became idle; aborted")
+    try:
+        return bg_type(s, before)
+    finally:
         sh([TMUX, "kill-session", "-t", s])
-        return 1
-    for keys, pause in ((["/clear", "Enter"], 4), (["-l", RESUME_MSG], 1), (["Enter"], 2), (["C-z"], 2)):
-        sh([TMUX, "send-keys", "-t", s, *keys])
-        time.sleep(pause)
-    sh([TMUX, "kill-session", "-t", s])
-    log("sent /clear + resume; client closed")
-    return 0
-
-
-# ----- iterm mode: AppleScript into the iTerm2 session with this tty (immune to window focus) -----
-ITERM_SCRIPT = """
-on run argv
-  set target to item 1 of argv
-  set resumeMsg to item 2 of argv
-  tell application "iTerm2"
-    repeat with w in windows
-      repeat with t in tabs of w
-        repeat with s in sessions of t
-          if tty of s is target then
-            tell s to write text "/clear"
-            delay 3
-            tell s to write text resumeMsg newline NO
-            delay 1
-            tell s to write text ""
-          end if
-        end repeat
-      end repeat
-    end repeat
-  end tell
-end run
-"""
 
 
 def run_iterm():
-    if not re.match(r"^/dev/ttys\d+$", target):
-        refuse(f"target {target} is not a terminal tty")
-    time.sleep(4)
-    ag, why = target_agent()
-    if ag is None or ag.get("sessionId") != sid:
-        refuse(f"tty {target} does not run session {short(sid)} ({why or 'runs ' + short(ag.get('sessionId'))})")
-    if DRY:
-        log("dry-run: would type /clear + resume through iTerm2")
-        return 0
-    r = subprocess.run(["osascript", "-", target, RESUME_MSG], input=ITERM_SCRIPT, text=True,
-                       capture_output=True, timeout=60)
-    if r.returncode != 0:
-        log(f"osascript failed: {r.stderr.strip()[:200]}")
-        notify("save-clear: the automatic /clear failed in iTerm2. Type /clear by hand.")
-        return 1
-    log("sent /clear + resume through iTerm2")
-    return 0
+    refuse("the iTerm2 mode was removed: the helper cannot check for an empty prompt there")
 
 
 # ----- tmux mode -----
@@ -284,9 +341,9 @@ def keys(*args):
     sh([TMUX, "send-keys", "-t", target, *args])
 
 
-def screen():
+def screen(t=None):
     # -e keeps colors: the empty-prompt hint is dim (ESC[2m); a real draft is not.
-    return sh([TMUX, "capture-pane", "-p", "-e", "-t", target])
+    return sh([TMUX, "capture-pane", "-p", "-e", "-t", t or target])
 
 
 DIM = re.compile(r"\x1b\[2m.*?(\x1b\[(0|22)m|$)")
@@ -299,6 +356,66 @@ def prompt_text(text):
         if "❯" in ln:
             return ANSI.sub("", DIM.sub("", ln.split("❯", 1)[1])).replace(" ", " ").strip().strip("│").strip()
     return None
+
+
+BORDER = re.compile(r"^[\s\u2500-\u257f]*$")  # box-drawing lines around the prompt
+
+
+def clean(line):
+    return ANSI.sub("", DIM.sub("", line)).replace("\u00a0", " ")
+
+
+def prompt_block(text):
+    """Everything after the ❯ prompt, wrapped lines included; None if there is no prompt."""
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if "❯" in lines[i]:
+            parts = [clean(lines[i].split("❯", 1)[1])]
+            for ln in lines[i + 1:]:
+                c = clean(ln)
+                if not c.strip() or BORDER.match(c):
+                    break
+                parts.append(c)
+            return " ".join(p.strip().strip("│").strip() for p in parts).strip()
+    return None
+
+
+def squash(t):
+    return "".join((t or "").split())
+
+
+def ready_for_enter(text):
+    """Right before Enter: same session and pid, idle, and the prompt holds exactly `text`."""
+    ag, why = ours()
+    if ag is None:
+        return False, why or "no Claude in the pane"
+    if ag.get("status") != "idle":
+        return False, "busy"
+    s = screen()
+    if "esc to interrupt" in s:
+        return False, "busy"
+    p = prompt_block(s)
+    if p is None or squash(p) != squash(text):
+        return False, f"the prompt holds {p!r}, not the typed text"
+    return True, ""
+
+
+def press_enter(text):
+    """Enter only after ready_for_enter; otherwise refuse and leave the typed text in the prompt."""
+    if DRY:
+        keys("Enter")
+        return
+    ok, why = ready_for_enter(text)
+    if not ok:
+        refuse(f"check before Enter failed ({why}). Enter not sent; {text[:30]!r} is still in the prompt")
+    if text == "/clear":
+        msgs = new_messages()  # a message can arrive during the pause between typing and Enter
+        if msgs:
+            keys(*["BSpace"] * len(text))  # the prompt holds exactly our text (just checked): erase it
+            rearm(f"new message while /clear was in the prompt ({msgs[-1][:40]!r}); Enter not sent")
+            notify("save-clear: a message arrived after the save, so the session was not cleared.")
+            sys.exit(0)
+    keys("Enter")
 
 
 def free():
@@ -321,9 +438,10 @@ def free():
     return True, ""
 
 
-TRIGGER = ("save-clear (automatic): your message arrived after the save. Add to the snapshot only what came "
-           "after it (section \"## After the save\") and run: python3 \"" + os.path.join(BIN, "save-clear") + "\" rearm. "
-           "The /clear follows.")
+def trigger():
+    return ("save-clear (automatic): your message arrived after the save. Add to the snapshot only what came "
+            "after it (section \"## After the save\") and run: python3 \"" + os.path.join(BIN, "save-clear")
+            + "\" rearm " + EXPECT["sid"] + ". The /clear follows.")
 
 
 def stop_if_new(step):
@@ -334,21 +452,23 @@ def stop_if_new(step):
     rearm(f"{step}: new message after the save ({msgs[-1][:40]!r})")
     ok, _ = free()
     if ok:
-        keys("-l", TRIGGER)
+        text = trigger()
+        keys("-l", text)
         time.sleep(1)
-        keys("Enter")
+        press_enter(text)
         log("asked Claude to save what came after")
     sys.exit(0)
 
 
 def type_line(text):
-    """Types only if the pane still runs the expected session with an empty prompt."""
+    """Types only if the pane still runs the expected session with an empty prompt; Enter only if
+    it still does and the prompt holds exactly `text`."""
     ok, why = free()
     if not ok:
         return False, why
     keys("-l", text)
     time.sleep(1)  # separate Enter: long text becomes a "paste" and swallows the Enter
-    keys("Enter")
+    press_enter(text)  # checks owner, idle and the exact prompt again; refuses and exits if changed
     return True, ""
 
 
@@ -412,8 +532,7 @@ def run_tmux():
             new_sid = cleared_now()
             if new_sid:
                 break
-            ours()
-            keys("Enter")
+            press_enter("/clear")
             time.sleep(3)
             new_sid = cleared_now()
             if new_sid:
@@ -440,9 +559,8 @@ def run_tmux():
         log("resume request not sent: the session was not free within 30 s")
         return 1
     time.sleep(3)
-    if prompt_text(screen()) == RESUME_MSG:  # Enter swallowed by the paste
-        ours()
-        keys("Enter")
+    if squash(prompt_block(screen())) == squash(RESUME_MSG):  # Enter swallowed by the paste
+        press_enter(RESUME_MSG)
     log("sent /clear (confirmed) + resume request")
     notify("save-clear: session saved and cleared.")
     return 0

@@ -2,11 +2,14 @@
 
 Files (all under the state folder: $SAVE_CLEAR_STATE_DIR, else $CLAUDE_PLUGIN_DATA, else ~/.claude/state/save-clear):
   pending_resume.json  who armed a resume, and which snapshot to deliver (one entry or a list)
-  pending_clear.json   the auto-/clear request the Stop hook acts on
+  pending_resume.lock  held while pending_resume.json is read, changed and written back
+  clear/<key>.json     one auto-/clear request per session (key = session id, or job-<id> for --bg)
+  cap/<session>.json   context size when the token-limit hook last asked for a save-clear
   config.json          plugin options, copied here by the SessionStart hook so bin/ commands see them
   save-clear.log       one line per decision
 """
 import calendar
+import contextlib
 import json
 import os
 import re
@@ -15,6 +18,20 @@ import shutil
 import subprocess
 import sys
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
+
+# Hook JSON, transcripts and our output are UTF-8. On Windows the default for pipes is the ANSI code
+# page, where printing a character like an arrow fails and the command prints nothing.
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "bin")
@@ -31,7 +48,7 @@ def _resolve_state():
         if value and value.strip():
             return os.path.expanduser(value.strip())
     try:
-        with open(POINTER) as f:
+        with open(POINTER, encoding="utf-8") as f:
             value = f.read().strip()
         if value and os.path.isdir(value):
             return value
@@ -49,7 +66,7 @@ def save_pointer():
     if not data or os.environ.get("SAVE_CLEAR_STATE_DIR"):
         return
     try:
-        with open(POINTER) as f:
+        with open(POINTER, encoding="utf-8") as f:
             if f.read().strip() == data:
                 return
     except OSError:
@@ -57,7 +74,7 @@ def save_pointer():
     try:
         os.makedirs(data, exist_ok=True)
         os.makedirs(os.path.dirname(POINTER), exist_ok=True)
-        with open(POINTER, "w") as f:
+        with open(POINTER, "w", encoding="utf-8") as f:
             f.write(data + "\n")
     except OSError:
         pass
@@ -66,13 +83,15 @@ def save_pointer():
 CONFIG = os.path.join(STATE, "config.json")
 LOG = os.path.join(STATE, "save-clear.log")
 RESUME_FLAG = os.path.join(STATE, "pending_resume.json")
-CLEAR_FLAG = os.path.join(STATE, "pending_clear.json")
+RESUME_LOCK = os.path.join(STATE, "pending_resume.lock")
+CLEAR_DIR = os.path.join(STATE, "clear")
 
 # Plugin option name -> environment variable name
 OPTIONS = {
     "snapshot_dir": "SAVE_CLEAR_SNAPSHOT_DIR",
     "notify_command": "SAVE_CLEAR_NOTIFY",
     "publish_link": "SAVE_CLEAR_PUBLISH_LINK",
+    "context_cap_tokens": "SAVE_CLEAR_CAP_TOKENS",
 }
 
 RESUME_MSG = ("save-clear: resuming. Start with the LAST topic (where we stopped and what is still open); "
@@ -90,7 +109,7 @@ def ensure_state():
 
 def _saved_config():
     try:
-        with open(CONFIG) as f:
+        with open(CONFIG, encoding="utf-8") as f:
             v = json.load(f)
         return v if isinstance(v, dict) else {}
     except Exception:
@@ -151,7 +170,7 @@ def stamp():
 def log(tag, msg):
     try:
         ensure_state()
-        with open(LOG, "a") as f:
+        with open(LOG, "a", encoding="utf-8") as f:
             f.write(f"{stamp()} [{tag}] {msg}\n")
     except OSError:
         pass
@@ -159,15 +178,67 @@ def log(tag, msg):
 
 def write_json(path, value):
     tmp = f"{path}.tmp-{os.getpid()}"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(value, f)
         f.write("\n")
     os.replace(tmp, path)
 
 
+@contextlib.contextmanager
+def locked(path):
+    """Exclusive lock on <path> for the whole block (other processes wait)."""
+    ensure_state()
+    f = open(path, "a+", encoding="utf-8")
+    try:
+        if fcntl:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        else:
+            while True:
+                try:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+        yield
+    finally:
+        try:
+            if fcntl:
+                fcntl.flock(f, fcntl.LOCK_UN)
+            else:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        f.close()
+
+
+def clear_key(session_id="", job=""):
+    """File name of a session's auto-/clear request: the session id, or job-<id> for a --bg job."""
+    key = f"job-{job}" if job else str(session_id or "")
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", key)[:120]
+
+
+def clear_path(key):
+    return os.path.join(CLEAR_DIR, key + ".json")
+
+
+def write_clear(flag):
+    os.makedirs(CLEAR_DIR, exist_ok=True)
+    write_json(clear_path(flag["key"]), flag)
+
+
+def all_clears():
+    try:
+        names = sorted(n for n in os.listdir(CLEAR_DIR) if n.endswith(".json"))
+    except OSError:
+        return []
+    return [f for f in (read_json(os.path.join(CLEAR_DIR, n)) for n in names) if isinstance(f, dict)]
+
+
 def read_json(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -226,10 +297,21 @@ def tail_lines(path, max_bytes=3 * 1024 * 1024):
 
 
 def user_messages_since(transcript, since_ms):
-    """The user's own messages (typed or queued) in the transcript after since_ms."""
-    out = []
+    """The user's own messages (typed or queued) in the transcript after since_ms.
+
+    Queued messages count from their `queue-operation` enqueue record, even before Claude reads them.
+    A later `remove` with a reason other than absorbed_mid_turn (the user took it back) cancels it."""
+    out, cancelled = [], set()
     if not transcript:
         return out
+    for line in tail_lines(transcript):
+        if '"queue-operation"' in line and '"remove"' in line:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("operation") == "remove" and d.get("reason") not in (None, "absorbed_mid_turn"):
+                cancelled.add(str(d.get("content") or "").strip())
     for line in tail_lines(transcript):
         if '"timestamp"' not in line:
             continue
@@ -246,6 +328,9 @@ def user_messages_since(transcript, since_ms):
         att = d.get("attachment") or {}
         if d.get("type") == "attachment" and att.get("type") == "queued_command":
             txt = att.get("prompt", "")
+        elif d.get("type") == "queue-operation" and d.get("operation") == "enqueue":
+            c = d.get("content")
+            txt = c if isinstance(c, str) and c.strip() not in cancelled else ""
         elif d.get("type") == "user":
             c = (d.get("message") or {}).get("content")
             if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
