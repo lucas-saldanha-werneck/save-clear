@@ -546,5 +546,62 @@ class Relay(Base):
         self.assertIn("## Context full", out)
 
 
+class ContextCap(Base):
+    """Token-limit hook: asks for a save-clear at the end of a turn when the context is too big."""
+    def transcript(self, tokens, sidechain_tokens=None):
+        p = os.path.join(self.proj, "cap.jsonl")
+        rows = [{"type": "assistant", "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": tokens - 10,
+                                                             "cache_creation_input_tokens": 0}}}]
+        if sidechain_tokens is not None:
+            rows.append({"type": "assistant", "isSidechain": True,
+                         "message": {"usage": {"input_tokens": sidechain_tokens}}})
+        with open(p, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        return p
+
+    def cap(self, tokens, sid=SID_A, extra=None, **env):
+        hook = {"session_id": sid, "transcript_path": self.transcript(tokens)}
+        hook.update(extra or {})
+        env.setdefault("CLAUDE_CODE_ENTRYPOINT", "cli")
+        return self.run_py("hooks/context_cap.py", stdin=hook, **env)
+
+    def test_below_default_limit_is_silent(self):
+        self.assertEqual(self.cap(299000).stdout, "")
+
+    def test_above_default_limit_blocks_once(self):
+        out = json.loads(self.cap(310000).stdout)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("310k", out["reason"])
+        self.assertIn("limit 300k", out["reason"])
+        self.assertEqual(self.cap(320000).stdout, "", "no second ask until +50k")
+        self.assertIn('"block"', self.cap(361000).stdout, "asks again after +50k")
+
+    def test_user_can_change_or_turn_off_the_limit(self):
+        self.assertIn("limit 150k", self.cap(160000, SAVE_CLEAR_CAP_TOKENS="150000").stdout)
+        self.assertIn("limit 200k", self.cap(250000, sid=SID_B, CLAUDE_PLUGIN_OPTION_CONTEXT_CAP_TOKENS="200000").stdout)
+        self.assertEqual(self.cap(900000, sid=SID_NEW, SAVE_CLEAR_CAP_TOKENS="0").stdout, "")
+
+    def test_skips_headless_active_armed_and_relay(self):
+        self.assertEqual(self.cap(400000, CLAUDE_CODE_ENTRYPOINT="sdk-cli").stdout, "")
+        self.assertEqual(self.cap(400000, extra={"stop_hook_active": True}).stdout, "")
+        os.makedirs(self.flag_path("clear"), exist_ok=True)
+        with open(self.flag_path(f"clear/{SID_A}.json"), "w") as f:
+            json.dump({"session_id": SID_A}, f)
+        self.assertEqual(self.cap(400000).stdout, "", "save-clear already armed")
+        with open(self.flag_path("relay.json"), "w") as f:
+            json.dump({"local_id": "relay-1"}, f)
+        self.assertEqual(self.cap(400000, sid=SID_B, CLAUDE_CODE_HOST_SESSION_ID="relay-1").stdout, "")
+
+    def test_ignores_subagent_usage_and_bad_input(self):
+        p = self.transcript(100000, sidechain_tokens=900000)
+        r = self.run_py("hooks/context_cap.py", stdin={"session_id": SID_A, "transcript_path": p},
+                        CLAUDE_CODE_ENTRYPOINT="cli")
+        self.assertEqual(r.stdout, "")
+        r = self.run_py("hooks/context_cap.py", stdin=None, CLAUDE_CODE_ENTRYPOINT="cli")
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+        self.assertIn("limit 300k", self.cap(400000, SAVE_CLEAR_CAP_TOKENS="abc").stdout, "bad value = default")
+
+
 if __name__ == "__main__":
     unittest.main()

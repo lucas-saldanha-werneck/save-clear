@@ -5,6 +5,10 @@ next steps to a summary file, checks that the file is on disk, clears its own co
 session starts from that summary. You keep what matters from a long session without doing the save
 and the `/clear` by hand.
 
+You do not even have to ask: when the context passes 300k tokens (30% of a 1M window), Claude runs
+it by itself at the end of the turn. Change the number with `context_cap_tokens`, or set it to `0`
+to turn it off.
+
 ## What Claude sees
 
 After the `/clear`, the plugin's SessionStart hook adds the summary to the new session's context.
@@ -65,6 +69,7 @@ Set them with `/plugin configure save-clear@save-clear`, or with environment var
 | `snapshot_dir` | `SAVE_CLEAR_SNAPSHOT_DIR` | `~/.claude/snapshots` | Where summaries and the compaction backups go |
 | `notify_command` | `SAVE_CLEAR_NOTIFY` | empty (off) | A program called with one line of text when the automatic `/clear` fails, is refused or stops halfway, and when it succeeds in tmux |
 | `publish_link` | `SAVE_CLEAR_PUBLISH_LINK` | `off` | `on`: the skill publishes the summary as a private claude.ai page (when the Artifact tool is available), and the next session shows that link first |
+| `context_cap_tokens` | `SAVE_CLEAR_CAP_TOKENS` | `300000` | When the context passes this many tokens, Claude runs save-clear at the end of the turn. `0` = off. With a 200k window, set it lower (e.g. `150000`), or compaction comes first |
 | (none) | `SAVE_CLEAR_STATE_DIR` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/state/save-clear` | Flags, relay inbox and the logs `save-clear.log` and `relay.log` |
 
 ## Optional requirements
@@ -116,6 +121,12 @@ If you send a message after the save, the Stop hook does not clear. It asks Clau
 it to the summary under `## After the save`, and run `save-clear rearm <session id>`. This repeats up
 to 3 times.
 In the desktop app, a PreToolUse hook holds the first `clear_session` call the same way.
+
+A second Stop hook watches the context size. When Claude ends a turn and the last reply used more
+than `context_cap_tokens` (input plus cache tokens, subagents not counted), it blocks the stop once
+and asks Claude to run save-clear in "save and clear" mode. It never acts in the middle of a task.
+It asks again only after the context grows another 50k tokens. It skips `claude -p` and SDK
+sessions, a session that already armed its `/clear`, and the desktop app relay session.
 
 Two backups run without the skill. Before any compaction, the full transcript is saved gzipped with
 an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker. After it, the summary Claude Code wrote is kept as
@@ -170,7 +181,7 @@ state ended up in `~/.claude/state/save-clear`, delete that folder yourself, plu
 
 ## Limits and what was not tested
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 38 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 43 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
   (`bash tests/run.sh`, 29 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. Install and uninstall were run with the

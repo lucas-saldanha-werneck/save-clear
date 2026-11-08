@@ -10,7 +10,8 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/stop.py"], "timeout": 15 }
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/stop.py"], "timeout": 15 },
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/context_cap.py"], "timeout": 10 }
         ]
       }
     ],
