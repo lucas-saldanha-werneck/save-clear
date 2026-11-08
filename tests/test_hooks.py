@@ -410,6 +410,17 @@ class BgHelper(Base):
         r, keys = self.run_bg(state="working")
         self.assertNotIn("/clear", keys)
 
+    def test_busy_job_marks_the_rearmed_flag(self):
+        # The flag the helper writes back says the session stayed busy, for kill_background_tasks.
+        self.run_bg(state="working")
+        with open(self.flag_path(f"clear/job-{self.JOB}.json")) as f:
+            self.assertTrue(json.load(f).get("busy_rearm"))
+
+    def test_message_rearm_is_not_marked_busy(self):
+        self.run_bg(messages=["wait, one more thing"])
+        with open(self.flag_path(f"clear/job-{self.JOB}.json")) as f:
+            self.assertNotIn("busy_rearm", json.load(f))
+
     def test_message_after_the_save_stops_the_clear(self):
         r, keys = self.run_bg(messages=["wait, one more thing"])
         self.assertNotIn("/clear", keys)
@@ -1300,6 +1311,139 @@ class UserConfig(Base):
 
 
 EXAMPLE = os.path.join(ROOT, "config.example.json")
+class KillBackgroundTasks(Base):
+    """kill_background_tasks: off (default) changes nothing; on asks Claude to stop this session's tasks."""
+    LINE = "kill_background_tasks: on"
+
+    def setUp(self):
+        super().setUp()
+        home = os.path.join(self.t, "home")  # nothing here may reach the real home folder
+        os.makedirs(home)
+        self.env.update(HOME=home, USERPROFILE=home)
+
+    def write_cfg(self, value):
+        with open(self.env["SAVE_CLEAR_CONFIG"], "w") as f:
+            json.dump({"kill_background_tasks": value}, f)
+
+    def write_flag(self, **extra):
+        os.makedirs(self.flag_path("clear"), exist_ok=True)
+        f = {"session_id": SID_A, "mode": "manual-test", "target": "", "key": SID_A, "ts": int(time.time() * 1000)}
+        f.update(extra)
+        with open(self.flag_path(f"clear/{SID_A}.json"), "w") as fh:
+            json.dump(f, fh)
+
+    def stop(self, **env):
+        return self.run_py("hooks/stop.py", stdin={"session_id": SID_A}, **env)
+
+    def test_dir_prints_nothing_new_when_absent_null_or_off(self):
+        base = self.run_py("bin/save-clear", ["dir"])
+        self.assertEqual(base.returncode, 0, base.stderr)
+        self.assertNotIn("kill_background_tasks", base.stdout)
+        for value in (None, "", "off", False):
+            self.write_cfg(value)
+            r = self.run_py("bin/save-clear", ["dir"])
+            self.assertEqual((r.returncode, r.stdout), (0, base.stdout), value)
+
+    def test_dir_prints_the_instruction_when_on(self):
+        for env, cfg in (({"SAVE_CLEAR_KILL_BACKGROUND_TASKS": "on"}, None),
+                         ({"CLAUDE_PLUGIN_OPTION_KILL_BACKGROUND_TASKS": "true"}, None), ({}, "on"), ({}, True)):
+            if cfg is not None:
+                self.write_cfg(cfg)
+            r = self.run_py("bin/save-clear", ["dir"], **env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(self.LINE, r.stdout, (env, cfg))
+            self.assertIn("TaskStop", r.stdout)
+            self.assertIn("## Stopped background tasks", r.stdout)
+            self.assertIn("Never stop anything this session did not start", r.stdout)
+
+    def test_bad_values_are_off_and_never_crash(self):
+        for value in ("maybe", 5, ["on"], {"x": 1}):
+            self.write_cfg(value)
+            r = self.run_py("bin/save-clear", ["dir"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn(self.LINE, r.stdout, value)
+            self.write_flag(busy_rearm=True)
+            r = self.stop()
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn('"decision": "block"', r.stdout, value)
+        with open(self.env["SAVE_CLEAR_CONFIG"], "w") as f:
+            f.write("{not json")
+        self.assertEqual(self.run_py("bin/save-clear", ["dir"]).returncode, 0)
+
+    def test_app_mode_reminder_only_when_on(self):
+        env = dict(CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="claude-desktop")
+        self.assertNotIn(self.LINE, self.run_py("bin/save-clear", ["arm-clear"], **env).stdout)
+        r = self.run_py("bin/save-clear", ["arm-clear"], SAVE_CLEAR_KILL_BACKGROUND_TASKS="on", **env)
+        self.assertIn("mode=app", r.stdout)
+        self.assertIn(self.LINE, r.stdout)
+        self.assertIn("before calling clear_session", r.stdout)
+
+    def test_manual_mode_has_no_reminder(self):
+        # The user types /clear; nothing waits for the session to be idle, so nothing to stop.
+        r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli",
+                        TERM_PROGRAM="Apple_Terminal", CLAUDE_PID=os.getpid(), SAVE_CLEAR_KILL_BACKGROUND_TASKS="on")
+        self.assertIn("mode=manual", r.stdout)
+        self.assertNotIn(self.LINE, r.stdout)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_armed_terminal_clear_reminds_before_ending_the_turn(self):
+        env = dict(CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_JOB_DIR=os.path.join(self.t, "jobs", "j1"),
+                   CLAUDE_CODE_ENTRYPOINT="cli")
+        off = self.run_py("bin/save-clear", ["arm-clear"], **env)
+        self.assertIn("mode=bg", off.stdout)
+        self.assertNotIn(self.LINE, off.stdout)
+        on = self.run_py("bin/save-clear", ["arm-clear"], SAVE_CLEAR_KILL_BACKGROUND_TASKS="on", **env).stdout
+        self.assertIn(self.LINE, on)
+        self.assertLess(on.index(self.LINE), on.index("end the turn now"))
+
+    def test_stop_hook_unchanged_when_off(self):
+        self.write_flag(busy_rearm=True)
+        r = self.stop()
+        self.assertNotIn('"decision": "block"', r.stdout)
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "consumed as today")
+
+    def test_stop_hook_asks_once_after_a_busy_rearm(self):
+        self.write_flag(busy_rearm=True)
+        r = self.stop(SAVE_CLEAR_KILL_BACKGROUND_TASKS="on")
+        out = json.loads(r.stdout)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("TaskStop", out["reason"])
+        self.assertIn("## Stopped background tasks", out["reason"])
+        with open(self.flag_path(f"clear/{SID_A}.json")) as f:
+            self.assertTrue(json.load(f)["bg_asked"], "flag kept, marked as asked")
+        r = self.stop(SAVE_CLEAR_KILL_BACKGROUND_TASKS="on")
+        self.assertNotIn('"decision": "block"', r.stdout, "asked only once")
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+
+    def test_stop_hook_does_not_ask_without_a_busy_rearm(self):
+        self.write_flag()
+        r = self.stop(SAVE_CLEAR_KILL_BACKGROUND_TASKS="on")
+        self.assertNotIn('"decision": "block"', r.stdout)
+
+    def test_user_message_still_comes_first(self):
+        self.write_flag(busy_rearm=True)
+        tp = os.path.join(self.proj, "t.jsonl")
+        with open(tp, "w") as f:
+            f.write(json.dumps({"type": "user", "timestamp": iso(1),
+                                "message": {"role": "user", "content": "one more thing"}}) + "\n")
+        r = self.run_py("hooks/stop.py", stdin={"session_id": SID_A, "transcript_path": tp},
+                        SAVE_CLEAR_KILL_BACKGROUND_TASKS="on")
+        reason = json.loads(r.stdout)["reason"]
+        self.assertIn("one more thing", reason)
+        self.assertNotIn("TaskStop", reason)
+
+    def test_resume_names_the_stopped_tasks_only_if_listed(self):
+        plain = self.snapshot()
+        self.arm(plain)
+        ctx = json.loads(self.start(CLAUDE_PID=4242).stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("stopped background tasks", ctx)
+        snap = self.snapshot("# Session\n## Last topic\nx\n## Stopped background tasks\n- b1x2: tail -f app.log (restart)\n")
+        self.arm(snap)
+        ctx = json.loads(self.start(CLAUDE_PID=4242).stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("stopped background tasks before the /clear", ctx)
+        self.assertIn("tail -f app.log", ctx)
+
+
 SETTINGS_DUMP = """
 import json, sys
 sys.path.insert(0, {lib!r})

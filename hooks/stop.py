@@ -17,8 +17,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (BIN, CLEAR_DIR, MARGIN_MS, clear_key, clear_path, log, notify, now_ms,  # noqa: E402
-                    read_hook_input, read_json, user_messages_since)
+from common import (BIN, CLEAR_DIR, MARGIN_MS, clear_key, clear_path, kill_background_tasks, log,  # noqa: E402
+                    notify, now_ms, read_hook_input, read_json, stop_tasks_instruction, user_messages_since,
+                    write_json)
 
 MAX_DELTAS = 3
 MAX_AGE_MS = 15 * 60 * 1000
@@ -115,6 +116,29 @@ def main():
                        "after: the message, your answer, what changed and any open question. Do not rewrite "
                        f"the rest. 3) Run `{rearm}` and end the turn with one short line. "
                        "The /clear follows by itself."),
+        }))
+        return
+
+    if flag.get("busy_rearm") and not flag.get("bg_asked") and kill_background_tasks():
+        # The helper found the session busy and re-armed. A leftover background task can keep it busy
+        # forever; only Claude can stop its own tasks, so ask once, then let the next Stop go ahead.
+        flag["bg_asked"] = True
+        try:
+            write_json(FLAG["path"], flag)
+            asked = True
+        except OSError as e:  # cannot remember that we asked: do not risk asking every turn
+            log("stop", f"could not mark the background-task request, clearing without it: {e!r}")
+            asked = False
+    else:
+        asked = False
+    if asked:
+        snap = my_snapshot(hook) or "(the one you wrote)"
+        log("stop", "asked Claude to stop leftover background tasks before the /clear")
+        print(json.dumps({
+            "decision": "block",
+            "reason": ("save-clear: the automatic /clear waited, but the session stayed busy. "
+                       + stop_tasks_instruction("Now,").replace("to the snapshot", f"to the snapshot {snap}", 1)
+                       + " End the turn with one short line; the /clear follows."),
         }))
         return
 

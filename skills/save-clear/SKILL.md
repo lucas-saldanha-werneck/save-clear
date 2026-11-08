@@ -34,7 +34,12 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
 3. **Write the snapshot.** Run `save-clear dir`; it prints the snapshot folder (first line) and
    whether `publish_link` is on. If it also prints `language: <L>`, write the snapshot (headings
    included) and your replies in <L>. If it prints an `extra steps` block, those are the user's own
-   steps for this ritual: follow them, at the point they name (no point named = before step 6). Write `<folder>/SESSION-SUMMARY-<YYYYMMDD-HHMMSS>-<short-slug>.md`:
+   steps for this ritual: follow them, at the point they name (no point named = before step 6). If it
+   prints a line starting with `kill_background_tasks: on` and this is save-and-clear mode, do what that
+   line says now: stop the background tasks THIS session started that are still running (TaskStop with
+   each task id) and list them under `## Stopped background tasks` in the snapshot. Never stop anything
+   this session did not start. That option off (no such line) = leave background tasks alone.
+   Write `<folder>/SESSION-SUMMARY-<YYYYMMDD-HHMMSS>-<short-slug>.md`:
 
    ```markdown
    ---
@@ -52,6 +57,7 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    ## Next steps (in order)
    ## Open items / risks
    ## Useful paths, commands and IDs
+   ## Stopped background tasks (ONLY when kill_background_tasks is on: one line per task - id, what it did, restart needed? - or "none")
    ```
 
    The frontmatter makes a **chain of snapshots**: each points to the previous one, so a multi-session
@@ -96,7 +102,9 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    save-clear arm-clear
    ```
 
-   It prints `save-clear: mode=<mode> ...`. What to do per mode:
+   It prints `save-clear: mode=<mode> ...`. If it also prints a `kill_background_tasks: on` line and a
+   background task of this session is still running, stop it now (before ending the turn or calling
+   `clear_session`) and add it to the snapshot section. What to do per mode:
    - **`tmux` or `bg`**: armed. End the turn right away with the short reply from step 7. Run
      nothing else after it. The Stop hook starts a helper that types `/clear` and then the resume
      request. It types only into an idle session with an empty prompt, checks again right before
@@ -122,6 +130,10 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
      2. Write the step 7 reply, then call `clear_session` with `session_id: "self"` as the very last
         action. The app clears only this session when the turn ends. If it refuses, change the reply to
         "You can /clear now."
+
+   **Busy session (kill_background_tasks on).** If the helper found the session still busy, the Stop
+   hook blocks once and asks you to stop this session's leftover background tasks and list them in the
+   snapshot. Do only that, end the turn with one short line, and the /clear follows.
 
    **A user message during the save.** If one arrives while you save, answer it and put it in the
    snapshot before step 8. If it arrives after step 8, the Stop hook does not clear: it blocks and asks

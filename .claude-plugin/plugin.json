@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "End-of-session ritual: Claude saves memory and a verified session summary, clears the context by itself, and the next session starts from the summary.",
   "author": {
     "name": "Lucas Saldanha Werneck",
@@ -96,6 +96,16 @@
       "title": "Command run on resume (optional)",
       "description": "Runs after the /clear, when the summary is delivered, with SAVE_CLEAR_SNAPSHOT set. What it prints (exit 0) is added to the new session's context.",
       "default": ""
+    },
+    "kill_background_tasks": {
+      "type": "string",
+      "title": "Stop leftover background tasks before the automatic /clear",
+      "description": "on: before the automatic /clear, Claude stops the background tasks THIS session left running (run_in_background commands, Monitor watches) with TaskStop and lists them in the summary. A forgotten task can keep the session busy so the /clear never fires. off = leave them running (default).",
+      "options": [
+        "off",
+        "on"
+      ],
+      "default": "off"
     }
   }
 }

@@ -8,7 +8,8 @@ own entry. A global flag would hand the summary to whichever session starts firs
 import os
 import re
 
-from common import RESUME_FLAG, RESUME_LOCK, ensure_state, language, locked, log, now_ms, read_json, write_json
+from common import (RESUME_FLAG, RESUME_LOCK, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
+                    read_json, write_json)
 
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
 
@@ -182,6 +183,9 @@ def resume_text(snapshot_path, extra=""):
         lines += [f"Write your replies in {lang}.", ""]
     lines += ["ORDER: write the summary as a TEXT message before asking any question. A question first "
               "ends the turn and the user never sees the summary.", ""]
+    if re.search(r"^" + re.escape(STOPPED_SECTION) + r"\s*$", summary, re.M):
+        lines += [f'The previous session stopped background tasks before the /clear (section "{STOPPED_SECTION[3:]}" '
+                  "below). Name them in your summary, and say which ones need to be started again.", ""]
     if extra:
         lines += ["## From your on_resume_command (do this first)", "", extra, ""]
     lines += [summary, "", "---",
