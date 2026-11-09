@@ -9,7 +9,7 @@
     {
       "name": "save-clear",
       "source": "./",
-      "description": "End-of-session ritual: Claude saves memory and a verified session summary, clears the context by itself, and the next session starts from the summary."
+      "description": "Saves decisions and next steps, clears the context, and the next session starts from them."
     }
   ]
 }
