@@ -116,6 +116,7 @@ it, and an existing file is never overwritten, so edit it freely.
 | `pre_clear_command` | `SAVE_CLEAR_PRE_CLEAR` | empty | Runs right before the automatic `/clear` (tmux, `--bg`) or before `clear_session` goes through (desktop app). Output ignored; it never stops the clear |
 | `on_resume_command` | `SAVE_CLEAR_ON_RESUME` | empty | Runs after the `/clear`, when the summary is delivered (5 s limit). What it prints (exit 0) is added to the new session's context, before the summary |
 | `kill_background_tasks` | `SAVE_CLEAR_KILL_BACKGROUND_TASKS` | `off` | `on`: before the automatic `/clear`, Claude stops the background tasks this session left running (Bash `run_in_background` jobs, Monitor watches) and lists them in the summary, and the next session names them. See [Leftover background tasks](#leftover-background-tasks) |
+| `notify_success` | `SAVE_CLEAR_NOTIFY_SUCCESS` | `on` | `off`: `notify_command` runs only when the automatic `/clear` fails, is refused or stops halfway, not when it works |
 | (none) | `SAVE_CLEAR_LAUNCHD_PREFIX` | `com.claude-tools` | Idle trigger only: prefix of the launchd job label (`<prefix>.save-clear-idle`) |
 | (none) | `SAVE_CLEAR_STATE_DIR` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/state/save-clear` | Flags, relay inbox and the logs `save-clear.log` and `relay.log` |
 

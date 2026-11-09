@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "End-of-session ritual: Claude saves memory and a verified session summary, clears the context by itself, and the next session starts from the summary.",
   "author": {
     "name": "Lucas Saldanha Werneck",
@@ -106,6 +106,16 @@
         "on"
       ],
       "default": "off"
+    },
+    "notify_success": {
+      "type": "string",
+      "title": "Notify when the clear works",
+      "description": "off: the notify command runs only when the automatic /clear fails, is refused or stops halfway. on = also when it works (default).",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
     }
   }
 }

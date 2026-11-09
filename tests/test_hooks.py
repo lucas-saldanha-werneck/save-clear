@@ -1330,6 +1330,33 @@ class UserConfig(Base):
         self.assertEqual(self.hook_calls(), [])
 
 
+class NotifySuccess(Base):
+    """notify_success: on (default) sends success and failure notices; off sends only failures."""
+
+    def notices(self, value):
+        out = os.path.join(self.t, "notices.txt")
+        if os.path.exists(out):
+            os.remove(out)
+        script = os.path.join(self.t, "notify.py")
+        with open(script, "w") as f:
+            f.write(f"import sys\nopen({out!r}, 'a').write(sys.argv[1] + '\\n')\n")
+        with open(self.env["SAVE_CLEAR_CONFIG"], "w") as f:
+            json.dump({"notify_command": f"{PY} {script}", "notify_success": value}, f)
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); from common import notify; "
+                "notify('ok', success=True); notify('failed')")
+        e = dict(self.env)
+        subprocess.run([PY, "-c", code, os.path.join(ROOT, "lib")], env=e, cwd=self.proj, timeout=60, check=True)
+        return open(out).read().split() if os.path.exists(out) else []
+
+    def test_default_sends_both(self):
+        for value in (None, "", "on", "typo"):
+            self.assertEqual(self.notices(value), ["ok", "failed"], value)
+
+    def test_off_sends_only_failures(self):
+        for value in ("off", "false", "no", "0", "OFF"):
+            self.assertEqual(self.notices(value), ["failed"], value)
+
+
 class KillBackgroundTasks(Base):
     """kill_background_tasks: off (default) changes nothing; on asks Claude to stop this session's tasks."""
     LINE = "kill_background_tasks: on"

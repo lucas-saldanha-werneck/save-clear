@@ -122,6 +122,7 @@ OPTIONS = {
     "pre_clear_command": "SAVE_CLEAR_PRE_CLEAR",
     "on_resume_command": "SAVE_CLEAR_ON_RESUME",
     "kill_background_tasks": "SAVE_CLEAR_KILL_BACKGROUND_TASKS",
+    "notify_success": "SAVE_CLEAR_NOTIFY_SUCCESS",
 }
 
 # Your own settings, outside the plugin folder: they survive plugin updates and reinstalls.
@@ -425,10 +426,20 @@ def short(s):
     return str(s or "?")[:8]
 
 
-def notify(msg):
-    """Optional: run the user's notify command with one line of text. Never fails."""
+def notify_success():
+    """The `notify_success` option: off = notify only when something goes wrong, not when the clear
+    works. Anything but off/false/no/0 (empty, null, a typo) = on, the old behavior."""
+    return setting("notify_success").lower() not in ("0", "off", "false", "no")
+
+
+def notify(msg, success=False):
+    """Optional: run the user's notify command with one line of text. Never fails.
+    success=True marks a "it worked" message, skipped when notify_success is off."""
     cmd = setting("notify_command")
     if not cmd:
+        return
+    if success and not notify_success():
+        log("notify", f"not sent (notify_success off): {msg}")
         return
     try:
         subprocess.run(split_command(cmd) + [msg], timeout=20, capture_output=True)
