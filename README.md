@@ -58,8 +58,8 @@ recap.
 ## Install
 
 ```
-/plugin marketplace add lucas-saldanha-werneck/save-clear
-/plugin install save-clear@save-clear
+/plugin marketplace add lucas-saldanha-werneck/claude-plugins
+/plugin install save-clear@lucas-plugins
 ```
 
 Restart the session so the hooks load. Then say "save and clear" (also "save-clear" or
@@ -72,7 +72,7 @@ On Windows, save and resume work, but the automatic `/clear` does not (see below
 
 ## Settings
 
-Set them with `/plugin configure save-clear@save-clear` (or the `/config` panel), with environment
+Set them with `/plugin configure save-clear@lucas-plugins` (or the `/config` panel), with environment
 variables, or in your own file `~/.config/save-clear/config.json` (`$XDG_CONFIG_HOME/save-clear/` if
 set; another path with `SAVE_CLEAR_CONFIG`). Same keys as the option names:
 
@@ -90,7 +90,7 @@ update replaces only the plugin's code. Precedence: plugin option, then environm
 the config file. Keep your personal behavior in small scripts next to that file instead of editing
 the plugin.
 
-### Your settings
+### Config file
 
 Your file is `~/.config/save-clear/config.json` (or the `$XDG_CONFIG_HOME` / `SAVE_CLEAR_CONFIG`
 path above; on Windows `~` is `%USERPROFILE%`). You don't have to create it: the plugin writes it
@@ -329,7 +329,7 @@ request (`SAVE_CLEAR_RELAY_GRACE`).
 ## Uninstall
 
 ```
-/plugin uninstall save-clear@save-clear
+/plugin uninstall save-clear@lucas-plugins
 ```
 
 Your summaries stay in the snapshot folder. Claude Code deletes the plugin's data folder on
@@ -338,7 +338,7 @@ state ended up in `~/.claude/state/save-clear`, delete that folder yourself, plu
 `~/.claude/state/save-clear.path`. Archive the relay session if you made one. If you scheduled the
 idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron line).
 
-## Limits and what was not tested
+## Limits
 
 - Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 121 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
@@ -363,7 +363,7 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
 - The tmux helper reads the screen to see an empty prompt. If colors are off in tmux, it may treat
   the dim placeholder text as a draft and not type.
 
-## Test
+## Tests
 
 ```
 python3 tests/test_hooks.py -v
