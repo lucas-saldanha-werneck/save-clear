@@ -49,8 +49,23 @@ DEFAULT_STATE = os.path.join(HOME, ".claude", "state", "save-clear")
 POINTER = os.path.expanduser(os.environ.get("SAVE_CLEAR_POINTER") or os.path.join(HOME, ".claude", "state", "save-clear.path"))
 
 
+def _own_plugin_data():
+    """$CLAUDE_PLUGIN_DATA only when it is ours. Claude Code sets it with CLAUDE_PLUGIN_ROOT for our hooks.
+    Another plugin's SessionStart hook can export its own CLAUDE_PLUGIN_DATA into the session
+    (CLAUDE_ENV_FILE), and then every Bash command carries a folder that belongs to someone else."""
+    data = (os.environ.get("CLAUDE_PLUGIN_DATA") or "").strip()
+    if not data:
+        return ""
+    root = (os.environ.get("CLAUDE_PLUGIN_ROOT") or "").strip()
+    if root and os.path.realpath(os.path.expanduser(root)) == os.path.realpath(ROOT):
+        return data
+    if os.path.basename(os.path.normpath(os.path.expanduser(data))).startswith("save-clear"):
+        return data  # <plugin>-<marketplace>, e.g. save-clear-lucas-plugins
+    return ""
+
+
 def _resolve_state():
-    for value in (os.environ.get("SAVE_CLEAR_STATE_DIR"), os.environ.get("CLAUDE_PLUGIN_DATA")):
+    for value in (os.environ.get("SAVE_CLEAR_STATE_DIR"), _own_plugin_data()):
         if value and value.strip():
             return os.path.expanduser(value.strip())
     try:
@@ -68,7 +83,7 @@ STATE = _resolve_state()
 
 def save_pointer():
     """SessionStart: remember $CLAUDE_PLUGIN_DATA for callers that do not have it."""
-    data = (os.environ.get("CLAUDE_PLUGIN_DATA") or "").strip()
+    data = _own_plugin_data()
     if not data or os.environ.get("SAVE_CLEAR_STATE_DIR"):
         return
     try:

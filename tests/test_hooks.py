@@ -529,9 +529,29 @@ class StateDir(Base):
     def test_plugin_data_reaches_bash_through_pointer(self):
         data = os.path.join(os.path.dirname(self.state), "plugin-data")
         self.env.pop("SAVE_CLEAR_STATE_DIR")
-        self.start(CLAUDE_PLUGIN_DATA=data)                      # hook env has it
+        self.start(CLAUDE_PLUGIN_DATA=data, CLAUDE_PLUGIN_ROOT=ROOT)  # hook env has it
         self.arm(self.snapshot())                                # Bash env does not
         self.assertTrue(os.path.exists(os.path.join(data, "pending_resume.json")))
+
+    def test_other_plugins_data_folder_in_bash_env_is_ignored(self):
+        # Another plugin's SessionStart hook can export its own CLAUDE_PLUGIN_DATA into the session
+        # (CLAUDE_ENV_FILE), so every Bash command carries a folder that is not ours.
+        data = os.path.join(os.path.dirname(self.state), "plugin-data")
+        other = os.path.join(os.path.dirname(self.state), "codex-openai-codex")
+        self.env.pop("SAVE_CLEAR_STATE_DIR")
+        self.start(CLAUDE_PLUGIN_DATA=data, CLAUDE_PLUGIN_ROOT=ROOT)
+        self.arm(self.snapshot(), CLAUDE_PLUGIN_DATA=other)
+        self.assertTrue(os.path.exists(os.path.join(data, "pending_resume.json")))
+        self.assertFalse(os.path.exists(os.path.join(other, "pending_resume.json")))
+
+    def test_hook_with_another_plugins_data_does_not_move_the_pointer(self):
+        data = os.path.join(os.path.dirname(self.state), "plugin-data")
+        other = os.path.join(os.path.dirname(self.state), "codex-openai-codex")
+        self.env.pop("SAVE_CLEAR_STATE_DIR")
+        self.start(CLAUDE_PLUGIN_DATA=data, CLAUDE_PLUGIN_ROOT=ROOT)
+        self.start(CLAUDE_PLUGIN_DATA=other)                     # no CLAUDE_PLUGIN_ROOT of ours
+        with open(self.env["SAVE_CLEAR_POINTER"], encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), data)
 
 
 APP = "local_11111111-1111-1111-1111-111111111111"
