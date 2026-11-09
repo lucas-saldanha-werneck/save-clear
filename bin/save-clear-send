@@ -248,7 +248,7 @@ def bg_type(s, before):
     if not (before and after and after != before):
         log("/clear sent, but the job's state file shows no new conversation id: not confirmed, "
             "resume request not typed")
-        notify("save-clear: /clear sent to the background session; the summary comes with your next message.")
+        notify("save-clear: /clear sent to the background session; the summary comes with your next message.", success=True)
         sh([TMUX, "send-keys", "-t", s, "C-z"])
         return 0
     log(f"/clear confirmed (conversation {short(before)} -> {short(after)})")
@@ -518,7 +518,7 @@ def run_tmux():
     if squash(prompt_block(screen())) == squash(RESUME_MSG):  # Enter swallowed by the paste
         press_enter(RESUME_MSG)
     log("sent /clear (confirmed) + resume request")
-    notify("save-clear: session saved and cleared.")
+    notify("save-clear: session saved and cleared.", success=True)
     return 0
 
 

@@ -13,7 +13,8 @@
     "on_save_command": "Runs when the skill arms the resume (SAVE_CLEAR_SNAPSHOT set); what it prints is appended to the snapshot. Empty = none",
     "pre_clear_command": "Runs just before the automatic /clear or clear_session; never stops the clear. Empty = none",
     "on_resume_command": "Runs after the /clear when the summary is delivered; what it prints (exit 0) goes into the new session. Empty = none",
-    "kill_background_tasks": "on: before the automatic /clear, Claude stops the background tasks this session left running (TaskStop) and lists them in the summary; never anything outside this session. Default: off"
+    "kill_background_tasks": "on: before the automatic /clear, Claude stops the background tasks this session left running (TaskStop) and lists them in the summary; never anything outside this session. Default: off",
+    "notify_success": "off: call notify_command only when the automatic /clear fails, is refused or stops halfway, not when it works. Default: on"
   },
   "snapshot_dir": null,
   "notify_command": null,
@@ -27,5 +28,6 @@
   "on_save_command": null,
   "pre_clear_command": null,
   "on_resume_command": null,
-  "kill_background_tasks": null
+  "kill_background_tasks": null,
+  "notify_success": null
 }
