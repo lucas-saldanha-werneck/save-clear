@@ -7,7 +7,9 @@ long-lived, cheap app session that serves every session: it listens on an inbox 
 the target's clear, and sends the resume prompt with send_message. The cleared session restarts on
 its own, and nothing is ever typed into a text box.
 
-  save-clear-relay setup [local_<id>]   run IN the relay session: record it (default: its own id)
+  save-clear-relay ensure               run in an app session: make sure a usable relay exists (creates one
+                                        when none is configured or the configured one is archived)
+  save-clear-relay setup [local_<id>]   record an existing session as the relay (default: the caller's own id)
   save-clear-relay rules                the rules the relay session follows (paths filled in)
   save-clear-relay waker-rules          the rules the waker session follows (paths filled in)
   save-clear-relay status               relay id, listening or not, queued, unacknowledged and failed requests
@@ -23,19 +25,30 @@ Exit codes of `job` and `request`:
   0  queued, the relay is listening
   2  queued, but the relay is NOT listening: wake it with send_message (text printed on stderr)
   3  the relay is turned off on purpose (OFF file): nothing queued
-  4  `request` only: no relay configured (fallback: the resume arrives with the user's next message)
+  4  `request` only: no usable relay (none configured, or archived in the app)
   1  bad arguments
+
+Exit codes of `ensure`:
+  0  a relay exists (created now, or already there): do the DO lines it prints, then `request`
+  3  the relay is off (setting `relay: off`, or the OFF file): nothing created
+  5  not a desktop app session: terminal sessions never get a relay
+  6  could not create it (reason printed); retried after a cool-down
 """
 import argparse
+import contextlib
 import glob
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
+import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import ROOT, resume_msg, STATE, ensure_state, read_json, write_json  # noqa: E402
+from common import (ROOT, claude_bin, resume_msg, setting, split_command, STATE, ensure_state,  # noqa: E402
+                    read_json, write_json)
 
 try:
     import fcntl
@@ -61,6 +74,14 @@ MAXWAIT = float(os.environ.get("SAVE_CLEAR_RELAY_MAXWAIT", str(6 * 3600)))  # ex
 GRACE = float(os.environ.get("SAVE_CLEAR_RELAY_GRACE", "60"))  # app log missing: deliver after this
 CLAIM_S = float(os.environ.get("SAVE_CLEAR_RELAY_CLAIM_S", "600"))  # no ack after this: hand it out again
 MAX_ATTEMPTS = 3
+CREATE_LOCK = os.path.join(STATE, "relay-create.lock")
+COOLDOWN = os.path.join(STATE, "relay-create.failed")
+COOLDOWN_S = float(os.environ.get("SAVE_CLEAR_RELAY_COOLDOWN_S", "3600"))
+IMPORT_S = float(os.environ.get("SAVE_CLEAR_RELAY_IMPORT_S", "40"))  # wait for the app to import the new session
+DEFAULT_TITLE = "Don't touch it, relay"
+DEFAULT_MODEL = "haiku"
+# Permission modes the CLI takes. A relay in plan mode could not run its listener: plan -> default.
+CLI_MODES = ("default", "acceptEdits", "bypassPermissions", "auto", "dontAsk")
 
 
 def app_log():
@@ -73,6 +94,36 @@ def app_log():
     if os.name == "nt":
         return os.path.join(os.environ.get("APPDATA", ""), "Claude", "logs", "main.log")
     return os.path.expanduser("~/.config/Claude/logs/main.log")
+
+
+def app_sessions_dir():
+    """Where the desktop app keeps one JSON per session (title, model, permissionMode, isArchived)."""
+    env = os.environ.get("SAVE_CLEAR_APP_SESSIONS")
+    if env:
+        return os.path.expanduser(env)
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions")
+    if os.name == "nt":
+        return os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code-sessions")
+    return os.path.expanduser("~/.config/Claude/claude-code-sessions")
+
+
+def app_session(sid):
+    """The app's JSON for local_<id>, or None when it cannot be found (unknown, not "gone")."""
+    if not ID_RE.fullmatch(sid or ""):
+        return None
+    hits = glob.glob(os.path.join(glob.escape(app_sessions_dir()), "**", sid + ".json"), recursive=True)
+    for p in sorted(hits, key=lambda h: os.path.getmtime(h), reverse=True):
+        v = read_json(p)
+        if isinstance(v, dict):
+            return v
+    return None
+
+
+def archived(sid):
+    """True / False from the app's session file; None when the file is not found."""
+    v = app_session(sid)
+    return None if v is None else bool(v.get("isArchived"))
 
 
 def rlog(msg):
@@ -156,6 +207,10 @@ def cmd_request():
         print("this is not a desktop app session (no CLAUDE_CODE_HOST_SESSION_ID); the relay cannot help",
               file=sys.stderr)
         return 4
+    if archived(rid):
+        print(f"the relay {rid} is archived in the app, which ignores archived sessions: nothing queued. "
+              f"Run `{CMD} ensure` (it replaces it), or unarchive it in the app.", file=sys.stderr)
+        return 4
     if me == rid:
         print(f"this session IS the relay: follow the \"Context full\" part of `{CMD} rules` instead", file=sys.stderr)
         return 1
@@ -168,6 +223,10 @@ def cmd_setup(args):
         print("run this inside the relay app session, or pass its id: setup local_<uuid>", file=sys.stderr)
         return 1
     waker = args[1] if len(args) > 1 and ID_RE.fullmatch(args[1]) else None
+    if archived(rid):
+        print(f"{rid} is archived in the app: the app ignores archived sessions, so it cannot be the relay. "
+              "Unarchive it first, or pick another session.", file=sys.stderr)
+        return 1
     ensure_state()
     v = {"local_id": rid, "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
     if waker:
@@ -175,6 +234,221 @@ def cmd_setup(args):
     write_json(RELAY, v)
     print(f"relay recorded: {rid}{' (waker ' + waker + ')' if waker else ''} in {RELAY}")
     print(f"Now, in the relay session, send: {wake_text()}")
+    return 0
+
+
+def relay_auto():
+    """The `relay` setting: auto (default) creates the relay when needed; off never does."""
+    return setting("relay").lower() not in ("off", "0", "false", "no")
+
+
+def is_app_session():
+    """A Claude desktop app session: it has a local_<id> host id and is not a terminal (cli) session."""
+    return bool(ID_RE.fullmatch(os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", ""))) and \
+        (os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli") != "cli"
+
+
+def cli_mode(mode):
+    """The caller's app permission mode, as a CLI --permission-mode value (None = leave the default)."""
+    if mode == "plan":
+        return "default"
+    return mode if mode in CLI_MODES else None
+
+
+@contextlib.contextmanager
+def create_lock():
+    """One creator at a time, across processes and platforms (O_EXCL file; stale after 5 minutes)."""
+    ensure_state()
+    for _ in range(2):
+        try:
+            fd = os.open(CREATE_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(CREATE_LOCK) > 300:
+                    os.unlink(CREATE_LOCK)
+                    continue
+            except OSError:
+                continue
+            yield False
+            return
+    else:
+        yield False
+        return
+    try:
+        os.write(fd, f"{os.getpid()} {int(time.time())}\n".encode())
+        os.close(fd)
+        yield True
+    finally:
+        try:
+            os.unlink(CREATE_LOCK)
+        except OSError:
+            pass
+
+
+def opener():
+    env = os.environ.get("SAVE_CLEAR_OPEN")
+    if env:
+        return split_command(env)
+    if sys.platform == "darwin":
+        return [shutil.which("open") or "/usr/bin/open"]
+    if os.name == "nt":
+        return ["cmd", "/c", "start", ""]
+    return [shutil.which("xdg-open") or "xdg-open"]
+
+
+def log_size():
+    try:
+        return os.path.getsize(app_log())
+    except OSError:
+        return 0
+
+
+def wait_import(pos, sid, timeout):
+    """Wait for the app log line that says the deep link imported local_<id>."""
+    end = time.time() + timeout
+    needle = f"as Desktop session {sid}"
+    while True:
+        try:
+            with open(app_log(), "rb") as f:
+                f.seek(pos)
+                if needle in f.read().decode("utf8", "replace"):
+                    return True
+        except OSError:
+            pass
+        if time.time() >= end:
+            return False
+        time.sleep(min(1.0, POLL))
+
+
+def create_relay(caller):
+    """Create a new app session for the relay: `claude -p --session-id` makes it, the deep link
+    claude://resume imports it into the app. Same permission mode as the caller (sessions in different
+    permission modes cannot always message each other), a cheap model, a fixed title."""
+    model = setting("relay_model") or DEFAULT_MODEL
+    me = app_session(caller) or {}
+    mode = cli_mode(me.get("permissionMode") or "")
+    folder = os.path.join(STATE, "relay-session")
+    os.makedirs(folder, exist_ok=True)
+    cli = str(uuid.uuid4())
+    sid = "local_" + cli
+    first = ("You are the save-clear relay session, created by the save-clear plugin. Do nothing until a message "
+             f"starting with 'RELAY listen' arrives; then follow it. Reply only: relay ready.")
+    cmd = [claude_bin(), "-p", "--session-id", cli, "--model", model]
+    if mode:
+        cmd += ["--permission-mode", mode]
+    try:
+        r = subprocess.run(cmd + [first], cwd=folder, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"could not run {cmd[0]} -p: {e}"
+    if r.returncode != 0:
+        return None, f"{cmd[0]} -p exited {r.returncode}: {(r.stderr or r.stdout or '').strip()[-300:]}"
+    pos = log_size()
+    try:
+        subprocess.run(opener() + [f"claude://resume?session={cli}"], stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=30, check=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"could not open the claude://resume deep link: {e}"
+    if not wait_import(pos, sid, IMPORT_S):
+        return None, (f"the app did not import {sid} within {int(IMPORT_S)} s "
+                      f"(no 'as Desktop session {sid}' in {app_log()})")
+    return {"local_id": sid, "model": model, "permission_mode": mode or "default", "folder": folder}, ""
+
+
+def ensure_steps(rid, new, caller_mode):
+    """The app tool calls only the calling session can make (scripts cannot)."""
+    title = setting("relay_title") or DEFAULT_TITLE
+    app = app_session(rid) or {}
+    steps = []
+    if new or (app and app.get("title") != title and v_created_by_plugin()):
+        steps.append(f'mcp__ccd_session_mgmt__set_session_title session_id={rid} title="{title}"')
+    model = setting("relay_model") or DEFAULT_MODEL
+    if new and app and model not in (app.get("model") or ""):
+        steps.append(f"mcp__ccd_session_mgmt__set_session_model session_id={rid} model={model}")
+    mode = cli_mode(caller_mode or "")
+    if app and mode and app.get("permissionMode") and cli_mode(app["permissionMode"]) != mode:
+        if new:
+            steps.append(f"mcp__ccd_session_mgmt__set_session_permission_mode session_id={rid} mode={caller_mode}")
+        else:
+            print(f"NOTE: the relay runs in permission mode {app['permissionMode']}, this session in {caller_mode}. "
+                  "If its messages do not arrive, set both to the same mode.")
+    return steps
+
+
+def v_created_by_plugin():
+    v = read_json(RELAY)
+    return isinstance(v, dict) and bool(v.get("created_by"))
+
+
+def cmd_ensure():
+    if not is_app_session():
+        print("not a desktop app session: terminal sessions do not use a relay; nothing created", file=sys.stderr)
+        return 5
+    if os.path.exists(OFF) or not relay_auto():
+        print("relay off (setting relay: off, or the OFF file): nothing created", file=sys.stderr)
+        return 3
+    caller = os.environ["CLAUDE_CODE_HOST_SESSION_ID"]
+    caller_mode = (app_session(caller) or {}).get("permissionMode") or ""
+    rid = relay_id()
+    if rid == caller:
+        print(f"this session IS the relay: nothing to do (follow `{CMD} rules`)")
+        return 0
+    if rid and archived(rid) is not True:
+        steps = ensure_steps(rid, False, caller_mode)
+        print(f"relay ready: {rid} ({'listening' if listening() else 'not listening yet: request will say how to wake it'})")
+        for i, st in enumerate(steps, 1):
+            print(f"DO {i}: {st}")
+        return 0
+    if rid:
+        print(f"the relay {rid} is archived in the app (the app ignores archived sessions): creating a new one")
+        rlog(f"configured relay {rid} is archived; replacing it")
+    try:
+        if time.time() - os.path.getmtime(COOLDOWN) < COOLDOWN_S:
+            with open(COOLDOWN, encoding="utf-8") as f:
+                why = f.read().strip()
+            print(f"not creating a relay: the last attempt failed less than {int(COOLDOWN_S / 60)} min ago ({why}). "
+                  f"Details in {RLOG}", file=sys.stderr)
+            return 6
+    except OSError:
+        pass
+    with create_lock() as got:
+        if not got:
+            print("another session is creating the relay right now; try `request` (it may say how to wake it)",
+                  file=sys.stderr)
+            return 6
+        now = relay_id()  # someone may have finished while we waited
+        if now and now != rid and archived(now) is not True:
+            print(f"relay ready: {now} (created by another session just now)")
+            return 0
+        made, why = create_relay(caller)
+        if not made:
+            ensure_state()
+            with open(COOLDOWN, "w", encoding="utf-8") as f:
+                f.write(why[:300] + "\n")
+            rlog(f"could not create the relay: {why}")
+            print(f"could not create the relay: {why}", file=sys.stderr)
+            return 6
+        v = {"local_id": made["local_id"], "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "created_by": caller,
+             "model": made["model"], "permission_mode": made["permission_mode"]}
+        old = read_json(RELAY)
+        if isinstance(old, dict) and old.get("waker"):
+            v["waker"] = old["waker"]
+        if rid:
+            v["replaced"] = rid
+        write_json(RELAY, v)
+        try:
+            os.unlink(COOLDOWN)
+        except OSError:
+            pass
+    rid = made["local_id"]
+    rlog(f"relay created: {rid} (model {made['model']}, permission mode {made['permission_mode']})")
+    print(f"relay created: {rid} (model {made['model']}, permission mode {made['permission_mode']}, "
+          f"folder {made['folder']})")
+    for i, st in enumerate(ensure_steps(rid, True, caller_mode), 1):
+        print(f"DO {i}: {st}")
+    print(f"THEN: run `{CMD} request`; it exits 2 (not listening yet) and prints the message that starts the "
+          "relay's listener: send it with send_message.")
     return 0
 
 
@@ -186,7 +460,12 @@ def cmd_status():
     rid = relay_id()
     v = read_json(RELAY) or {}
     unacked, failed = names(CLAIMED), names(FAILED)
+    app = app_session(rid) if rid else None
     print(json.dumps({"relay": rid or None, "waker": v.get("waker"), "listening": listening(),
+                      "archived": None if app is None else bool(app.get("isArchived")),
+                      "title": (app or {}).get("title"), "model": (app or {}).get("model"),
+                      "permission_mode": (app or {}).get("permissionMode"),
+                      "auto": relay_auto(), "created_by_plugin": bool(v.get("created_by")),
                       "off": os.path.exists(OFF), "queued": len(glob.glob(os.path.join(INBOX, "*.json"))),
                       "unacked": len(unacked), "failed": len(failed), "unacked_requests": unacked,
                       "failed_requests": failed, "state": STATE, "app_log": app_log(),
@@ -398,6 +677,8 @@ def main(argv):
         return cmd_request()
     if cmd == "setup":
         return cmd_setup(args)
+    if cmd == "ensure":
+        return cmd_ensure()
     if cmd == "status":
         return cmd_status()
     if cmd == "off":

@@ -14,7 +14,10 @@
     "pre_clear_command": "Runs just before the automatic /clear or clear_session; never stops the clear. Empty = none",
     "on_resume_command": "Runs after the /clear when the summary is delivered; what it prints (exit 0) goes into the new session. Empty = none",
     "kill_background_tasks": "on: before the automatic /clear, Claude stops the background tasks this session left running (TaskStop) and lists them in the summary; never anything outside this session. Default: off",
-    "notify_success": "off: call notify_command only when the automatic /clear fails, is refused or stops halfway, not when it works. Default: on"
+    "notify_success": "off: call notify_command only when the automatic /clear fails, is refused or stops halfway, not when it works. Default: on",
+    "relay": "Desktop app only. auto: the first save-and-clear in an app session creates the relay session (and replaces an archived one) by itself. off: never create one. Default: auto",
+    "relay_model": "Model of the relay session the plugin creates. Empty = haiku",
+    "relay_title": "Title of the relay session the plugin creates. Empty = Don't touch it, relay"
   },
   "snapshot_dir": null,
   "notify_command": null,
@@ -29,5 +32,8 @@
   "pre_clear_command": null,
   "on_resume_command": null,
   "kill_background_tasks": null,
-  "notify_success": null
+  "notify_success": null,
+  "relay": null,
+  "relay_model": null,
+  "relay_title": null
 }

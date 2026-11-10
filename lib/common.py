@@ -123,6 +123,9 @@ OPTIONS = {
     "on_resume_command": "SAVE_CLEAR_ON_RESUME",
     "kill_background_tasks": "SAVE_CLEAR_KILL_BACKGROUND_TASKS",
     "notify_success": "SAVE_CLEAR_NOTIFY_SUCCESS",
+    "relay": "SAVE_CLEAR_RELAY",
+    "relay_model": "SAVE_CLEAR_RELAY_MODEL",
+    "relay_title": "SAVE_CLEAR_RELAY_TITLE",
 }
 
 # Your own settings, outside the plugin folder: they survive plugin updates and reinstalls.
