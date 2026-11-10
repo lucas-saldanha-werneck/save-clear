@@ -116,8 +116,15 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
      terminal that may belong to another session. If the `mcp__ccd_session_mgmt__clear_session` tool
      is missing (load it with ToolSearch if it is only listed), reply "You can /clear now." and stop.
      Otherwise:
-     1. **Ask the relay for the resume (optional helper).** A session cannot message itself, so without
-        help the resume only arrives with the user's next message. Run
+     1. **Make sure the relay exists.** A session cannot message itself, so the resume comes from one
+        helper app session, the relay. Run `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear-relay" ensure`
+        (it can take up to a minute the first time: it creates the relay session):
+        - exit **0**: a relay exists. If it printed `DO <n>:` lines, make each of those app tool calls
+          now, in order (load them with ToolSearch if only listed); a failed one is only noted. Never
+          create a relay any other way: `ensure` is the only creator, and it never makes two.
+        - exit **3** (off), **5** (not an app session) or **6** (could not create it; reason printed):
+          go on to the next step; it reports what to say.
+     2. **Ask the relay for the resume.** Run
         `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear-relay" request`:
         - exit **0**: the relay is listening; it sends the resume right after the clear.
         - exit **2**: queued, but the relay is not listening. Wake it: `send_message` to the relay id
@@ -125,10 +132,11 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
           cold start). If that fails, say the resume arrives with the user's next message.
         - exit **3**: the relay was turned off on purpose. Do not wake it; say the resume arrives with
           the user's next message.
-        - exit **4**: no relay configured. Same: the resume arrives with the user's next message; say so.
+        - exit **4**: no usable relay (none, or archived in the app). Same: the resume arrives with the
+          user's next message; say so, with the reason it printed.
         - exit **1** saying "this session IS the relay": stop here and follow only the "Context full"
           part of `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear-relay" rules`.
-     2. Write the step 7 reply, then call `clear_session` with `session_id: "self"` as the very last
+     3. Write the step 7 reply, then call `clear_session` with `session_id: "self"` as the very last
         action. The app clears only this session when the turn ends. If it refuses, change the reply to
         "You can /clear now."
 

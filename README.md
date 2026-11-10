@@ -65,6 +65,10 @@ recap.
 Restart the session so the hooks load. Then say "save and clear" (also "save-clear" or
 "salvalimpa"), or "checkpoint" / "save the session" to save without clearing.
 
+In the Claude desktop app there is nothing else to set up: the first "save and clear" in an app
+session creates the [relay](#desktop-app-relay) session by itself (titled "Don't touch it, relay").
+Terminal sessions never create one.
+
 Requires `python3` 3.8 or newer. The automatic `/clear` also needs the `claude` CLI on `PATH`
 (the helper runs `claude agents --json` to check which session it is typing into). macOS or Linux.
 On Windows, save and resume work, but the automatic `/clear` does not (see below). The hooks call
@@ -117,6 +121,9 @@ it, and an existing file is never overwritten, so edit it freely.
 | `on_resume_command` | `SAVE_CLEAR_ON_RESUME` | empty | Runs after the `/clear`, when the summary is delivered (5 s limit). What it prints (exit 0) is added to the new session's context, before the summary |
 | `kill_background_tasks` | `SAVE_CLEAR_KILL_BACKGROUND_TASKS` | `off` | `on`: before the automatic `/clear`, Claude stops the background tasks this session left running (Bash `run_in_background` jobs, Monitor watches) and lists them in the summary, and the next session names them. See [Leftover background tasks](#leftover-background-tasks) |
 | `notify_success` | `SAVE_CLEAR_NOTIFY_SUCCESS` | `on` | `off`: `notify_command` runs only when the automatic `/clear` fails, is refused or stops halfway, not when it works |
+| `relay` | `SAVE_CLEAR_RELAY` | `auto` | Desktop app only. `auto`: the first save-and-clear in an app session creates the relay session when there is none, or when the configured one is archived. `off`: never create one (a relay you set up yourself still works; `save-clear-relay off` turns that off too). See [Desktop app relay](#desktop-app-relay) |
+| `relay_model` | `SAVE_CLEAR_RELAY_MODEL` | `haiku` | Model of the relay session the plugin creates |
+| `relay_title` | `SAVE_CLEAR_RELAY_TITLE` | `Don't touch it, relay` | Title of the relay session the plugin creates |
 | (none) | `SAVE_CLEAR_LAUNCHD_PREFIX` | `com.claude-tools` | Idle trigger only: prefix of the launchd job label (`<prefix>.save-clear-idle`) |
 | (none) | `SAVE_CLEAR_STATE_DIR` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/state/save-clear` | Flags, relay inbox and the logs `save-clear.log` and `relay.log` |
 
@@ -296,16 +303,35 @@ A desktop app session can clear itself but cannot send itself a message, so the 
 your next message. The relay is one app session that serves the others: it watches an inbox folder,
 waits for a session's clear, and sends that session the resume request with `send_message`.
 
-Setup, once:
+**It sets itself up.** On "save and clear" in an app session, the skill runs
+`save-clear-relay ensure` before asking for the resume. When no relay is configured (or the
+configured one is archived), `ensure`:
 
-1. Open a new desktop app session in any folder, name it "relay", and use it only for this.
-2. In it, ask Claude to run `python3 <plugin folder>/bin/save-clear-relay setup`. This records the
-   session's id and prints the message that starts the listener.
-3. Send that message (`RELAY listen. Run ... rules and follow the cycle from step 1.`).
+1. creates a session with `claude -p --session-id <uuid>` in `<state folder>/relay-session`, on
+   `relay_model` (default `haiku`, cheap) and in the same permission mode as the session that creates
+   it (plan mode becomes `default`, since the relay must run its listener). Sessions in different
+   permission modes may not get each other's messages;
+2. opens the deep link `claude://resume?session=<uuid>`, which imports it into the app, and waits
+   for the app log line `as Desktop session local_<uuid>`;
+3. records it, and prints the app tool calls only a session can make: `set_session_title` with
+   `relay_title` (default "Don't touch it, relay"; leave that session alone), and
+   `set_session_model` / `set_session_permission_mode` if the app shows something else.
 
-After that, "save and clear" in another app session queues a request with
-`save-clear-relay request`. If the relay is not listening, that session wakes it with
-`send_message`.
+Then `save-clear-relay request` queues the resume, sees the new relay is not listening yet, and the
+skill wakes it with `send_message` (the relay starts listening only after `RELAY listen ...`).
+
+`ensure` is idempotent: a relay that exists and is not archived is used as is (one you set up
+yourself keeps its title), a lock keeps two sessions from creating two relays, and a failed
+creation is not retried for an hour (`relay.log` has the reason). It never runs in terminal
+sessions (exit 5) or with `relay: off` (exit 3). The app ignores archived sessions, so an archived
+relay is shown by `status` (`"archived": true`), refused by `setup` and `request`, and replaced by
+`ensure` (the old one stays archived). The app's session files are read from
+`~/Library/Application Support/Claude/claude-code-sessions` on macOS (`SAVE_CLEAR_APP_SESSIONS`
+overrides it).
+
+Manual setup (instead of the automatic one): in an app session you keep for this, ask Claude to run
+`python3 <plugin folder>/bin/save-clear-relay setup`, then send the message it prints
+(`RELAY listen. Run ... rules and follow the cycle from step 1.`).
 
 A request stays pending until the relay acknowledges it with `save-clear-relay ack <name> ok` after
 `send_message`. If the relay reports a failure, or its turn is lost before the ack, the request is
@@ -314,7 +340,8 @@ and `status` lists it. A lost ack can make the resume request arrive twice.
 
 Other commands:
 
-- `save-clear-relay status`: relay id, whether it is listening, how many requests are queued,
+- `save-clear-relay status`: relay id, whether it is listening, whether the app shows it archived
+  (with its title, model and permission mode), how many requests are queued,
   handed out but not acknowledged (`unacked`) or given up (`failed`), and the state folder.
 - `save-clear-relay off` and `on`: while off, requests are refused.
 - `save-clear-relay setup <relay id> <waker id>`: when the relay's own context fills up it saves
@@ -340,12 +367,16 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
 
 ## Limits
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 121 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 134 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
   (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. On Windows, CI runs the unit tests
   only, and skips the ones for the automatic `/clear`, which needs tmux. Install and uninstall were run with the
   `claude plugin` CLI.
+- The automatic relay setup (`ensure`) is tested with a fake `claude -p`, a fake deep-link opener
+  and fake app session files. Not tested live: that a session imported this way honors the
+  `--model` and `--permission-mode` given to `claude -p` (the `DO` lines correct it if the app shows
+  otherwise), and the deep link on Linux and Windows.
 - Not tested live: the desktop app relay round trip (request, clear, `send_message`, ack, resume),
   the waker, and `claude --bg` sessions. The unit tests cover their decision logic only. The
   `claude --bg` clear confirmation reads `resumeSessionId` from `~/.claude/jobs/<id>/state.json`;

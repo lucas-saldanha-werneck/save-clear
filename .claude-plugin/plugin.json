@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.7.3",
+  "version": "0.8.0",
   "description": "Saves decisions and next steps, clears the context, and the next session starts from them.",
   "author": {
     "name": "Lucas Saldanha Werneck",
@@ -116,6 +116,28 @@
         "off"
       ],
       "default": "on"
+    },
+    "relay": {
+      "type": "string",
+      "title": "Desktop app relay",
+      "description": "auto: in the Claude desktop app, the first save-and-clear creates the relay session by itself (and replaces an archived one). off: never create one. Terminal sessions never use a relay.",
+      "options": [
+        "auto",
+        "off"
+      ],
+      "default": "auto"
+    },
+    "relay_model": {
+      "type": "string",
+      "title": "Relay model (optional)",
+      "description": "Model of the relay session the plugin creates. Empty = haiku (cheap).",
+      "default": ""
+    },
+    "relay_title": {
+      "type": "string",
+      "title": "Relay session title (optional)",
+      "description": "Title of the relay session the plugin creates. Empty = Don't touch it, relay",
+      "default": ""
     }
   }
 }

@@ -131,9 +131,9 @@ def cmd_arm_clear(args):
         if mode == "manual":
             print("No automatic /clear here. Tell the user to type /clear; the summary comes back by itself.")
         else:
-            print("Not a terminal session. If the clear_session tool exists: run save-clear-relay request "
-                  "(optional relay), then call clear_session with session_id \"self\"; otherwise tell the user "
-                  "to type /clear.")
+            print("Not a terminal session. If the clear_session tool exists: run save-clear-relay ensure, then "
+                  "save-clear-relay request (the relay sends the resume), then call clear_session with session_id "
+                  "\"self\"; otherwise tell the user to type /clear.")
             if kill_background_tasks():
                 print(stop_tasks_instruction("If you have not done it yet, before calling clear_session,"))
         return 0

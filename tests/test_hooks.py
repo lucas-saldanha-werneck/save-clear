@@ -683,6 +683,173 @@ class Relay(Base):
         self.assertIn("## Context full", out)
 
 
+class RelayAuto(Base):
+    """`save-clear-relay ensure`: the relay sets itself up in the desktop app, never in a terminal."""
+    def setUp(self):
+        super().setUp()
+        self.sessions = os.path.join(self.t, "app-sessions")
+        os.makedirs(os.path.join(self.sessions, "acct", "org"))
+        self.calls = os.path.join(self.t, "claude-calls.txt")
+        # fake `claude -p`: records its arguments
+        fake = os.path.join(self.t, "fake_claude_p.py")
+        with open(fake, "w") as f:
+            f.write("import sys\nopen(sys.argv[1], 'a').write(' '.join(sys.argv[2:]) + '\\n')\nprint('relay ready')\n")
+        # fake deep-link opener: the app imports the session (log line + session file)
+        opener = os.path.join(self.t, "fake_open.py")
+        with open(opener, "w") as f:
+            f.write("import json, os, sys, time\n"
+                    "log, sess, url = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+                    "cli = url.split('session=')[1]\n"
+                    "open(log, 'a').write(time.strftime('%Y-%m-%d %H:%M:%S') + "
+                    "f' [info] Resume deep link: imported {cli} as Desktop session local_{cli}\\n')\n"
+                    "json.dump({'sessionId': 'local_' + cli, 'isArchived': False, 'model': 'claude-haiku-x', "
+                    "'permissionMode': os.environ.get('FAKE_MODE', 'bypassPermissions'), 'title': 'relay ready'}, "
+                    "open(os.path.join(sess, 'local_' + cli + '.json'), 'w'))\n")
+        if sys.platform == "win32":
+            claude = os.path.join(self.t, "claude.cmd")
+            with open(claude, "w") as f:
+                f.write(f'@"{PY}" "{fake}" "{self.calls}" %*\n')
+        else:
+            claude = os.path.join(self.t, "claude")
+            with open(claude, "w") as f:
+                f.write(f'#!/bin/sh\nexec "{PY}" "{fake}" "{self.calls}" "$@"\n')
+            os.chmod(claude, 0o755)
+        self.env.update(SAVE_CLEAR_CLAUDE=claude, SAVE_CLEAR_APP_SESSIONS=self.sessions,
+                        SAVE_CLEAR_OPEN=f'"{PY}" "{opener}" "{self.env["SAVE_CLEAR_APP_LOG"]}" '
+                                        f'"{os.path.join(self.sessions, "acct", "org")}"',
+                        SAVE_CLEAR_RELAY_IMPORT_S="5", SAVE_CLEAR_RELAY_POLL="0.1")
+        self.app_session(APP, permissionMode="bypassPermissions")
+
+    def app_session(self, sid, **fields):
+        v = {"sessionId": sid, "isArchived": False}
+        v.update(fields)
+        with open(os.path.join(self.sessions, "acct", "org", sid + ".json"), "w") as f:
+            json.dump(v, f)
+
+    def ensure(self, **env):
+        e = dict(CLAUDE_CODE_ENTRYPOINT="claude-desktop", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        e.update(env)
+        return self.run_py("bin/save-clear-relay", ["ensure"], **e)
+
+    def created(self):
+        try:
+            with open(self.calls) as f:
+                return f.read().splitlines()
+        except OSError:
+            return []
+
+    def relay_json(self):
+        p = os.path.join(self.state, "relay.json")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            return json.load(f)
+
+    def test_no_relay_created_once(self):
+        r = self.ensure()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("relay created: local_", r.stdout)
+        [call] = self.created()
+        self.assertIn("-p --session-id", call)
+        self.assertIn("--model haiku", call)
+        self.assertIn("--permission-mode bypassPermissions", call, "same permission mode as the caller")
+        rid = self.relay_json()["local_id"]
+        self.assertIn(f'set_session_title session_id={rid} title="Don\'t touch it, relay"', r.stdout)
+        self.assertIn("request", r.stdout)
+        # again: the same relay, nothing created
+        r2 = self.ensure()
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn(f"relay ready: {rid}", r2.stdout)
+        self.assertEqual(len(self.created()), 1, "never two relays")
+        self.assertEqual(self.relay_json()["local_id"], rid)
+        # request then queues for it and says how to wake it
+        q = self.run_py("bin/save-clear-relay", ["request"], CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(q.returncode, 2, q.stderr)
+        self.assertIn(f"send_message to {rid}", q.stderr)
+
+    def test_custom_title_and_model(self):
+        r = self.ensure(SAVE_CLEAR_RELAY_TITLE="Relay X", SAVE_CLEAR_RELAY_MODEL="sonnet")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('title="Relay X"', r.stdout)
+        self.assertIn("--model sonnet", self.created()[0])
+        self.assertIn("set_session_model", r.stdout, "the fake app reports haiku, so it asks to set sonnet")
+
+    def test_plan_mode_caller_gives_default_mode(self):
+        self.app_session(APP, permissionMode="plan")
+        self.ensure(FAKE_MODE="default")
+        self.assertIn("--permission-mode default", self.created()[0])
+
+    def test_archived_relay_reported_and_not_used(self):
+        self.app_session(RELAY_ID, isArchived=True)
+        self.assertEqual(self.run_py("bin/save-clear-relay", ["setup", RELAY_ID]).returncode, 1,
+                         "setup refuses an archived session")
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "relay.json"), "w") as f:
+            json.dump({"local_id": RELAY_ID}, f)
+        st = json.loads(self.run_py("bin/save-clear-relay", ["status"]).stdout)
+        self.assertIs(st["archived"], True)
+        q = self.run_py("bin/save-clear-relay", ["request"], CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(q.returncode, 4)
+        self.assertIn("archived", q.stderr)
+        self.assertFalse(os.path.isdir(os.path.join(self.state, "relay-inbox")) and
+                         [n for n in os.listdir(os.path.join(self.state, "relay-inbox")) if n.endswith(".json")])
+        r = self.ensure()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("archived", r.stdout)
+        v = self.relay_json()
+        self.assertNotEqual(v["local_id"], RELAY_ID)
+        self.assertEqual(v["replaced"], RELAY_ID)
+        self.assertEqual(len(self.created()), 1)
+
+    def test_terminal_session_never_creates(self):
+        for env in (dict(CLAUDE_CODE_ENTRYPOINT="cli"), dict(CLAUDE_CODE_HOST_SESSION_ID=""),
+                    dict(CLAUDE_CODE_ENTRYPOINT="", CLAUDE_CODE_HOST_SESSION_ID="")):
+            r = self.ensure(**env)
+            self.assertEqual(r.returncode, 5, (env, r.stdout, r.stderr))
+        self.assertEqual(self.created(), [])
+        self.assertIsNone(self.relay_json())
+        out = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_SESSION_ID=SID_A).stdout
+        self.assertNotIn("relay", out)
+
+    def test_off_setting_does_nothing(self):
+        r = self.ensure(SAVE_CLEAR_RELAY="off")
+        self.assertEqual(r.returncode, 3)
+        with open(self.env["SAVE_CLEAR_CONFIG"], "w") as f:
+            json.dump({"relay": "off"}, f)
+        self.assertEqual(self.ensure().returncode, 3)
+        self.assertEqual(self.created(), [])
+        self.assertIsNone(self.relay_json())
+
+    def test_existing_relay_is_left_alone(self):
+        self.app_session(RELAY_ID, title="my relay", permissionMode="bypassPermissions")
+        self.run_py("bin/save-clear-relay", ["setup", RELAY_ID])
+        r = self.ensure()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"relay ready: {RELAY_ID}", r.stdout)
+        self.assertNotIn("DO ", r.stdout, "a relay the user set up keeps its title")
+        self.assertEqual(self.created(), [])
+
+    def test_failed_creation_cools_down(self):
+        self.env["SAVE_CLEAR_OPEN"] = f'"{PY}" -c "pass"'          # the app never imports it
+        self.env["SAVE_CLEAR_RELAY_IMPORT_S"] = "0.3"
+        r = self.ensure()
+        self.assertEqual(r.returncode, 6)
+        self.assertIn("did not import", r.stderr)
+        self.assertIsNone(self.relay_json())
+        r = self.ensure()
+        self.assertEqual(r.returncode, 6)
+        self.assertIn("less than", r.stderr)
+        self.assertEqual(len(self.created()), 1, "no retry during the cool-down")
+
+    def test_concurrent_creator_waits(self):
+        os.makedirs(self.state, exist_ok=True)
+        open(os.path.join(self.state, "relay-create.lock"), "w").close()
+        r = self.ensure()
+        self.assertEqual(r.returncode, 6)
+        self.assertIn("another session", r.stderr)
+        self.assertEqual(self.created(), [])
+
+
 class ContextCap(Base):
     """Token-limit hook: asks for a save-clear at the end of a turn when the context is too big."""
     def transcript(self, tokens, sidechain_tokens=None):
