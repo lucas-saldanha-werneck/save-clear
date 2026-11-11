@@ -60,7 +60,7 @@ def _own_plugin_data():
     if root and os.path.realpath(os.path.expanduser(root)) == os.path.realpath(ROOT):
         return data
     if os.path.basename(os.path.normpath(os.path.expanduser(data))).startswith("save-clear"):
-        return data  # <plugin>-<marketplace>, e.g. save-clear-lucas-plugins
+        return data  # <plugin>-<marketplace>, e.g. save-clear-lucas-tools
     return ""
 
 

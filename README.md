@@ -59,7 +59,7 @@ recap.
 
 ```
 /plugin marketplace add lucas-saldanha-werneck/claude-plugins
-/plugin install save-clear@lucas-plugins
+/plugin install save-clear@lucas-tools
 ```
 
 Restart the session so the hooks load. Then say "save and clear" (also "save-clear" or
@@ -76,7 +76,7 @@ On Windows, save and resume work, but the automatic `/clear` does not (see below
 
 ## Settings
 
-Set them with `/plugin configure save-clear@lucas-plugins` (or the `/config` panel), with environment
+Set them with `/plugin configure save-clear@lucas-tools` (or the `/config` panel), with environment
 variables, or in your own file `~/.config/save-clear/config.json` (`$XDG_CONFIG_HOME/save-clear/` if
 set; another path with `SAVE_CLEAR_CONFIG`). Same keys as the option names:
 
@@ -366,7 +366,7 @@ request (`SAVE_CLEAR_RELAY_GRACE`).
 ## Uninstall
 
 ```
-/plugin uninstall save-clear@lucas-plugins
+/plugin uninstall save-clear@lucas-tools
 ```
 
 Your summaries stay in the snapshot folder. Claude Code deletes the plugin's data folder on
