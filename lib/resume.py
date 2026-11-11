@@ -8,7 +8,7 @@ own entry. A global flag would hand the summary to whichever session starts firs
 import os
 import re
 
-from common import (RESUME_FLAG, RESUME_LOCK, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
+from common import (app_host, RESUME_FLAG, RESUME_LOCK, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
                     read_json, write_json)
 
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
@@ -77,7 +77,7 @@ def match(e, hook, env, now):
         return False, "same conversation, still has its context"
     # Desktop app: a clear opens a new transcript in a new process; the host session id stays
     if e.get("app_session"):
-        host = env.get("CLAUDE_CODE_HOST_SESSION_ID")
+        host = app_host(env)
         if host == e["app_session"]:
             return True, f"same app session ({_short(host)})"
         return False, f"armed by app session {_short(e['app_session'])}, this is {_short(host)}"
@@ -104,7 +104,7 @@ def arm(snapshot, session_id=None, env=None):
         "snapshot": snap,
         "session_id": env.get("CLAUDE_CODE_SESSION_ID") or session_id or None,
         "cwd": norm_dir(env.get("CLAUDE_PROJECT_DIR") or os.getcwd()),
-        "app_session": env.get("CLAUDE_CODE_HOST_SESSION_ID") or None,
+        "app_session": app_host(env),
         "entrypoint": env.get("CLAUDE_CODE_ENTRYPOINT") or "cli",
         "pid": int(env["CLAUDE_PID"]) if (env.get("CLAUDE_PID") or "").isdigit() else None,
         "job": os.path.basename(env["CLAUDE_JOB_DIR"]) if env.get("CLAUDE_JOB_DIR") else None,

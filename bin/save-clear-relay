@@ -53,7 +53,7 @@ import time
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import (ROOT, claude_bin, resume_msg, setting, split_command, STATE, ensure_state,  # noqa: E402
+from common import (ROOT, under_terminal, claude_bin, resume_msg, setting, split_command, STATE, ensure_state,  # noqa: E402
                     read_json, write_json)
 
 try:
@@ -305,7 +305,7 @@ def relay_auto():
 def is_app_session():
     """A Claude desktop app session: it has a local_<id> host id and is not a terminal (cli) session."""
     return bool(ID_RE.fullmatch(os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", ""))) and \
-        (os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli") != "cli"
+        (os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli") != "cli" and not under_terminal()
 
 
 def cli_mode(mode):

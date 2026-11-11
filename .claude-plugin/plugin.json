@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.10.3",
+  "version": "0.10.4",
   "description": "Saves decisions and next steps, clears the context, and the next session starts from them.",
   "author": {
     "name": "Lucas Saldanha Werneck",

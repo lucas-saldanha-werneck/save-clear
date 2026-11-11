@@ -41,7 +41,7 @@ class Base(unittest.TestCase):
         os.makedirs(self.proj)
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("CLAUDE", "TMUX", "SAVE_CLEAR", "TERM_PROGRAM", "LC_TERMINAL"))}
-        self.env.update(SAVE_CLEAR_STATE_DIR=self.state, SAVE_CLEAR_SNAPSHOT_DIR=self.snaps,
+        self.env.update(SAVE_CLEAR_UNDER_TERMINAL="0", SAVE_CLEAR_STATE_DIR=self.state, SAVE_CLEAR_SNAPSHOT_DIR=self.snaps,
                         SAVE_CLEAR_CLAUDE="/nonexistent/claude", SAVE_CLEAR_POINTER=os.path.join(t, "pointer"),
                         SAVE_CLEAR_APP_LOG=os.path.join(t, "app-main.log"),
                         SAVE_CLEAR_CONFIG=os.path.join(t, "user-config.json"))
@@ -2173,6 +2173,20 @@ class RcClear(Base):
         out = self.relay("rules").stdout
         self.assertIn("RCON <id>", out)
         self.assertIn("rc-on-ack", out)
+
+
+class AppHost(unittest.TestCase):
+    """An app host id inherited by a terminal session (tmux server started from an app session) is ignored."""
+
+    def test_app_host_ignored_under_a_terminal(self):
+        from unittest import mock
+        sys.path.insert(0, os.path.join(ROOT, "lib"))
+        import common
+        env = {"CLAUDE_CODE_HOST_SESSION_ID": "local_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}
+        with mock.patch.dict(os.environ, {"SAVE_CLEAR_UNDER_TERMINAL": "1"}):
+            self.assertIsNone(common.app_host(env))
+        with mock.patch.dict(os.environ, {"SAVE_CLEAR_UNDER_TERMINAL": "0"}):
+            self.assertEqual(common.app_host(env), env["CLAUDE_CODE_HOST_SESSION_ID"])
 
 
 if __name__ == "__main__":

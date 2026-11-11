@@ -427,6 +427,41 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def under_terminal():
+    """True when an ancestor process has a terminal (a terminal `claude`); desktop app sessions have none.
+    A terminal session can INHERIT CLAUDE_CODE_ENTRYPOINT / CLAUDE_CODE_HOST_SESSION_ID from a tmux server
+    an app session started, so those variables alone do not prove an app session.
+    SAVE_CLEAR_UNDER_TERMINAL=1/0 forces the answer (tests). Unknown (no ps, Windows) = False."""
+    forced = os.environ.get("SAVE_CLEAR_UNDER_TERMINAL")
+    if forced in ("0", "1"):
+        return forced == "1"
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,tty="], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    procs = {}
+    for ln in out.splitlines():
+        parts = ln.split()
+        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
+    p, seen = os.getpid(), set()
+    while p in procs and p not in seen and p > 1:
+        seen.add(p)
+        ppid, tty = procs[p]
+        if tty not in ("??", "?", "-"):
+            return True
+        p = ppid
+    return False
+
+
+def app_host(env=None):
+    """The desktop app session id (local_...) of this session, or None in a terminal session."""
+    env = os.environ if env is None else env
+    host = env.get("CLAUDE_CODE_HOST_SESSION_ID") or None
+    return None if host and under_terminal() else host
+
+
 def short(s):
     return str(s or "?")[:8]
 

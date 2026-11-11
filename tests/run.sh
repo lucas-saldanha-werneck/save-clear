@@ -21,7 +21,7 @@ B=bbbbbbbb-0000-0000-0000-00000000000b
 export TMUX_TMPDIR="$(mktemp -d /tmp/sct.XXXX)"   # short path: sockets are limited to ~104 chars
 unset TMUX TMUX_PANE
 TMS="$TMUX_TMPDIR/tmux-$(id -u)/default"   # the test server's socket: kill-server only ever targets it
-export SAVE_CLEAR_START_DELAY=0.5 CLAUDE_CODE_ENTRYPOINT=cli SAVE_CLEAR_CONFIG=/nonexistent/save-clear.json
+export SAVE_CLEAR_UNDER_TERMINAL=0 SAVE_CLEAR_START_DELAY=0.5 CLAUDE_CODE_ENTRYPOINT=cli SAVE_CLEAR_CONFIG=/nonexistent/save-clear.json
 unset CLAUDE_JOB_DIR CLAUDE_CODE_HOST_SESSION_ID
 cleanup() { "$TM" -S "$TMS" kill-server 2>/dev/null; rm -rf "$W" "$TMUX_TMPDIR"; }
 trap cleanup EXIT
