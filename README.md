@@ -58,7 +58,7 @@ recap.
 ## Install
 
 ```
-/plugin marketplace add lucas-saldanha-werneck/claude-plugins
+/plugin marketplace add lucas-saldanha-werneck/lucas-tools
 /plugin install save-clear@lucas-tools
 ```
 
