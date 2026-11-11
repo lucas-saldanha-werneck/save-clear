@@ -2054,9 +2054,30 @@ class RcClear(Base):
         with open(os.path.join(self.sessions, APP + ".json"), "w") as f:
             json.dump(row, f)
 
-    def heartbeat(self):
+    def heartbeat(self, rcon=True):
         with open(os.path.join(self.state, "relay-listener.alive"), "w") as f:
             f.write(f"{os.getpid()} {int(time.time())}\n")
+        caps = os.path.join(self.state, "relay-listener.caps")
+        if rcon:
+            with open(caps, "w") as f:
+                f.write(f"{os.getpid()} rcon\n")
+        elif os.path.exists(caps):
+            os.unlink(caps)
+
+    def test_older_listener_keeps_it_on(self):
+        self.app_row(remoteControlUserEnabled=True)
+        self.heartbeat(rcon=False)                    # a 0.9.x listener writes no caps file
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("RC-KEEP", r.stdout)
+        self.assertNotIn("RC-OFF-SELF", r.stdout)
+        self.assertFalse(self.job().get("rc_on"))
+
+    def test_listener_writes_its_caps(self):
+        r = self.relay("listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="0.5")
+        self.assertEqual(r.stdout.strip(), "IDLE")
+        with open(os.path.join(self.state, "relay-listener.caps")) as f:
+            self.assertIn("rcon", f.read())
 
     def job(self):
         d = os.path.join(self.state, "relay-inbox")

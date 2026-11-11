@@ -69,6 +69,7 @@ CLAIMED = os.path.join(INBOX, "claimed")  # handed to the relay, waiting for its
 FAILED = os.path.join(INBOX, "failed")    # gave up: shown by status
 ALIVE = os.path.join(STATE, "relay-listener.alive")
 LOCK = os.path.join(STATE, "relay-listener.lock")
+CAPS = os.path.join(STATE, "relay-listener.caps")  # what the running listener can do ("<pid> rcon")
 RLOG = os.path.join(STATE, "relay.log")
 SELF = os.path.abspath(__file__)
 CMD = f'python3 "{SELF}"'
@@ -176,6 +177,19 @@ def listening(max_age=ALIVE_S):
         return False
 
 
+def listener_rcon():
+    """True when the running listener prints RCON lines (0.10.0 and later). An older listener would
+    never turn a session's Remote Control back on, so a session must not turn it off for it."""
+    try:
+        with open(ALIVE, encoding="utf-8") as f:
+            pid = f.read().split()[0]
+        with open(CAPS, encoding="utf-8") as f:
+            caps = f.read().split()
+        return bool(caps) and caps[0] == pid and "rcon" in caps[1:]
+    except Exception:
+        return False
+
+
 def wake_text():
     return f"RELAY listen. Run `{CMD} rules` and follow the cycle from step 1."
 
@@ -245,7 +259,7 @@ def cmd_request():
         return 1
     rc = rc_self(me)
     # Turn Remote Control off only while the relay is listening: it is the one that turns it back on.
-    rc_off = rc == "on" and listening(RC_ALIVE_S)
+    rc_off = rc == "on" and listening(RC_ALIVE_S) and listener_rcon()
     code = enqueue(me, resume_msg(), after_clear=me, why="save-clear", rc_on=rc_off)
     if code == 0 and rc_off:
         print("RC-OFF-SELF: Remote Control is on here, and the app does not clear a session while it is on. "
@@ -254,7 +268,7 @@ def cmd_request():
               "(enabled=true). After the clear the relay sends the resume and turns Remote Control back on "
               f"(by itself after {int(AFTER_CLEAR_RC_MAX)} s if the clear never comes).")
     elif rc == "on":
-        print("RC-KEEP: Remote Control is on here and the relay is not listening (or is off), so nothing could turn it "
+        print("RC-KEEP: Remote Control is on here and the relay is not listening (or is off, or runs an older listener), so nothing could turn it "
               "back on after a clear. Leave it on, do not call clear_session, and reply \"You can /clear now.\"")
     elif rc == "locked":
         print("RC-LOCKED: this session was started from Remote Control; the app locks its Remote Control "
@@ -665,6 +679,8 @@ def cmd_listen():
         except OSError:
             print("ALREADY")  # another listener is alive: the relay does NOT start one again
             return 0
+    with open(CAPS, "w", encoding="utf-8") as f:
+        f.write(f"{os.getpid()} rcon\n")
     rlog("listening")
     start = time.time()
     while True:
