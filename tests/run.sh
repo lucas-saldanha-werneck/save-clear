@@ -73,11 +73,11 @@ new_case switch
 [ $rc -eq 3 ] && ok "exit 3" || bad "rc=$rc"
 typed | grep -q '^/clear' && bad "typed /clear" || ok "/clear NOT typed"
 
-echo "== T5: Stop hook in a desktop app session (entrypoint claude-desktop) -> refuse and say so"
-new_case match
+echo "== T5: Stop hook in a desktop app session whose stale pane runs another session -> refuse and say so"
+new_case mismatch
 flag_now
 OUT=$(echo "{\"session_id\":\"$A\",\"transcript_path\":\"\"}" | CLAUDE_CODE_ENTRYPOINT=claude-desktop "$PY" "$R/hooks/stop.py")
-echo "$OUT" | grep -q 'did NOT clear - this session is claude-desktop' && ok "message: $OUT" || bad "output: $OUT"
+echo "$OUT" | grep -q 'did NOT clear' && ok "message: $OUT" || bad "output: $OUT"
 [ -f "$(FL)" ] && bad "flag left behind" || ok "flag consumed"
 sleep 2; [ -z "$(typed)" ] && ok "nothing typed" || bad "typed: $(typed)"
 
@@ -113,6 +113,16 @@ echo "== T10: arm-clear inside the test pane with the right session -> mode=tmux
 new_case match
 OUT=$(TMUX_PANE="$PANE" CLAUDE_CODE_SESSION_ID=$A CLAUDE_PID=$$ "$PY" "$R/bin/save-clear" arm-clear)
 echo "$OUT" | grep -q "mode=tmux target=$PANE" && [ -f "$(FL)" ] && ok "$(echo "$OUT" | head -1)" || bad "output: $OUT"
+
+echo "== T10b: arm-clear with an inherited app entrypoint, in a pane that runs this session -> mode=tmux"
+new_case match
+OUT=$(TMUX_PANE="$PANE" CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_SESSION_ID=$A CLAUDE_PID=$$ "$PY" "$R/bin/save-clear" arm-clear)
+echo "$OUT" | grep -q "mode=tmux target=$PANE" && [ -f "$(FL)" ] && ok "$(echo "$OUT" | head -1)" || bad "output: $OUT"
+
+echo "== T10c: inherited app entrypoint, pane runs another session -> mode=app, no flag"
+new_case mismatch
+OUT=$(TMUX_PANE="$PANE" CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_SESSION_ID=$A CLAUDE_PID=$$ "$PY" "$R/bin/save-clear" arm-clear)
+echo "$OUT" | grep -q "mode=app" && [ ! -f "$(FL)" ] && ok "$(echo "$OUT" | head -1)" || bad "output: $OUT"
 
 echo "== T11: arm-clear in the test pane, but it runs another session -> falls back to manual, no flag"
 new_case mismatch

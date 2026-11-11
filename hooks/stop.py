@@ -87,20 +87,21 @@ def main():
         drop_flag()
         refuse("the iTerm2 mode was removed: an empty prompt cannot be checked there")
     if flag.get("mode") == "tmux" and not job:
+        # A non-cli entrypoint here is usually inherited from a tmux server started by an app session. The
+        # pane is then trusted only when the check positively proves it runs this session (unknown = refuse).
         ep = os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli"
-        if ep != "cli":
-            drop_flag()
-            refuse(f"this session is {ep}, not a terminal; the {flag['mode']} target {flag.get('target')} "
-                   "would be another session")
         try:
             chk = subprocess.run([sys.executable, os.path.join(BIN, "save-clear-send"), "--check", flag["mode"],
                                   flag.get("target") or "", flag.get("session_id") or ""],
                                  capture_output=True, text=True, timeout=7)
-            if chk.returncode == 1:
+            if chk.returncode == 1 or (ep != "cli" and chk.returncode != 0):
                 drop_flag()
-                refuse(chk.stdout.strip() or f"target {flag.get('target')} does not run this session")
+                refuse(chk.stdout.strip() or f"target {flag.get('target')} does not run this session ({ep})")
         except subprocess.TimeoutExpired:
-            pass  # unknown for now: the helper checks again before every key
+            if ep != "cli":
+                drop_flag()
+                refuse(f"this session is {ep} and target {flag.get('target')} could not be checked in time")
+            # cli: unknown for now; the helper checks again before every key
 
     deltas = int(flag.get("deltas") or 0)
     fresh = user_messages_since(hook.get("transcript_path"), int(flag.get("ts") or 0) - MARGIN_MS)

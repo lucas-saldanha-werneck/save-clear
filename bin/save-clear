@@ -102,11 +102,17 @@ def cmd_arm_clear(args):
     pid = env.get("CLAUDE_PID") or str(os.getppid())
     tty = tty_of(pid)
     target, note = "", ""
+    pane_ok = False
+    if ep != "cli" and not env.get("CLAUDE_JOB_DIR") and env.get("TMUX_PANE") and tmux_bin() and sid:
+        # A terminal Claude can inherit an app entrypoint (a tmux server started from a desktop app session
+        # keeps CLAUDE_CODE_ENTRYPOINT=claude-desktop for every pane). The pane wins only when the check
+        # proves it runs THIS session; otherwise TMUX_PANE is an app's stale one and nothing is typed there.
+        pane_ok = check("tmux", env["TMUX_PANE"], sid)[0] == 0
     if env.get("CLAUDE_JOB_DIR"):
         mode, target = "bg", os.path.basename(env["CLAUDE_JOB_DIR"])
         if not tmux_bin():
             mode, note = "manual", "background session, but tmux is not installed"
-    elif ep != "cli":
+    elif ep != "cli" and not pane_ok:
         # Desktop app, IDE, SDK: an inherited TMUX_PANE points at ANOTHER session. Never type there.
         mode = "app"
     elif env.get("TMUX_PANE") and tmux_bin():
@@ -118,7 +124,7 @@ def cmd_arm_clear(args):
     else:
         mode = "manual"
         note = "no tmux and no iTerm2 to type into"
-    if mode == "tmux":
+    if mode == "tmux" and not pane_ok:
         if not sid:
             mode, note = "manual", "no session id to check the target with"
         else:
