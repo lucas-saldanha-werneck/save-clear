@@ -2115,6 +2115,25 @@ class RcClear(Base):
         self.assertIn(f"RCON {APP}: call", r.stdout)
         self.assertNotIn("TEXT: hello", r.stdout)
         self.assertNotIn("send_message session_id", r.stdout)
+        # the resume still waits for the clear, without the rc_on mark
+        resume = self.job()
+        self.assertEqual((resume["message"], resume["after_clear"]), ("hello", APP))
+        self.assertNotIn("rc_on", resume)
+        with open(self.env["SAVE_CLEAR_APP_LOG"], "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + f" [info] Clearing session {APP}\n")
+        r = self.relay("listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="2",
+                       SAVE_CLEAR_RELAY_RC_MAX="0")
+        self.assertIn("TEXT: hello", r.stdout)
+        self.assertNotIn("RCON", r.stdout)
+
+    def test_rc_on_with_the_relay_off_keeps_it_on(self):
+        self.app_row(remoteControlUserEnabled=True)
+        self.heartbeat()
+        self.relay("off")
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("RC-KEEP", r.stdout)
+        self.assertNotIn("RC-OFF-SELF", r.stdout)
 
     def test_job_without_rc_on_has_no_rcon(self):
         self.relay("job", "--to", APP, "--message", "hello")

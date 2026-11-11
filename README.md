@@ -353,8 +353,9 @@ switched on in the app (by you or a tool), `request` sees it in the app's sessio
 the relay is listening, prints `RC-OFF-SELF`: the session turns its own Remote Control off right before
 `clear_session`, and the relay turns it back on (`set_remote_control ... enabled: true`, then
 `save-clear-relay rc-on-ack`) right after it sends the resume. If the clear never shows up in the app
-log within 3 minutes (`SAVE_CLEAR_RELAY_RC_MAX`), the relay turns Remote Control back on anyway, without
-a resume. A session started from Remote Control (phone or claude.ai) has its switch locked by the app,
+log within 3 minutes (`SAVE_CLEAR_RELAY_RC_MAX`), the relay turns Remote Control back on anyway; the
+resume keeps waiting for the clear (up to 15 minutes). It turns it off only when the listener beat in
+the last 15 seconds. A session started from Remote Control (phone or claude.ai) has its switch locked by the app,
 so it is never cleared by a tool: `request` prints `RC-LOCKED` and the skill says "You can /clear now."
 When the relay is not listening it prints `RC-KEEP` and nothing is turned off.
 
