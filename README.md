@@ -279,9 +279,16 @@ only when all of these hold:
 - the session has not armed its own `/clear`, and did not arm a resume in the last 15 minutes;
 - after an automatic resume, the context grew 40k tokens or more (a freshly resumed session is not
   saved again every hour);
-- it did not already act during this idle stretch. A stretch ends when the transcript changes, so
-  if the session later sits idle again without having cleared, it asks again. If it pressed Enter
-  and the session wrote nothing at all, it logs `no-response` once and does not type again;
+- it did not already act during this idle stretch (a stretch ends when the transcript changes). If
+  it pressed Enter and the session wrote nothing at all, it logs `no-response` once and does not
+  type again;
+- the session was not already asked with nothing from you after it. A session that was asked and
+  still has the same id did not clear (a usage limit, a failed `/clear`, or the same session open
+  in several panes, which share one transcript); asking again every hour would only save the same
+  context again. It asks again after you write something there;
+- it did not already ask this session id twice. A `/clear` gives the session a new id, so two
+  requests on one id mean it did not clear twice: it logs `gave-up`, runs your notify command once
+  and leaves that session alone;
 - the session runs in a tmux pane, that pane runs exactly this session, and the prompt is empty.
   Right before Enter it checks again that the session is idle and the prompt holds exactly the typed
   text. If not, it does not press Enter, erases its text if the prompt still holds exactly that, and
@@ -367,7 +374,7 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
 
 ## Limits
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 134 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 136 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
   (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. On Windows, CI runs the unit tests

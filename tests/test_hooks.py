@@ -1106,16 +1106,64 @@ class IdleTrigger(Base):
         self.assertEqual(len(self.typed()), 2, "no second request in the same idle stretch")
 
     @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
-    def test_acts_again_in_a_later_idle_stretch_within_the_hour(self):
+    def test_asks_again_only_after_the_user_wrote_something(self):
         p = self.session(idle_min=55)
         self.idle()
         self.assertEqual(len(self.typed()), 2)
         self.assertIn("sent_at", self.mark())
-        # The request landed (transcript changed), the session did not clear, and it sat idle again.
-        self.session(idle_min=51)
+        self.assertEqual(self.mark()["asks"], 1)
+        # The request landed (transcript changed), the session did not clear (a usage limit, or the same
+        # session open in another pane) and it sat idle again: the same context is not saved twice.
+        asked = {"type": "user", "message": {"content": self.typed()[0][4]}}
+        limit = {"type": "assistant", "message": {"content": [{"type": "text", "text": "usage limit reached"}],
+                                                  "usage": {"input_tokens": 0}}}
+        hook = {"type": "user", "isMeta": True, "message": {"content": "Stop hook feedback: check it"}}
+        tool = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}
+        self.session(idle_min=51, rows=[asked, limit, hook, tool])
         self.idle()
-        self.assertEqual(len(self.typed()), 4, "a new idle stretch gets a new request")
+        self.assertEqual(len(self.typed()), 2, "no new request while the user wrote nothing")
+        self.assertIn("already asked to save and the user wrote nothing since", self.log_text())
+        self.assertEqual(self.mark()["asks"], 1, "the count survives a skipped stretch")
+        # The user came back, wrote, and left again: a new request.
+        self.session(idle_min=51, rows=[asked, limit, {"type": "user", "message": {"content": "go on with the tests"}}])
+        self.idle()
+        self.assertEqual(len(self.typed()), 4, "a new idle stretch after the user's message gets a new request")
+        self.assertEqual(self.mark()["asks"], 2)
         self.assertTrue(os.path.exists(p))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_queued_message_counts_as_the_user_writing(self):
+        self.session(idle_min=55)
+        self.idle()
+        asked = {"type": "user", "message": {"content": self.typed()[0][4]}}
+        queued = {"type": "queue-operation", "operation": "enqueue", "content": "one more thing"}
+        self.session(idle_min=51, rows=[asked, queued])
+        self.idle()
+        self.assertEqual(len(self.typed()), 4)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_gives_up_and_notifies_once_after_two_requests(self):
+        out = os.path.join(self.t, "notified.txt")
+        script = os.path.join(self.t, "notify.py")
+        with open(script, "w") as f:
+            f.write("import sys\nopen(sys.argv[1], 'a', encoding='utf-8').write(sys.argv[2] + '\\n')\n")
+        with open(os.path.join(self.t, "user-config.json"), "w") as f:
+            json.dump({"notify_command": f"{PY} {script} {out}"}, f)
+        self.session(idle_min=55)
+        self.idle()
+        asked = {"type": "user", "message": {"content": self.typed()[0][4]}}
+        words = {"type": "user", "message": {"content": "keep going"}}
+        self.session(idle_min=51, rows=[asked, words])
+        self.idle()
+        self.assertEqual(len(self.typed()), 4, "second request")
+        for _ in range(2):  # two more idle stretches, each after a message from the user
+            self.session(idle_min=51, rows=[asked, words, asked, words])
+            self.idle()
+        self.assertEqual(len(self.typed()), 4, "never a third request on the same session id")
+        self.assertEqual(self.log_text().count('"gave-up"'), 1)
+        self.assertTrue(self.mark()["gave_up"])
+        self.assertEqual(len(read_text(out).splitlines()), 1, "notified once")
+        self.assertIn("did not clear", read_text(out))
 
     @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
     def test_no_response_is_logged_once_and_not_retyped(self):
