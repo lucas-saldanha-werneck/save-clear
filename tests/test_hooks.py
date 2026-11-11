@@ -1958,5 +1958,79 @@ class SeedConfig(Base):
             self.assertEqual((a.returncode, a.stdout), (b.returncode, b.stdout))
 
 
+class RcIdleOff(Base):
+    """The relay turns Remote Control off for sessions idle past `rc_idle_off_hours`."""
+
+    def relay(self, *args, **env):
+        return self.run_py("bin/save-clear-relay", args, **env)
+    IDLE = "local_33333333-3333-3333-3333-333333333333"      # RC on, last message 30 h ago
+    NEVER = "local_44444444-4444-4444-4444-444444444444"     # RC on, no message, created 48 h ago
+    RECENT = "local_55555555-5555-5555-5555-555555555555"    # RC on, last message 1 h ago
+    RC_OFF = "local_66666666-6666-6666-6666-666666666666"    # RC off, idle
+    KEPT = "local_77777777-7777-7777-7777-777777777777"      # RC on, idle, in the keep-on file
+    GONE = "local_88888888-8888-8888-8888-888888888888"      # RC on, idle, archived
+
+    def setUp(self):
+        super().setUp()
+        t = os.path.dirname(self.state)
+        self.sessions = os.path.join(t, "app-sessions", "acct", "org")
+        os.makedirs(self.sessions)
+        now_ms = time.time() * 1000
+        h = 3600 * 1000
+        rows = [(self.IDLE, True, now_ms - 30 * h, now_ms - 60 * h, False),
+                (self.NEVER, True, None, now_ms - 48 * h, False),
+                (self.RECENT, True, now_ms - 1 * h, now_ms - 60 * h, False),
+                (self.RC_OFF, False, now_ms - 30 * h, now_ms - 60 * h, False),
+                (self.KEPT, True, now_ms - 30 * h, now_ms - 60 * h, False),
+                (self.GONE, True, now_ms - 30 * h, now_ms - 60 * h, True),
+                (RELAY_ID, True, now_ms - 30 * h, now_ms - 60 * h, False)]
+        for sid, rc, last, created, gone in rows:
+            row = {"sessionId": sid, "title": sid[-4:], "remoteControlUserEnabled": rc,
+                   "createdAt": created, "isArchived": gone}
+            if last is not None:
+                row["latestUserFrameAt"] = last
+            with open(os.path.join(self.sessions, sid + ".json"), "w") as f:
+                json.dump(row, f)
+        keep = os.path.join(t, "keep-on.json")
+        with open(keep, "w") as f:
+            json.dump({"session_ids": [self.KEPT]}, f)
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "relay.json"), "w") as f:
+            json.dump({"local_id": RELAY_ID}, f)
+        self.env.update(SAVE_CLEAR_APP_SESSIONS=os.path.dirname(os.path.dirname(self.sessions)),
+                        SAVE_CLEAR_RC_KEEP_ON=keep, SAVE_CLEAR_RC_IDLE_OFF_HOURS="24")
+
+    def test_dry_run_lists_only_idle_sessions_with_rc_on(self):
+        r = self.relay("rc-sweep", "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout)
+        self.assertEqual(got["rc_idle_off_hours"], 24.0)
+        self.assertEqual(sorted(c["id"] for c in got["candidates"]), sorted([self.IDLE, self.NEVER]))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "rc-off.json")))
+
+    def test_sweep_hands_out_once_until_acked(self):
+        first = self.relay("rc-sweep")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stdout.count("RCOFF "), 2)
+        self.assertIn(f"session_id={self.IDLE} enabled=false", first.stdout)
+        self.assertIn(f"rc-ack {self.NEVER} ok", first.stdout)
+        again = self.relay("rc-sweep")
+        self.assertEqual(again.stdout.strip(), "NONE")           # handed out, not acked yet
+        self.assertEqual(self.relay("rc-ack", self.IDLE, "ok").returncode, 0)
+        third = self.relay("rc-sweep")
+        self.assertEqual(third.stdout.count("RCOFF "), 1)         # acked, still on: handed again
+        self.assertIn(self.IDLE, third.stdout)
+
+    def test_off_when_the_setting_is_empty(self):
+        self.env["SAVE_CLEAR_RC_IDLE_OFF_HOURS"] = ""
+        r = self.relay("rc-sweep")
+        self.assertTrue(r.stdout.startswith("OFF"), r.stdout)
+        self.assertEqual(json.loads(self.relay("rc-sweep", "--dry-run").stdout)["candidates"], [])
+
+    def test_rc_ack_needs_an_id_and_a_result(self):
+        self.assertEqual(self.relay("rc-ack", "nope", "ok").returncode, 1)
+        self.assertEqual(self.relay("rc-ack", self.IDLE, "maybe").returncode, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

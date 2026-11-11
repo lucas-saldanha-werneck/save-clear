@@ -126,6 +126,7 @@ OPTIONS = {
     "relay": "SAVE_CLEAR_RELAY",
     "relay_model": "SAVE_CLEAR_RELAY_MODEL",
     "relay_title": "SAVE_CLEAR_RELAY_TITLE",
+    "rc_idle_off_hours": "SAVE_CLEAR_RC_IDLE_OFF_HOURS",
 }
 
 # Your own settings, outside the plugin folder: they survive plugin updates and reinstalls.
