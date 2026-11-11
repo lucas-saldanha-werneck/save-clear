@@ -2032,5 +2032,108 @@ class RcIdleOff(Base):
         self.assertEqual(self.relay("rc-ack", self.IDLE, "maybe").returncode, 1)
 
 
+class RcClear(Base):
+    """A session with Remote Control on: the app will not clear it, so it turns its own Remote Control
+    off right before clear_session and the relay turns it back on after the resume."""
+
+    def relay(self, *args, **env):
+        return self.run_py("bin/save-clear-relay", args, **env)
+
+    def setUp(self):
+        super().setUp()
+        t = os.path.dirname(self.state)
+        self.sessions = os.path.join(t, "app-sessions", "acct", "org")
+        os.makedirs(self.sessions)
+        self.env.update(SAVE_CLEAR_APP_SESSIONS=os.path.dirname(os.path.dirname(self.sessions)),
+                        SAVE_CLEAR_APP_LOG=os.path.join(t, "main.log"))
+        self.relay("setup", RELAY_ID)
+
+    def app_row(self, **fields):
+        row = {"sessionId": APP, "title": "app", "isArchived": False}
+        row.update(fields)
+        with open(os.path.join(self.sessions, APP + ".json"), "w") as f:
+            json.dump(row, f)
+
+    def heartbeat(self):
+        with open(os.path.join(self.state, "relay-listener.alive"), "w") as f:
+            f.write(f"{os.getpid()} {int(time.time())}\n")
+
+    def job(self):
+        d = os.path.join(self.state, "relay-inbox")
+        [name] = [f for f in os.listdir(d) if f.endswith(".json")]
+        with open(os.path.join(d, name)) as f:
+            return json.load(f)
+
+    def test_rc_on_and_listening_turns_itself_off(self):
+        self.app_row(remoteControlUserEnabled=True)
+        self.heartbeat()
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("RC-OFF-SELF", r.stdout)
+        self.assertIn("session_id=self enabled=false", r.stdout)
+        self.assertTrue(self.job().get("rc_on"))
+
+    def test_rc_on_but_relay_not_listening_keeps_it_on(self):
+        self.app_row(remoteControlUserEnabled=True)
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("RC-KEEP", r.stdout)
+        self.assertNotIn("RC-OFF-SELF", r.stdout)
+        self.assertFalse(self.job().get("rc_on"))
+
+    def test_started_from_remote_control_is_locked(self):
+        self.app_row(remoteControlUserEnabled=None, remoteControlSpawn={"ccrSessionId": "cse_x"})
+        self.heartbeat()
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertIn("RC-LOCKED", r.stdout)
+        self.assertNotIn("RC-OFF-SELF", r.stdout)
+        self.assertFalse(self.job().get("rc_on"))
+
+    def test_rc_off_prints_nothing_about_it(self):
+        self.app_row(remoteControlUserEnabled=False)
+        self.heartbeat()
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("RC-", r.stdout)
+
+    def test_listener_turns_it_back_on_after_the_resume(self):
+        self.relay("job", "--to", APP, "--message", "hello", "--after-clear", APP, "--rc-on")
+        with open(self.env["SAVE_CLEAR_APP_LOG"], "w") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + f" [info] Clearing session {APP}\n")
+        r = self.relay("listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="2")
+        self.assertIn("TEXT: hello", r.stdout)
+        self.assertIn(f"RCON {APP}: after the send_message", r.stdout)
+        self.assertIn(f"session_id={APP} enabled=true", r.stdout)
+        self.assertLess(r.stdout.index("TEXT: hello"), r.stdout.index("RCON "))
+
+    def test_no_clear_turns_it_back_on_without_a_resume(self):
+        self.relay("job", "--to", APP, "--message", "hello", "--after-clear", APP, "--rc-on")
+        with open(self.env["SAVE_CLEAR_APP_LOG"], "w") as f:
+            f.write("2026-01-01 00:00:00 [info] nothing\n")
+        r = self.relay("listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="2",
+                       SAVE_CLEAR_RELAY_RC_MAX="0")
+        self.assertIn(f"RCON {APP}: call", r.stdout)
+        self.assertNotIn("TEXT: hello", r.stdout)
+        self.assertNotIn("send_message session_id", r.stdout)
+
+    def test_job_without_rc_on_has_no_rcon(self):
+        self.relay("job", "--to", APP, "--message", "hello")
+        r = self.relay("listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="2")
+        self.assertIn("TEXT: hello", r.stdout)
+        self.assertNotIn("RCON", r.stdout)
+
+    def test_rc_on_ack(self):
+        self.assertEqual(self.relay("rc-on-ack", "nope", "ok").returncode, 1)
+        self.assertEqual(self.relay("rc-on-ack", APP, "maybe").returncode, 1)
+        self.assertEqual(self.relay("rc-on-ack", APP, "ok").returncode, 0)
+        with open(os.path.join(self.state, "relay.log")) as f:
+            self.assertIn(f"rc on ok: {APP}", f.read())
+
+    def test_rules_allow_turning_on_only_the_rcon_session(self):
+        out = self.relay("rules").stdout
+        self.assertIn("RCON <id>", out)
+        self.assertIn("rc-on-ack", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -127,6 +127,12 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
      2. **Ask the relay for the resume.** Run
         `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear-relay" request`:
         - exit **0**: the relay is listening; it sends the resume right after the clear.
+        - It may also print one Remote Control line (the app never clears a session while its Remote
+          Control is on):
+          - `RC-OFF-SELF`: do what it says in sub-step 3: turn this session's Remote Control off right
+            before `clear_session`. The relay turns it back on after the resume.
+          - `RC-KEEP` or `RC-LOCKED`: leave Remote Control alone, skip `clear_session`, and reply
+            "You can /clear now." The summary comes back after the /clear.
         - exit **2**: queued, but the relay is not listening. Wake it: `send_message` to the relay id
           with the exact text printed on stderr ("no sign of starting within 20s" is a false alarm on a
           cold start). If that fails, say the resume arrives with the user's next message.
@@ -136,9 +142,12 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
           user's next message; say so, with the reason it printed.
         - exit **1** saying "this session IS the relay": stop here and follow only the "Context full"
           part of `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear-relay" rules`.
-     3. Write the step 7 reply, then call `clear_session` with `session_id: "self"` as the very last
-        action. The app clears only this session when the turn ends. If it refuses, change the reply to
-        "You can /clear now."
+     3. Write the step 7 reply (after `RC-OFF-SELF`, add: "Remote Control drops for a moment and comes
+        back with the summary."). Then, as the very last actions: if `request` printed `RC-OFF-SELF`,
+        call `mcp__ccd_session_mgmt__set_remote_control` with `session_id: "self"`, `enabled: false`;
+        then call `clear_session` with `session_id: "self"`. The app clears only this session when the
+        turn ends. If `clear_session` refuses, turn Remote Control back on at once (`enabled: true`) when
+        you turned it off, and change the reply to "You can /clear now."
 
    **Busy session (kill_background_tasks on).** If the helper found the session still busy, the Stop
    hook blocks once and asks you to stop this session's leftover background tasks and list them in the
