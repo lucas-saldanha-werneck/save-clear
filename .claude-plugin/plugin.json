@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Saves decisions and next steps, clears the context, and the next session starts from them.",
   "author": {
     "name": "Lucas Saldanha Werneck",
@@ -137,6 +137,12 @@
       "type": "string",
       "title": "Relay session title (optional)",
       "description": "Title of the relay session the plugin creates. Empty = Don't touch it, relay",
+      "default": ""
+    },
+    "rc_idle_off_hours": {
+      "type": "string",
+      "title": "Turn idle Remote Control off (hours, optional)",
+      "description": "Desktop app, relay only: once an hour the relay turns Remote Control off for sessions with no message from you for this many hours. Empty or 0 = off.",
       "default": ""
     }
   }

@@ -124,6 +124,7 @@ it, and an existing file is never overwritten, so edit it freely.
 | `relay` | `SAVE_CLEAR_RELAY` | `auto` | Desktop app only. `auto`: the first save-and-clear in an app session creates the relay session when there is none, or when the configured one is archived. `off`: never create one (a relay you set up yourself still works; `save-clear-relay off` turns that off too). See [Desktop app relay](#desktop-app-relay) |
 | `relay_model` | `SAVE_CLEAR_RELAY_MODEL` | `haiku` | Model of the relay session the plugin creates |
 | `relay_title` | `SAVE_CLEAR_RELAY_TITLE` | `Don't touch it, relay` | Title of the relay session the plugin creates |
+| `rc_idle_off_hours` | `SAVE_CLEAR_RC_IDLE_OFF_HOURS` | off | Desktop app: once an hour the relay turns Remote Control off for sessions with no message from you for this many hours (the relay itself and sessions in `~/.claude/rc-auto-keep-on.json` stay on). `save-clear-relay rc-sweep --dry-run` lists them |
 | (none) | `SAVE_CLEAR_LAUNCHD_PREFIX` | `com.claude-tools` | Idle trigger only: prefix of the launchd job label (`<prefix>.save-clear-idle`) |
 | (none) | `SAVE_CLEAR_STATE_DIR` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/state/save-clear` | Flags, relay inbox and the logs `save-clear.log` and `relay.log` |
 

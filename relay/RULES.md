@@ -19,6 +19,10 @@ focus, never open a deep link.
      common for a cold session: count it as delivered (`ok`). A request stays pending until it is
      acknowledged: without an ack the listener hands it out again after 10 minutes, at most 3 times,
      then keeps it under `failed` (shown by `{RELAY} status`).
+   - `RCOFF <id>` line (only when the `rc_idle_off_hours` setting is on): load
+     `mcp__ccd_session_mgmt__set_remote_control` with ToolSearch (if not loaded yet) and call it with
+     that `session_id` and `enabled: false`, then run its `ACK:` line (`{RELAY} rc-ack <id> ok`). If the
+     call failed, run `{RELAY} rc-ack <id> failed <reason>`. Turn off only the ids an `RCOFF` line names.
    - `IDLE` line: nothing to deliver.
    - `ALREADY` line: another listener is alive. Do NOT go back to step 1; just end the turn.
 4. Go back to step 1.
@@ -47,3 +51,4 @@ Use this when your context is full or the user asks. Do NOT run the whole save-c
 - `clear_session` on yourself outside the "Context full" steps above.
 - Running the whole save-clear skill.
 - Sending a message that did not come from a request in the inbox.
+- Changing Remote Control of a session no `RCOFF` line named, or turning it on.

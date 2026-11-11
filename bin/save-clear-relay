@@ -18,6 +18,10 @@ its own, and nothing is ever typed into a text box.
   save-clear-relay job --to local_<id> [--message TEXT] [--after-clear local_<id>] [--in S] [--why W]
   save-clear-relay listen               the relay's listener (run in the background by the relay)
   save-clear-relay ack <name> ok|failed the relay reports a delivery; a request stays pending until then
+  save-clear-relay rc-sweep [--dry-run] sessions with Remote Control on and no message from the person
+                                        for `rc_idle_off_hours` (0/empty = off); without --dry-run, hands
+                                        them out as RCOFF lines, like the listener does once an hour
+  save-clear-relay rc-ack <id> ok|failed  the relay reports turning a session's Remote Control off
   save-clear-relay clear-count          how many clears of the relay the app log shows
   save-clear-relay wait-clear --base N  the waker waits until the relay's clear shows up in the app log
 
@@ -637,10 +641,126 @@ def cmd_listen():
                   f"Without an ack a request is handed out again after {int(CLAIM_S)} s, "
                   f"at most {MAX_ATTEMPTS} times.")
             return 0
+        due = rc_due()
+        if due:
+            print_rc(due)
+            return 0
         if time.time() - start > MAXWAIT:
             print("IDLE")
             return 0
         time.sleep(POLL)
+
+
+RC_SWEEP_S = float(os.environ.get("SAVE_CLEAR_RELAY_RC_SWEEP_S", "3600"))  # how often to look for idle RC
+RC_STATE = os.path.join(STATE, "rc-off.json")
+RC_KEEP_ON = os.path.expanduser(os.environ.get("SAVE_CLEAR_RC_KEEP_ON") or "~/.claude/rc-auto-keep-on.json")
+
+
+def rc_idle_hours():
+    """The `rc_idle_off_hours` setting: hours without a message from the person before the relay turns
+    a session's Remote Control off. 0 or empty = off."""
+    try:
+        return max(0.0, float(setting("rc_idle_off_hours", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
+def keep_on_ids():
+    """Sessions to leave on: the rc-auto keep-on file ({"session_ids": [...]} or {"local_id": ...})."""
+    v = read_json(RC_KEEP_ON)
+    ids = set()
+    if isinstance(v, dict):
+        ids.update(x for x in (v.get("session_ids") or []) if isinstance(x, str))
+        if isinstance(v.get("local_id"), str):
+            ids.add(v["local_id"])
+    return ids
+
+
+def rc_candidates(now=None):
+    """Desktop sessions with Remote Control on and no message from the person for rc_idle_off_hours.
+    The last message is the app's `latestUserFrameAt`; a session that never got one counts from its
+    `createdAt`. The relay itself and the keep-on sessions are left alone."""
+    hours = rc_idle_hours()
+    if hours <= 0:
+        return []
+    now = now or time.time()
+    skip = keep_on_ids() | {relay_id()}
+    out = []
+    for p in glob.glob(os.path.join(glob.escape(app_sessions_dir()), "**", "local_*.json"), recursive=True):
+        v = read_json(p)
+        if not isinstance(v, dict) or v.get("isArchived") or not v.get("remoteControlUserEnabled"):
+            continue
+        sid = v.get("sessionId") or ""
+        if not ID_RE.fullmatch(sid) or sid in skip:
+            continue
+        last = float(v.get("latestUserFrameAt") or v.get("createdAt") or 0) / 1000
+        idle = now - last
+        if idle >= hours * 3600:
+            out.append({"id": sid, "title": v.get("title", ""), "idle_hours": round(idle / 3600, 1)})
+    return sorted(out, key=lambda c: -c["idle_hours"])
+
+
+def rc_state():
+    v = read_json(RC_STATE)
+    if not isinstance(v, dict):
+        v = {}
+    v.setdefault("last_sweep", 0)
+    v.setdefault("handed", {})
+    return v
+
+
+def rc_due(now=None, force=False):
+    """Candidates to hand to the relay now: the sweep is due (or forced) and none was handed out
+    within CLAIM_S."""
+    now = now or time.time()
+    st = rc_state()
+    if rc_idle_hours() <= 0 or (not force and now - float(st["last_sweep"]) < RC_SWEEP_S):
+        return []
+    st["last_sweep"] = now
+    fresh = {k: t for k, t in st["handed"].items() if now - float(t) < CLAIM_S}
+    due = [c for c in rc_candidates(now) if c["id"] not in fresh]
+    for c in due:
+        fresh[c["id"]] = now
+    st["handed"] = fresh
+    write_json(RC_STATE, st)
+    return due
+
+
+def print_rc(due):
+    for c in due:
+        print(f"RCOFF {c['id']} ({c['title']}, {c['idle_hours']} h without a message from the person)")
+        print(f"  DO: mcp__ccd_session_mgmt__set_remote_control session_id={c['id']} enabled=false")
+        print(f"  ACK: {CMD} rc-ack {c['id']} ok")
+        print(f"  (if it failed: {CMD} rc-ack {c['id']} failed <reason>)")
+        rlog(f"rc off handed to the relay: {c['id']} ({c['idle_hours']} h idle)")
+    print("  THEN: run the ACK line of each RCOFF; start the listener again in the background.")
+
+
+def cmd_rc_sweep(args):
+    ap = argparse.ArgumentParser(prog="save-clear-relay rc-sweep")
+    ap.add_argument("--dry-run", action="store_true", help="list the candidates; record nothing")
+    a = ap.parse_args(args)
+    hours = rc_idle_hours()
+    if a.dry_run:
+        print(json.dumps({"rc_idle_off_hours": hours, "candidates": rc_candidates()}, indent=2))
+        return 0
+    due = rc_due(force=True)  # a manual sweep does not wait for the hour
+    if due:
+        print_rc(due)
+    else:
+        print("NONE" if hours > 0 else "OFF (rc_idle_off_hours is 0 or empty)")
+    return 0
+
+
+def cmd_rc_ack(args):
+    if len(args) < 2 or not ID_RE.fullmatch(args[0]) or args[1] not in ("ok", "failed"):
+        print("usage: save-clear-relay rc-ack <local_id> ok|failed [reason]", file=sys.stderr)
+        return 1
+    st = rc_state()
+    st["handed"].pop(args[0], None)
+    write_json(RC_STATE, st)
+    rlog(f"rc off {args[1]}: {args[0]}" + (f" ({' '.join(args[2:])})" if args[2:] else ""))
+    return 0
 
 
 def clear_count(rid):
@@ -701,6 +821,10 @@ def main(argv):
         return cmd_listen()
     if cmd == "ack":
         return cmd_ack(args)
+    if cmd == "rc-sweep":
+        return cmd_rc_sweep(args)
+    if cmd == "rc-ack":
+        return cmd_rc_ack(args)
     if cmd == "clear-count":
         print(clear_count(relay_id()))
         return 0
