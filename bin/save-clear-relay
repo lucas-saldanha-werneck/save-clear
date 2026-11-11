@@ -78,6 +78,7 @@ AFTER_CLEAR_MAX = 900  # 15 min without the target's clear: drop the request
 # A request made with Remote Control on: the session turned its own Remote Control off to be cleared.
 # Without its clear in this many seconds, the relay turns Remote Control back on anyway (no resume).
 AFTER_CLEAR_RC_MAX = float(os.environ.get("SAVE_CLEAR_RELAY_RC_MAX", "180"))
+RC_ALIVE_S = 15  # a session turns its Remote Control off only when the listener beat this recently
 POLL = float(os.environ.get("SAVE_CLEAR_RELAY_POLL", "3"))
 MAXWAIT = float(os.environ.get("SAVE_CLEAR_RELAY_MAXWAIT", str(6 * 3600)))  # exit so the relay re-arms
 GRACE = float(os.environ.get("SAVE_CLEAR_RELAY_GRACE", "60"))  # app log missing: deliver after this
@@ -164,13 +165,13 @@ def relay_id():
     return v.get("local_id", "") if isinstance(v, dict) else ""
 
 
-def listening():
+def listening(max_age=ALIVE_S):
     try:
         with open(ALIVE, encoding="utf-8") as f:
             pid, t = f.read().split()
         if os.name != "nt":
             os.kill(int(pid), 0)
-        return time.time() - int(t) < ALIVE_S
+        return time.time() - int(t) < max_age
     except Exception:
         return False
 
@@ -244,7 +245,7 @@ def cmd_request():
         return 1
     rc = rc_self(me)
     # Turn Remote Control off only while the relay is listening: it is the one that turns it back on.
-    rc_off = rc == "on" and listening()
+    rc_off = rc == "on" and listening(RC_ALIVE_S)
     code = enqueue(me, resume_msg(), after_clear=me, why="save-clear", rc_on=rc_off)
     if code == 0 and rc_off:
         print("RC-OFF-SELF: Remote Control is on here, and the app does not clear a session while it is on. "
@@ -252,8 +253,8 @@ def cmd_request():
               "session_id=self enabled=false. If clear_session is refused, turn it back on at once "
               "(enabled=true). After the clear the relay sends the resume and turns Remote Control back on "
               f"(by itself after {int(AFTER_CLEAR_RC_MAX)} s if the clear never comes).")
-    elif rc == "on" and code == 2:
-        print("RC-KEEP: Remote Control is on here and the relay is not listening, so nothing could turn it "
+    elif rc == "on":
+        print("RC-KEEP: Remote Control is on here and the relay is not listening (or is off), so nothing could turn it "
               "back on after a clear. Leave it on, do not call clear_session, and reply \"You can /clear now.\"")
     elif rc == "locked":
         print("RC-LOCKED: this session was started from Remote Control; the app locks its Remote Control "
@@ -582,11 +583,17 @@ def ready(path):
             return False
         if not done:
             if job.get("rc_on") and time.time() - created > AFTER_CLEAR_RC_MAX:
+                # Turn Remote Control back on now (a job of its own); the resume keeps waiting for the
+                # clear, up to AFTER_CLEAR_MAX, without the rc_on mark.
                 rlog(f"{os.path.basename(path)}: no clear of {ac} in {int(AFTER_CLEAR_RC_MAX)} s; "
-                     "turning its Remote Control back on, no resume")
-                job.update(after_clear=None, rc_only=True)
+                     "turning its Remote Control back on; the resume keeps waiting for the clear")
+                now = time.time()
+                rc_job = {"to": ac, "message": "", "due": now, "after_clear": None, "why": "rc-on",
+                          "created": now, "rc_on": True, "rc_only": True}
+                write_job(os.path.join(INBOX, f"{int(now * 1000)}-rc-on-{ac[6:14]}.json"), rc_job)
+                job.pop("rc_on", None)
                 write_job(path, job)
-                return True
+                return False
             if time.time() - created > AFTER_CLEAR_MAX:
                 rlog(f"{os.path.basename(path)}: no clear of {ac} in 15 min; dropped")
                 os.makedirs(FAILED, exist_ok=True)
@@ -680,7 +687,7 @@ def cmd_listen():
                 name = os.path.basename(d)
                 print(f"JOB {d}")
                 if job.get("rc_only"):
-                    print(f"  (no clear came: nothing to deliver; only turn its Remote Control back on)")
+                    print("  (no clear came: nothing to deliver; only turn its Remote Control back on)")
                 else:
                     print(f"  DO: mcp__ccd_session_mgmt__send_message session_id={job['to']} message=<the text below, exactly>")
                     print("  TEXT: " + job["message"])
