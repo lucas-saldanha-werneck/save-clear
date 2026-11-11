@@ -1105,17 +1105,153 @@ class IdleTrigger(Base):
         self.idle()
         self.assertEqual(len(self.typed()), 2, "no second request in the same idle stretch")
 
-    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
-    def test_acts_again_in_a_later_idle_stretch_within_the_hour(self):
-        p = self.session(idle_min=55)
+    # ----- a later idle stretch: ask again only after the user did something -----
+    @staticmethod
+    def at(minutes_ago):
+        return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - minutes_ago * 60))
+
+    def asked(self, minutes_ago=54):
+        """The transcript record of the request typed by the first send."""
+        return {"type": "user", "timestamp": self.at(minutes_ago), "message": {"content": self.typed()[0][4]}}
+
+    def said(self, content="go on with the tests", minutes_ago=53, **extra):
+        return dict({"type": "user", "timestamp": self.at(minutes_ago), "message": {"content": content}}, **extra)
+
+    def first_send(self):
+        self.session(idle_min=55)
         self.idle()
         self.assertEqual(len(self.typed()), 2)
-        self.assertIn("sent_at", self.mark())
-        # The request landed (transcript changed), the session did not clear, and it sat idle again.
-        self.session(idle_min=51)
+
+    def notify_file(self):
+        out = os.path.join(self.t, "notified.txt")
+        script = os.path.join(self.t, "notify.py")
+        with open(script, "w") as f:
+            f.write("import sys\nopen(sys.argv[1], 'a', encoding='utf-8').write(sys.argv[2] + '\\n')\n")
+        with open(os.path.join(self.t, "user-config.json"), "w") as f:
+            json.dump({"notify_command": f"{PY} {script} {out}"}, f)
+        return out
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_not_asked_again_while_the_user_did_nothing(self):
+        self.first_send()
+        m = self.mark()
+        self.assertIn("sent_at", m)
+        self.assertEqual((m["asked_pid"], m["pending"]), (self.PANE_PID, True))
+        # The request landed (transcript changed), the session did not clear (say, a usage limit) and
+        # it sat idle again: the same context is not saved twice. None of these rows is the user.
+        limit = {"type": "assistant", "timestamp": self.at(53.9), "message": {
+            "content": [{"type": "text", "text": "usage limit reached"}], "usage": {"input_tokens": 0}}}
+        rows = [self.asked(), limit,
+                self.said("Stop hook feedback: check it", isMeta=True),
+                self.said([{"type": "tool_result", "tool_use_id": "t", "content": "<command-name>x \"image\""}]),
+                self.said("This session is being continued from a previous conversation that ran out of context.",
+                          isCompactSummary=True),
+                self.said("in the subagent", isSidechain=True),
+                self.said("<command-name>/stack</command-name>\n<command-message>stack</command-message>",
+                          origin={"kind": "plugin", "name": "some-plugin"}),
+                {"type": "user", "timestamp": self.at(53), "promptSource": "system",
+                 "message": {"content": "<task-notification>\n<task-id>b1</task-id>"}},
+                {"type": "queue-operation", "operation": "enqueue", "timestamp": self.at(53), "content": "never mind"},
+                {"type": "queue-operation", "operation": "remove", "timestamp": self.at(52.9), "content": "never mind",
+                 "reason": "user_cancelled"}]
+        self.session(idle_min=51, rows=rows)
         self.idle()
-        self.assertEqual(len(self.typed()), 4, "a new idle stretch gets a new request")
-        self.assertTrue(os.path.exists(p))
+        self.assertEqual(len(self.typed()), 2, "no new request while the user did nothing")
+        self.assertIn("already asked to save and the user did nothing since", self.log_text())
+        m = self.mark()
+        self.assertEqual((m["fails"], "pending" in m, "gave_up" in m), (1, False, False))
+        self.session(idle_min=51, rows=rows)  # one more hour like that: still nothing, and no second failure
+        self.idle()
+        self.assertEqual((len(self.typed()), self.mark()["fails"]), (2, 1))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_asks_again_after_the_user_did_something(self):
+        image = [{"type": "image", "source": {"type": "base64", "data": "AAAA"}}]
+        for name, row in (("message", self.said()),
+                          ("queued message", {"type": "queue-operation", "operation": "enqueue",
+                                              "timestamp": self.at(53), "content": "one more thing"}),
+                          ("image", self.said(image)),
+                          ("slash command", self.said("<command-message>x</command-message>\n<command-name>/x</command-name>")),
+                          ("! command", self.said("<bash-input>ls</bash-input>")),
+                          ("interrupt", self.said([{"type": "text", "text": "[Request interrupted by user]"}]))):
+            with self.subTest(name):
+                for f in ("tmux-calls.jsonl", os.path.join("state", "idle", SID_A + ".done")):
+                    if os.path.exists(os.path.join(self.t, f)):
+                        os.unlink(os.path.join(self.t, f))
+                self.first_send()
+                self.session(idle_min=51, rows=[self.asked(), row])
+                self.idle()
+                self.assertEqual(len(self.typed()), 4, "a new idle stretch after the user gets a new request")
+                self.assertNotIn("fails", self.mark(), "a request the user answered is not a failure")
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_gives_up_and_notifies_once_after_two_requests_that_did_not_clear(self):
+        out = self.notify_file()
+        self.first_send()
+        asked1, words, asked2 = self.asked(54), self.said(minutes_ago=53), self.asked(52)
+        self.session(idle_min=51, rows=[asked1])
+        self.idle()  # failure 1: landed, nobody wrote, same process still on the same id
+        self.session(idle_min=51, rows=[asked1, words])
+        self.idle()
+        self.assertEqual(len(self.typed()), 4, "the user wrote: second request")
+        self.session(idle_min=51, rows=[asked1, words, asked2])
+        self.idle()  # failure 2
+        self.assertEqual(self.mark()["fails"], 2)
+        self.assertTrue(self.mark()["gave_up"])
+        for _ in range(2):  # the user writes again and leaves, twice: this session is left alone
+            self.session(idle_min=51, rows=[asked1, words, asked2, self.said("and now?", minutes_ago=51.5)])
+            r = self.idle("--only", SID_A)
+            self.assertIn("gave up on this session", r.stdout)
+        self.assertEqual(len(self.typed()), 4, "no third request")
+        self.assertEqual(self.log_text().count('"gave-up"'), 1)
+        self.assertEqual(len(read_text(out).splitlines()), 1, "notified once")
+        self.assertIn("stayed as it was", read_text(out))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_requests_the_user_answered_never_add_up_to_giving_up(self):
+        out = self.notify_file()
+        self.first_send()
+        rows = []
+        for n in range(1, 4):  # three more hours: each time the user wrote after the request
+            rows += [self.asked(60 - 2 * n), self.said(f"reply {n}", minutes_ago=59 - 2 * n)]
+            self.session(idle_min=51, rows=rows)
+            self.idle()
+            self.assertEqual(len(self.typed()), 2 + 2 * n)
+        self.assertNotIn("gave-up", self.log_text())
+        self.assertNotIn("fails", self.mark())
+        self.assertFalse(os.path.exists(out))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_same_session_open_in_another_pane_is_not_asked_and_is_not_a_failure(self):
+        # Pane %7 (pid 4242) was asked, saved and cleared: it now has a new id. Pane %8 (pid 4343) still
+        # runs the old id and shares its transcript, where the request and the save now are.
+        self.first_send()
+        other = 4343
+        with open(self.agents_file, "w") as f:
+            json.dump([{"kind": "interactive", "pid": other, "sessionId": SID_A, "status": "idle", "name": "copy"}], f)
+        self.session(idle_min=51, rows=[self.asked()])
+        r = self.idle("--only", SID_A, FAKE_TMUX_PANES=f"{other} %8")
+        self.assertIn("already asked in another process", r.stdout)
+        self.assertEqual(len(self.typed()), 2, "the copy is not asked to save the same context")
+        m = self.mark()
+        self.assertEqual(("fails" in m, "gave_up" in m, m["asked_pid"]), (False, False, self.PANE_PID))
+        # The user works in the copy, then leaves: now it is asked.
+        self.session(idle_min=51, rows=[self.asked(), self.said()])
+        self.idle(FAKE_TMUX_PANES=f"{other} %8")
+        typed = self.typed()
+        self.assertEqual((len(typed), typed[2][:3]), (4, ["send-keys", "-t", "%8"]))
+        self.assertEqual(self.mark()["asked_pid"], other)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_request_that_never_landed_is_not_a_failure(self):
+        out = self.notify_file()
+        for n in range(1, 4):  # Enter was pressed, but the request never reached the transcript
+            self.session(idle_min=55 - n)
+            self.idle()
+            self.assertEqual(len(self.typed()), 2 * n, "asked again in the next idle stretch")
+        self.assertNotIn("fails", self.mark())
+        self.assertNotIn("gave-up", self.log_text())
+        self.assertFalse(os.path.exists(out))
 
     @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
     def test_no_response_is_logged_once_and_not_retyped(self):

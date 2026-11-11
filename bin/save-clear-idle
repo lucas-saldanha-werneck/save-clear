@@ -21,6 +21,16 @@ It types a save-clear request into a session only when ALL of these hold:
     only re-read its summary);
   - it did not act already during this same idle stretch (a stretch ends when the transcript changes;
     a request that got no reply at all is logged once as no-response and not typed again);
+  - the transcript does not already hold an idle request with nothing from the user after it. A
+    session that was asked and still has the same id did not clear (a usage limit, a failed /clear,
+    or the same session open in several panes, which share one transcript): asking again every hour
+    only saves the same context again. It asks again once the user does something there (a message,
+    a queued message, an image, a slash or `!` command, an interrupt);
+  - it did not give up on the session. A request counts as failed when it landed, the user did
+    nothing after it, and the same process is still on the same session id (a /clear gives a new
+    id). After 2 of those (MAX_FAILS) it logs `gave-up`, runs the notify command once and leaves
+    that session alone. A request the user answered, or one typed into another process of the same
+    session, is not a failure;
   - the session runs in a tmux pane, the pane runs exactly that session, the prompt is empty, and
     right before Enter the prompt holds exactly the typed text and the session is still idle.
     Otherwise it types nothing, or does not press Enter and erases its text if the prompt still holds
@@ -49,9 +59,9 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (HOME, RESUME_MSG, STATE, resume_msg, is_resume_text, ancestors, claude_bin, clear_key, clear_path,  # noqa: E402
-                    draft_why, log as _log, now_ms, prompt_block, ps_parents, setting, short, squash, tail_lines,
-                    tmux_bin)
+from common import (HOME, RESUME_MSG, STATE, _ts_ms, resume_msg, is_resume_text, ancestors, claude_bin,  # noqa: E402
+                    clear_key, clear_path, draft_why, log as _log, notify, now_ms, prompt_block, ps_parents, setting,
+                    short, squash, tail_lines, tmux_bin, user_messages_since)
 
 DEFAULT_IDLE_MIN = 50
 WINDOW_MIN = 8            # act between idle_min and idle_min + 8 minutes ...
@@ -64,6 +74,12 @@ IDLE_DIR = os.path.join(STATE, "idle")
 MSG = ("save-clear (automatic: session idle for {m} min, context {k}k; saving before the prompt cache expires). "
        "Run the save-clear skill now in \"save and clear\" mode. If your last message was a question to the "
        "user, put that question under next steps.")
+MSG_START = MSG.split("{")[0]
+MAX_FAILS = 2             # requests that landed, with the same process still on the same session id after
+KEEP = ("fails", "gave_up", "asked_pid", "pending")  # mark fields that outlive an idle stretch
+# What the user does without writing a plain message: slash command, `!` command, interrupt, image.
+ACTIVE_STARTS = ("<command-message>", "<command-name>", "<bash-input>", "[Request interrupted")
+ACTIVE_PROBES = ACTIVE_STARTS + ('"image"',)
 
 
 def number(name, default):
@@ -194,6 +210,67 @@ def resume_baseline(tp):
         if seen and base is None and '"usage"' in line:
             base = usage_total(line)
     return base
+
+
+def _user_record(line):
+    """The parsed line when it is a top-level user message of the main conversation, else None."""
+    try:
+        d = json.loads(line)
+    except Exception:
+        return None
+    if not isinstance(d, dict) or d.get("type") != "user" or d.get("isSidechain") or d.get("isMeta"):
+        return None
+    return d
+
+
+def silent_since_request(tp):
+    """True when the transcript already holds an idle request and the user did nothing after it.
+
+    "Did something" = wrote or queued a message (common.user_messages_since: no hook or skill text,
+    tool result, compaction summary, resume request or cancelled queued message), sent an image, ran
+    a slash command or a `!` command, or interrupted (a command with a plugin as its `origin` is not
+    the user: a plugin may run one after every turn). A request without a timestamp cannot be placed
+    in time: False, so the session is asked as before."""
+    lines = tail_lines(tp, 8 * 1024 * 1024)
+    at, idx = None, -1
+    for i, line in enumerate(lines):
+        if MSG_START not in line:  # cheap filter: the text is plain ASCII, the same inside JSON
+            continue
+        d = _user_record(line)
+        c = (d.get("message") or {}).get("content") if d else None
+        if isinstance(c, str) and c.lstrip().startswith(MSG_START):
+            at, idx = _ts_ms(d), i
+    if idx < 0 or at is None:
+        return False
+    if user_messages_since(tp, at):
+        return False
+    for line in lines[idx + 1:]:
+        if not any(p in line for p in ACTIVE_PROBES):
+            continue
+        d = _user_record(line)
+        origin = d.get("origin") if d else None
+        if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+            continue  # a command a plugin ran, a task notification: not the user
+        c = (d.get("message") or {}).get("content") if d else None
+        if isinstance(c, str):
+            if c.lstrip().startswith(ACTIVE_STARTS):
+                return False
+        elif isinstance(c, list):
+            blocks = [b for b in c if isinstance(b, dict)]
+            if any(b.get("type") == "tool_result" for b in blocks):
+                continue
+            if any(b.get("type") == "image" for b in blocks):
+                return False
+            if any(str(b.get("text") or "").lstrip().startswith(ACTIVE_STARTS) for b in blocks if b.get("type") == "text"):
+                return False
+    return True
+
+
+def count(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def armed_or_saving(sid):
@@ -396,48 +473,80 @@ def main():
             continue
         info = dict(session=sid, name=ag.get("name"), cwd=ag.get("cwd"), idle_min=round(idle))
         mark = read_mark(sid)
+        keep = {k: mark[k] for k in KEEP if k in mark}
         if mark["mt"] >= mt:
             sent_at = mark.get("sent_at")
             if sent_at and not mark.get("reported") and now - float(sent_at) >= NO_REPLY_S:
                 # Enter went in but the session wrote nothing: not even our message reached it.
                 log(event="no-response", why="the request was typed and Enter pressed, but the session did not "
                                              "change since; not typing again in this idle stretch", **info)
-                write_mark(sid, mark["mt"], sent_at=sent_at, reported=True)
+                write_mark(sid, mark["mt"], sent_at=sent_at, reported=True, **keep)
             continue  # already acted (or decided to skip) during this idle stretch
         ctx = last_context(tp)
         info["ctx"] = ctx
         if ctx < MIN_TOKENS:
             log(event="skipped", why=f"context below {MIN_TOKENS}", **info)
-            write_mark(sid, mt)
+            write_mark(sid, mt, **keep)
             continue
         busy = armed_or_saving(sid)
         if busy:
             log(event="skipped", why=busy, **info)
-            write_mark(sid, mt)
+            write_mark(sid, mt, **keep)
             continue
         base = resume_baseline(tp)
         if base is not None and ctx - base < GROWTH_AFTER_RESUME:
             log(event="skipped", why=f"little new since the automatic resume ({base // 1000}k -> {ctx // 1000}k)", **info)
-            write_mark(sid, mt)
+            write_mark(sid, mt, **keep)
+            continue
+        pid = count(ag.get("pid"))
+        if silent_since_request(tp):
+            # Asked, and the user did nothing since: asking again only saves the same context again.
+            same = count(mark.get("asked_pid")) == pid
+            why = "already asked to save and the user did nothing since"
+            if not same:
+                # A /clear moves only one process to a new id; the others keep the old id and transcript.
+                why = "this session id was already asked in another process (same session open twice) and " \
+                      "the user did nothing since"
+            elif keep.pop("pending", None):
+                # The process that was asked is still on this id, and nobody stopped it: it did not clear.
+                keep["fails"] = count(mark.get("fails")) + 1
+                if keep["fails"] >= MAX_FAILS and not keep.get("gave_up"):
+                    keep["gave_up"] = True
+                    log(event="gave-up", why=f"asked {keep['fails']} times, the request landed and the session "
+                                             f"did not clear; not asking this session again", **info)
+                    if not a.dry_run:
+                        notify(f"save-clear: session {ag.get('name') or short(sid)} was asked {keep['fails']} times "
+                               f"to save and clear while idle and stayed as it was. Not asking again; run "
+                               f"save-clear there yourself.")
+            log(event="skipped", why=why, **info)
+            write_mark(sid, mt, **keep)
+            continue
+        keep.pop("pending", None)  # the user took over after the last request: that one is not a failure
+        if keep.get("gave_up"):
+            if a.only:
+                log(event="skipped", why=f"gave up on this session: {count(mark.get('fails'))} requests landed "
+                                         f"and it did not clear", **info)
+            write_mark(sid, mt, **keep)
             continue
         pane = pane_of(ag.get("pid") or 0)
         if not pane:
             log(event="skipped", why="not in a tmux pane (no safe way to check the prompt)", **info)
-            write_mark(sid, mt)
+            write_mark(sid, mt, **keep)
             continue
         if a.dry_run:
             log(event="would-type", target=pane, **info)
             continue
         sent, why = type_into(pane, sid, ag.get("pid"), MSG.format(m=round(idle), k=round(ctx / 1000)), ags)
         if sent:
-            # The stretch ends when the transcript changes (our message lands there). If the session
-            # later sits idle again without having cleared, that is a new stretch and it acts again.
-            write_mark(sid, mt, sent_at=time.time())
+            # The stretch ends when the transcript changes (our message lands there). A later stretch
+            # gets a new request only after the user did something; `pending` is judged then.
+            keep.update(asked_pid=pid, pending=True)
+            write_mark(sid, mt, sent_at=time.time(), **keep)
             log(event="sent", target=pane, **info)
         else:
             log(event="skipped", target=pane, why=why, **info)
             if "Enter not sent" in why:
-                write_mark(sid, mt)  # do not type again during this idle stretch
+                write_mark(sid, mt, **keep)  # do not type again during this idle stretch
     return 0
 
 
