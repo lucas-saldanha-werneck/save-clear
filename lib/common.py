@@ -164,7 +164,8 @@ RESUME_MSG = ("save-clear: resuming. Start with the LAST topic (where we stopped
 
 # Messages that are not the user's own words
 NOT_HUMAN = re.compile(r"^(<|Stop hook feedback|Base directory for this skill|save-clear: resuming|"
-                       r"save-clear \(automatic|\[Request interrupted|Caveat:)")
+                       r"save-clear \(automatic|\[Request interrupted|Caveat:|"
+                       r"This session is being continued from a previous conversation)")
 MARGIN_MS = 15000  # a message delivered just before the flag may not be in the snapshot
 
 
@@ -507,8 +508,8 @@ def user_messages_since(transcript, since_ms):
             d = json.loads(line)
         except Exception:
             continue
-        if d.get("isSidechain") or d.get("isMeta"):
-            continue
+        if d.get("isSidechain") or d.get("isMeta") or d.get("isCompactSummary"):
+            continue  # a compaction summary is a user-type record, but not the user's words
         t = _ts_ms(d)
         if t is None or t <= since_ms:
             continue

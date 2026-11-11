@@ -285,10 +285,12 @@ only when all of these hold:
 - the session was not already asked with nothing from you after it. A session that was asked and
   still has the same id did not clear (a usage limit, a failed `/clear`, or the same session open
   in several panes, which share one transcript); asking again every hour would only save the same
-  context again. It asks again after you write something there;
-- it did not already ask this session id twice. A `/clear` gives the session a new id, so two
-  requests on one id mean it did not clear twice: it logs `gave-up`, runs your notify command once
-  and leaves that session alone;
+  context again. It asks again after you do something there (a message, a queued message, an
+  image, a slash or `!` command, an interrupt);
+- it did not give up on the session. A request counts as failed when it landed, you did nothing
+  after it, and the same process is still on the same session id (a `/clear` gives a new id).
+  After 2 of those it logs `gave-up`, runs your notify command once and leaves that session alone.
+  A request you answered, or one typed into another pane of the same session, is not a failure;
 - the session runs in a tmux pane, that pane runs exactly this session, and the prompt is empty.
   Right before Enter it checks again that the session is idle and the prompt holds exactly the typed
   text. If not, it does not press Enter, erases its text if the prompt still holds exactly that, and
@@ -374,7 +376,7 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
 
 ## Limits
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 136 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 139 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
   (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. On Windows, CI runs the unit tests
