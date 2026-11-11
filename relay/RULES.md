@@ -19,6 +19,10 @@ focus, never open a deep link.
      common for a cold session: count it as delivered (`ok`). A request stays pending until it is
      acknowledged: without an ack the listener hands it out again after 10 minutes, at most 3 times,
      then keeps it under `failed` (shown by `{RELAY} status`).
+   - A job with an `RCON <id>` line: that session turned its own Remote Control off so the app would
+     clear it. Right AFTER the `send_message` (or alone, when the job says there is nothing to deliver),
+     load `mcp__ccd_session_mgmt__set_remote_control` and call it with that `session_id` and
+     `enabled: true`, then run `{RELAY} rc-on-ack <id> ok` (or `failed <reason>`). Then the job's ACK.
    - `RCOFF <id>` line (only when the `rc_idle_off_hours` setting is on): load
      `mcp__ccd_session_mgmt__set_remote_control` with ToolSearch (if not loaded yet) and call it with
      that `session_id` and `enabled: false`, then run its `ACK:` line (`{RELAY} rc-ack <id> ok`). If the
@@ -51,4 +55,5 @@ Use this when your context is full or the user asks. Do NOT run the whole save-c
 - `clear_session` on yourself outside the "Context full" steps above.
 - Running the whole save-clear skill.
 - Sending a message that did not come from a request in the inbox.
-- Changing Remote Control of a session no `RCOFF` line named, or turning it on.
+- Changing Remote Control of a session no `RCOFF` or `RCON` line named; turning it on for any session
+  but the one an `RCON` line names.

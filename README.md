@@ -348,6 +348,16 @@ A request stays pending until the relay acknowledges it with `save-clear-relay a
 handed out again (after 10 minutes without an ack), at most 3 times. After that it is kept as failed
 and `status` lists it. A lost ack can make the resume request arrive twice.
 
+**Remote Control.** The app does not clear a session while its Remote Control is on. When it was
+switched on in the app (by you or a tool), `request` sees it in the app's session file and, only while
+the relay is listening, prints `RC-OFF-SELF`: the session turns its own Remote Control off right before
+`clear_session`, and the relay turns it back on (`set_remote_control ... enabled: true`, then
+`save-clear-relay rc-on-ack`) right after it sends the resume. If the clear never shows up in the app
+log within 3 minutes (`SAVE_CLEAR_RELAY_RC_MAX`), the relay turns Remote Control back on anyway, without
+a resume. A session started from Remote Control (phone or claude.ai) has its switch locked by the app,
+so it is never cleared by a tool: `request` prints `RC-LOCKED` and the skill says "You can /clear now."
+When the relay is not listening it prints `RC-KEEP` and nothing is turned off.
+
 Other commands:
 
 - `save-clear-relay status`: relay id, whether it is listening, whether the app shows it archived

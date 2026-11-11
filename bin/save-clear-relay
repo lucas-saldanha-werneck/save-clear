@@ -15,13 +15,15 @@ its own, and nothing is ever typed into a text box.
   save-clear-relay status               relay id, listening or not, queued, unacknowledged and failed requests
   save-clear-relay off | on             turn the relay off on purpose / back on
   save-clear-relay request              the calling app session asks for its resume after its clear
-  save-clear-relay job --to local_<id> [--message TEXT] [--after-clear local_<id>] [--in S] [--why W]
+  save-clear-relay job --to local_<id> [--message TEXT] [--after-clear local_<id>] [--in S] [--why W] [--rc-on]
   save-clear-relay listen               the relay's listener (run in the background by the relay)
   save-clear-relay ack <name> ok|failed the relay reports a delivery; a request stays pending until then
   save-clear-relay rc-sweep [--dry-run] sessions with Remote Control on and no message from the person
                                         for `rc_idle_off_hours` (0/empty = off); without --dry-run, hands
                                         them out as RCOFF lines, like the listener does once an hour
   save-clear-relay rc-ack <id> ok|failed  the relay reports turning a session's Remote Control off
+  save-clear-relay rc-on-ack <id> ok|failed  the relay reports turning a session's Remote Control back on
+                                        after its clear (requests made with Remote Control on)
   save-clear-relay clear-count          how many clears of the relay the app log shows
   save-clear-relay wait-clear --base N  the waker waits until the relay's clear shows up in the app log
 
@@ -73,6 +75,9 @@ CMD = f'python3 "{SELF}"'
 ID_RE = re.compile(r"local_[0-9a-f-]{36}")
 ALIVE_S = 60          # a heartbeat older than this = not listening
 AFTER_CLEAR_MAX = 900  # 15 min without the target's clear: drop the request
+# A request made with Remote Control on: the session turned its own Remote Control off to be cleared.
+# Without its clear in this many seconds, the relay turns Remote Control back on anyway (no resume).
+AFTER_CLEAR_RC_MAX = float(os.environ.get("SAVE_CLEAR_RELAY_RC_MAX", "180"))
 POLL = float(os.environ.get("SAVE_CLEAR_RELAY_POLL", "3"))
 MAXWAIT = float(os.environ.get("SAVE_CLEAR_RELAY_MAXWAIT", str(6 * 3600)))  # exit so the relay re-arms
 GRACE = float(os.environ.get("SAVE_CLEAR_RELAY_GRACE", "60"))  # app log missing: deliver after this
@@ -124,6 +129,21 @@ def app_session(sid):
     return None
 
 
+def rc_self(sid):
+    """Remote Control of an app session, from the app's JSON:
+    "on"     switched on in the app (by the person or a tool): the app refuses to clear the session
+             while it is on, but the session may turn it off, be cleared, and get it back from the relay;
+    "locked" the session was started from Remote Control (phone or claude.ai): the app locks its switch,
+             so it can never be cleared by a tool;
+    "off"    off, or unknown."""
+    v = app_session(sid)
+    if not isinstance(v, dict):
+        return "off"
+    if v.get("remoteControlSpawn"):
+        return "locked"
+    return "on" if v.get("remoteControlUserEnabled") else "off"
+
+
 def archived(sid):
     """True / False from the app's session file; None when the file is not found."""
     v = app_session(sid)
@@ -159,12 +179,14 @@ def wake_text():
     return f"RELAY listen. Run `{CMD} rules` and follow the cycle from step 1."
 
 
-def enqueue(to, message, after_clear=None, delay=0.0, why=""):
+def enqueue(to, message, after_clear=None, delay=0.0, why="", rc_on=False):
     if os.path.exists(OFF):
         print(f"relay turned off on purpose ({OFF}); nothing queued", file=sys.stderr)
         return 3
     now = time.time()
     job = {"to": to, "message": message, "due": now + delay, "after_clear": after_clear, "why": why, "created": now}
+    if rc_on:
+        job["rc_on"] = True
     os.makedirs(INBOX, exist_ok=True)
     name = f"{int(now * 1000)}-{why or 'job'}-{to[6:14]}.json"
     tmp = os.path.join(INBOX, "." + name)
@@ -187,6 +209,7 @@ def cmd_job(args):
     ap.add_argument("--after-clear", default=None)
     ap.add_argument("--in", dest="delay", type=float, default=0)
     ap.add_argument("--why", default="")
+    ap.add_argument("--rc-on", action="store_true", help="turn the target's Remote Control on after delivery")
     try:
         a = ap.parse_args(args)
     except SystemExit:
@@ -197,7 +220,8 @@ def cmd_job(args):
     if not ID_RE.fullmatch(a.to) or (a.after_clear and not ID_RE.fullmatch(a.after_clear)):
         print("invalid id (expected local_<uuid>)", file=sys.stderr)
         return 1
-    return enqueue(a.to, a.message, a.after_clear, a.delay, re.sub(r"[^a-z0-9-]", "", a.why.lower())[:20])
+    return enqueue(a.to, a.message, a.after_clear, a.delay, re.sub(r"[^a-z0-9-]", "", a.why.lower())[:20],
+                   rc_on=a.rc_on)
 
 
 def cmd_request():
@@ -218,7 +242,24 @@ def cmd_request():
     if me == rid:
         print(f"this session IS the relay: follow the \"Context full\" part of `{CMD} rules` instead", file=sys.stderr)
         return 1
-    return enqueue(me, resume_msg(), after_clear=me, why="save-clear")
+    rc = rc_self(me)
+    # Turn Remote Control off only while the relay is listening: it is the one that turns it back on.
+    rc_off = rc == "on" and listening()
+    code = enqueue(me, resume_msg(), after_clear=me, why="save-clear", rc_on=rc_off)
+    if code == 0 and rc_off:
+        print("RC-OFF-SELF: Remote Control is on here, and the app does not clear a session while it is on. "
+              "Right before clear_session, call mcp__ccd_session_mgmt__set_remote_control with "
+              "session_id=self enabled=false. If clear_session is refused, turn it back on at once "
+              "(enabled=true). After the clear the relay sends the resume and turns Remote Control back on "
+              f"(by itself after {int(AFTER_CLEAR_RC_MAX)} s if the clear never comes).")
+    elif rc == "on" and code == 2:
+        print("RC-KEEP: Remote Control is on here and the relay is not listening, so nothing could turn it "
+              "back on after a clear. Leave it on, do not call clear_session, and reply \"You can /clear now.\"")
+    elif rc == "locked":
+        print("RC-LOCKED: this session was started from Remote Control; the app locks its Remote Control "
+              "and never lets a tool clear it. Do not call clear_session: reply \"You can /clear now.\" "
+              "The summary comes back after the /clear.")
+    return code
 
 
 def cmd_setup(args):
@@ -540,6 +581,12 @@ def ready(path):
                 return True
             return False
         if not done:
+            if job.get("rc_on") and time.time() - created > AFTER_CLEAR_RC_MAX:
+                rlog(f"{os.path.basename(path)}: no clear of {ac} in {int(AFTER_CLEAR_RC_MAX)} s; "
+                     "turning its Remote Control back on, no resume")
+                job.update(after_clear=None, rc_only=True)
+                write_job(path, job)
+                return True
             if time.time() - created > AFTER_CLEAR_MAX:
                 rlog(f"{os.path.basename(path)}: no clear of {ac} in 15 min; dropped")
                 os.makedirs(FAILED, exist_ok=True)
@@ -632,8 +679,15 @@ def cmd_listen():
             for d, job in done:
                 name = os.path.basename(d)
                 print(f"JOB {d}")
-                print(f"  DO: mcp__ccd_session_mgmt__send_message session_id={job['to']} message=<the text below, exactly>")
-                print("  TEXT: " + job["message"])
+                if job.get("rc_only"):
+                    print(f"  (no clear came: nothing to deliver; only turn its Remote Control back on)")
+                else:
+                    print(f"  DO: mcp__ccd_session_mgmt__send_message session_id={job['to']} message=<the text below, exactly>")
+                    print("  TEXT: " + job["message"])
+                if job.get("rc_on"):
+                    print(f"  RCON {job['to']}: {'' if job.get('rc_only') else 'after the send_message, '}call "
+                          f"mcp__ccd_session_mgmt__set_remote_control session_id={job['to']} enabled=true, then "
+                          f"`{CMD} rc-on-ack {job['to']} ok` (or `failed <reason>`)")
                 print(f"  ACK: {CMD} ack {name} ok")
                 print(f"  (if send_message failed: {CMD} ack {name} failed <reason>)")
                 rlog(f"handed to the relay: {name} (attempt {job['attempts']} of {MAX_ATTEMPTS})")
@@ -763,6 +817,14 @@ def cmd_rc_ack(args):
     return 0
 
 
+def cmd_rc_on_ack(args):
+    if len(args) < 2 or not ID_RE.fullmatch(args[0]) or args[1] not in ("ok", "failed"):
+        print("usage: save-clear-relay rc-on-ack <local_id> ok|failed [reason]", file=sys.stderr)
+        return 1
+    rlog(f"rc on {args[1]}: {args[0]}" + (f" ({' '.join(args[2:])})" if args[2:] else ""))
+    return 0
+
+
 def clear_count(rid):
     lines = _log_lines() or []
     return sum(1 for line in lines if f"Clearing session {rid}" in line)
@@ -825,6 +887,8 @@ def main(argv):
         return cmd_rc_sweep(args)
     if cmd == "rc-ack":
         return cmd_rc_ack(args)
+    if cmd == "rc-on-ack":
+        return cmd_rc_on_ack(args)
     if cmd == "clear-count":
         print(clear_count(relay_id()))
         return 0
