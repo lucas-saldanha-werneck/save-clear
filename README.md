@@ -215,9 +215,10 @@ app relay session.
 
 ### Leftover background tasks
 
-A background task this session forgot about (a `run_in_background` Bash job, a Monitor watch) can
-keep the session busy, so the helper never sees it idle and only re-arms the `/clear`. With
-`kill_background_tasks` off (the default) nothing changes. With it on:
+A background task this session forgot about (a `run_in_background` Bash job, a Monitor watch) keeps
+`claude agents` saying busy. Since 0.12.0 that no longer holds the `/clear` once the turn is over (see
+[Subagents still running](#subagents-still-running)); the option is for stopping such leftovers anyway.
+With `kill_background_tasks` off (the default) nothing changes. With it on:
 
 - `save-clear dir` and `save-clear arm-clear` print a `kill_background_tasks: on` line, and the skill
   tells Claude to stop the tasks this session started that are still running, with the TaskStop tool,
@@ -237,25 +238,36 @@ can stop its own tasks, so this works through instructions to Claude, not from a
 
 ### Subagents still running
 
-A background subagent (Agent tool) is work in progress, not a leftover. While one runs, `claude agents`
-reports the session as `busy` even after the turn ended with an empty prompt (watched on Claude Code
-2.1.322). Before 0.11.0 the helper took that for a leftover task, and with `kill_background_tasks` on
-the Stop hook asked Claude to stop "every background task", so subagents were stopped mid-work and
-their results lost. Now:
+A background subagent (Agent tool) is work in progress, not a leftover, and it survives `/clear`: it
+keeps running and its result arrives in the new conversation as a notification (watched on Claude Code
+2.1.322). While one runs, `claude agents` reports the session as `busy` even after the turn ended with
+an empty prompt. Before 0.11.0 the helper took that for a leftover task, and with
+`kill_background_tasks` on the Stop hook asked Claude to stop "every background task", so subagents
+were stopped mid-work and their results lost. Now:
 
-- The helper reads the turn's end record in the transcript (`pendingBackgroundAgentCount`). Subagents
-  still running: it types nothing and re-arms with `agents_wait`. That wait does not count toward the
-  5 re-arms, is never treated as busy, and the request is kept for up to 4 hours
-  (`SAVE_CLEAR_AGENTS_MAX_AGE_MS`), then given up with a notice.
-- Each result arrives as a notification and ends a turn. The Stop hook then blocks and asks Claude to
-  record it under `## After the save` and run `save-clear rearm <session id> --subagents` (up to 20
-  rounds; they do not use up the 3 rounds kept for your own messages). The `/clear` happens after the
-  last subagent finishes.
-- The skill lists running subagents under `## Running subagents` (id, task, brief, branch or
-  worktree). After the `/clear`, the resume tells the new session to check any that has no result
-  before restarting it. In the desktop app or a terminal without tmux, the skill does not clear while
-  subagents run: it says "You can /clear once the subagents finish."
-- The stop-tasks instruction (`kill_background_tasks`) now says never to stop a subagent.
+- The helper reads the transcript: when the turn's end record is the newest main-thread record, "busy"
+  comes only from background work (subagents, `run_in_background` commands, also a subagent's own) and
+  counts as idle (the screen must still show no "esc to interrupt" and an empty prompt), so the
+  `/clear` goes ahead at once. Watched live: a subagent's background `sleep 90; date > file` kept
+  running across the automatic `/clear` and wrote the file.
+- The skill lists each running subagent under `## Running subagents`: id, description, a brief
+  summary (goal, repo/worktree/branch, what it will deliver, whether it merges or installs by itself),
+  the brief's path and what to do with its result. After the `/clear`, the resume tells the new session
+  that results will arrive as notifications and to act on each one by that section.
+- A subagent result that reaches the old conversation after the save but before the `/clear` blocks
+  the Stop hook once: Claude records it under `## After the save` and runs
+  `save-clear rearm <session id> --subagents` (up to 20 rounds; they do not use up the 3 rounds kept
+  for your own messages).
+- The stop-tasks instruction (`kill_background_tasks`) says never to stop a subagent.
+- A subagent's permission prompt (or any open dialog) makes `claude agents` say `waiting`. The helper
+  never types then (keys would answer the dialog); it waits until the prompt is answered, then clears.
+- A result that starts a turn while `/clear` sits in the prompt: the helper sees the turn begin before
+  pressing Enter, erases `/clear` (only when the prompt holds exactly that) and does not press Enter.
+  A result whose turn ran while the helper held the request is caught before the next `/clear` try:
+  Claude is asked to record it under `## After the save` first. All three were seen live on 2.1.322.
+- The slash-command menu under the input box marks its item with the same sign as the prompt; the
+  helper now reads the input box itself, so a typed `/clear` with the menu open is still recognized.
+- The skill asks Claude to hand long work to background subagents, so save-clear never has to wait.
 
 Two backups run without the skill. Before any compaction, the full transcript is saved gzipped with
 an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker; the backup is readable by you only, and the 10 newest

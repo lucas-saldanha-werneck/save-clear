@@ -9,9 +9,9 @@ No flag: exits at once. Rules:
   `save-clear-send --check` confirms the target runs this session.
 - A user message that arrived after the save blocks the stop (up to 3 rounds): Claude answers it,
   adds it to the snapshot and re-arms. The message never vanishes in the /clear.
-- A background subagent's result that arrived after the save blocks the stop the same way: Claude
-  records it in the snapshot and re-arms. While subagents still run, the helper waits for them
-  (flag `agents_wait`, kept up to AGENTS_MAX_AGE_MS) instead of asking Claude to stop them.
+- A background subagent's result that reached THIS conversation after the save (before the /clear)
+  blocks the stop the same way: Claude records it in the snapshot and re-arms. Subagents still running
+  are left alone: they survive /clear and report to the new conversation.
 """
 import json
 import os
@@ -27,7 +27,6 @@ from common import (BIN, CLEAR_DIR, MARGIN_MS, clear_key, clear_path, kill_backg
 MAX_DELTAS = 3
 MAX_AGE_MS = 15 * 60 * 1000
 MAX_AGENT_ROUNDS = 20
-AGENTS_MAX_AGE_MS = int(os.environ.get("SAVE_CLEAR_AGENTS_MAX_AGE_MS", str(4 * 3600 * 1000)))  # waiting for subagents
 
 
 FLAG = {"path": ""}
@@ -84,13 +83,7 @@ def main():
     flag = find_flag(hook, job)
     if not flag:
         return
-    age = now_ms() - int(flag.get("armed_at") or flag.get("ts") or 0)
-    if flag.get("agents_wait") and age > AGENTS_MAX_AGE_MS:
-        drop_flag()
-        log("stop", f"gave up: subagents still running {age // 60000} min after the save")
-        notify("save-clear: gave up waiting for this session's subagents. Type /clear yourself when they finish.")
-        return
-    if not flag.get("agents_wait") and age > MAX_AGE_MS:
+    if now_ms() - int(flag.get("armed_at") or flag.get("ts") or 0) > MAX_AGE_MS:
         drop_flag()
         return
 
@@ -146,7 +139,7 @@ def main():
                        "its id, what it returned (PR, commit, numbers, paths), what you did with it and what is "
                        "still open; mark it finished under \"## Running subagents\". Do not rewrite the rest. "
                        f"3) Run `{rearm}` and end the turn with one short line. Do not stop the subagents "
-                       "still running: the /clear follows by itself after the last one finishes."),
+                       "still running: they survive the /clear, which follows by itself."),
         }))
         return
 

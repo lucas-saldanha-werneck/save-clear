@@ -1971,8 +1971,8 @@ def notification(task_id, summary, offset_s=1, status="completed"):
 
 
 class Subagents(Base):
-    """Background subagents: the /clear waits for them, never asks Claude to stop them, and their results
-    reach the snapshot before the /clear (seen on 12/11/2026: subagents stopped mid-work, results lost)."""
+    """Background subagents survive /clear: they never hold it, are never stopped, and the new conversation
+    is told how to read their results (seen on 12/11/2026: subagents stopped mid-work, results lost)."""
     PANE_PID = 4242
 
     def setUp(self):
@@ -2010,14 +2010,14 @@ class Subagents(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.strip()
 
-    def test_running_count_comes_from_the_last_turn_end(self):
+    def test_turn_over_comes_from_the_last_turn_end(self):
         user = {"type": "user", "timestamp": iso(), "message": {"role": "user", "content": "hi"}}
-        cases = [((user, turn_end(2)), "2"), ((user, turn_end(0)), "0"), ((turn_end(2), user), "0"),
-                 ((turn_end(3), {"type": "attachment", "timestamp": iso()}), "3"),
-                 ((turn_end(1), dict(user, isSidechain=True)), "1"), ((), "0")]
+        cases = [((user, turn_end(2)), "(True, 2)"), ((user, turn_end(0)), "(True, 0)"), ((turn_end(2), user), "(False, 0)"),
+                 ((turn_end(3), {"type": "attachment", "timestamp": iso()}), "(True, 3)"),
+                 ((turn_end(1), dict(user, isSidechain=True)), "(True, 1)"), ((), "(False, 0)")]
         for entries, want in cases:
             tp = self.transcript(*entries)
-            self.assertEqual(self.common(f"common.subagents_running({tp!r})"), want, entries)
+            self.assertEqual(self.common(f"common.turn_over({tp!r})"), want, entries)
 
     def test_reports_keep_only_subagents_after_the_save(self):
         tp = self.transcript(notification("aold", 'Agent "old one" completed', offset_s=-120),
@@ -2028,38 +2028,119 @@ class Subagents(Base):
         out = self.common(f"[r[0] + ':' + r[1] for r in common.subagent_reports_since({tp!r}, {since})]")
         self.assertEqual(out, "['a456:completed', 'a789:killed']")
 
+    def test_prompt_is_the_input_box_not_the_command_menu(self):
+        # Seen live (2.1.322): after typing /clear, the menu under the box marks its item with the same sign.
+        b = "\x1b[38;5;244m" + "\u2500" * 40
+        screen = "\n".join(["\u276f old message in the history", b, "\u276f /clear", b,
+                             "  \u276f /clear        Start a new session with empty context",
+                             "    /save-clear:save-clear   (save-clear) End-of-session ritual"])
+        self.assertEqual(self.common(f"common.prompt_block({screen!r}) + '|' + common.prompt_text({screen!r})"),
+                         "/clear|/clear")
+        self.assertEqual(self.common("common.prompt_text('\\x1b[0m\\n\u276f draft\\n')"), "draft", "old layout")
+
     def test_stop_tasks_instruction_never_includes_subagents(self):
         self.assertIn("Never stop a subagent", self.common("common.stop_tasks_instruction('Now,')"))
 
-    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
-    def test_helper_waits_for_subagents_instead_of_marking_busy(self):
+    def run_helper(self, *entries):
         fake = os.path.join(self.t, "fake_claude.sh")
         with open(fake, "w") as f:
             f.write("#!/bin/sh\necho '" + json.dumps([{"kind": "interactive", "pid": self.PANE_PID, "sessionId": SID_A,
                                                        "status": "busy", "cwd": self.proj}]) + "'\n")
         os.chmod(fake, 0o755)
-        user = {"type": "user", "timestamp": iso(-30), "message": {"role": "user", "content": "go"}}
-        tp = self.transcript(user, turn_end(2, -20))
-        flag = {"session_id": SID_A, "mode": "tmux", "target": "%7", "key": SID_A, "rearms": 4,
+        tp = self.transcript(*entries)
+        flag = {"session_id": SID_A, "mode": "tmux", "target": "%7", "key": SID_A,
                 "ts": int(time.time() * 1000) - 60000}
+        r = self.run_py("bin/save-clear-send", ["tmux", "%7", SID_A, json.dumps(flag), tp], SAVE_CLEAR_CLAUDE=fake,
+                        FAKE_TMUX_PANES=f"{self.PANE_PID} %7", SAVE_CLEAR_START_DELAY="0", SAVE_CLEAR_MAX_WAIT="30",
+                        SAVE_CLEAR_DRY_RUN="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.flag_path("save-clear.log")) as fh:
+            return fh.read()
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_helper_clears_at_once_while_subagents_run(self):
+        user = {"type": "user", "timestamp": iso(-120), "message": {"role": "user", "content": "go"}}
+        log = self.run_helper(user, turn_end(2, -110))
+        self.assertIn("background work still running (2 subagent(s)): it survives the /clear", log)
+        self.assertIn("would type ('-l', '/clear')", log)
+        self.assertNotIn("re-armed", log)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_turn_starting_before_enter_erases_the_typed_clear(self):
+        # A subagent's result starts a turn between typing /clear and pressing Enter: the helper must
+        # not press Enter into that turn; it erases /clear and re-arms.
+        fake = os.path.join(self.t, "fake_claude.py")
+        idle = json.dumps([{"kind": "interactive", "pid": self.PANE_PID, "sessionId": SID_A, "status": "idle"}])
+        with open(fake, "w") as f:
+            f.write(f"#!{PY}\nimport os\nc = os.path.join({self.t!r}, 'agent-calls')\n"
+                    "n = (len(open(c).read()) if os.path.exists(c) else 0) + 1\nopen(c, 'a').write('x')\n"
+                    f"print({idle!r} if n <= 2 else {idle!r}.replace('idle', 'busy'))\n")
+        os.chmod(fake, 0o755)
+        tp = self.transcript(notification("a456", 'Agent "fix" completed', offset_s=-120))
+        flag = {"session_id": SID_A, "mode": "tmux", "target": "%7", "key": SID_A, "ts": int(time.time() * 1000) - 60000}
         r = self.run_py("bin/save-clear-send", ["tmux", "%7", SID_A, json.dumps(flag), tp], SAVE_CLEAR_CLAUDE=fake,
                         FAKE_TMUX_PANES=f"{self.PANE_PID} %7", SAVE_CLEAR_START_DELAY="0", SAVE_CLEAR_MAX_WAIT="30")
         self.assertEqual(r.returncode, 0, r.stderr)
-        calls = os.path.join(self.t, "tmux-calls.jsonl")
-        typed = ""
-        if os.path.exists(calls):
-            with open(calls) as fh:
-                typed = fh.read()
-        self.assertNotIn("send-keys", typed, "nothing typed while subagents run")
-        f = self.read_flag()
-        self.assertEqual(f.get("agents_wait"), 2)
-        self.assertNotIn("busy_rearm", f, "a subagent is not a leftover task")
-        self.assertEqual(f.get("rearms"), 4, "waiting for subagents does not use up the re-arms")
+        with open(os.path.join(self.t, "tmux-calls.jsonl")) as fh:
+            keys = [a for a in (json.loads(l) for l in fh) if a and a[0] == "send-keys"]
+        flat = [k for a in keys for k in a]
+        self.assertIn("/clear", flat)
+        self.assertIn("BSpace", flat)
+        self.assertNotIn("Enter", flat, "Enter never pressed into the running turn")
+        with open(os.path.join(self.t, "draft.txt")) as fh:
+            self.assertEqual(fh.read(), "", "the typed /clear was erased")
+        self.assertTrue(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "re-armed for the next end of turn")
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_helper_asks_to_record_a_result_that_came_after_the_save(self):
+        # Seen live: the result's turn ran while the helper held the flag, so no Stop hook caught it.
+        user = {"type": "user", "timestamp": iso(-120), "message": {"role": "user", "content": "go"}}
+        log = self.run_helper(user, turn_end(1, -110), notification("a883", 'Agent "fetch title" completed', offset_s=-5),
+                              turn_end(0, -3))
+        self.assertIn("subagent result after the save (a883)", log)
+        self.assertIn("rearm " + SID_A + " --subagents", log)
+        self.assertNotIn("would type ('-l', '/clear')", log)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_helper_clears_while_only_a_background_command_runs(self):
+        # Seen live: a subagent put its work in a background shell and reported early; no subagent is
+        # pending, but the shell keeps the session "busy" after the turn ended.
+        user = {"type": "user", "timestamp": iso(-120), "message": {"role": "user", "content": "go"}}
+        log = self.run_helper(user, turn_end(0, -110))
+        self.assertIn("would type ('-l', '/clear')", log)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_helper_never_types_into_an_open_permission_prompt(self):
+        # Seen live: a background subagent's permission prompt makes the session "waiting"; typing
+        # would answer it. The turn's end record says the turn is over, which must not override that.
+        fake = os.path.join(self.t, "fake_claude.sh")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\necho '" + json.dumps([{"kind": "interactive", "pid": self.PANE_PID, "sessionId": SID_A,
+                                                       "status": "waiting"}]) + "'\n")
+        os.chmod(fake, 0o755)
+        tp = self.transcript({"type": "user", "timestamp": iso(-120), "message": {"role": "user", "content": "go"}},
+                             turn_end(1, -110))
+        flag = {"session_id": SID_A, "mode": "tmux", "target": "%7", "key": SID_A, "ts": int(time.time() * 1000) - 60000}
+        r = self.run_py("bin/save-clear-send", ["tmux", "%7", SID_A, json.dumps(flag), tp], SAVE_CLEAR_CLAUDE=fake,
+                        FAKE_TMUX_PANES=f"{self.PANE_PID} %7", SAVE_CLEAR_START_DELAY="0", SAVE_CLEAR_MAX_WAIT="3",
+                        SAVE_CLEAR_DRY_RUN="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
         with open(self.flag_path("save-clear.log")) as fh:
-            self.assertIn("2 background subagent(s) of this session still running", fh.read())
+            log = fh.read()
+        self.assertIn("a permission prompt or question is open", log)
+        self.assertNotIn("would type", log)
+        self.assertTrue(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "re-armed after the wait")
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_helper_still_waits_when_really_busy(self):
+        # Busy with no subagent pending (a turn is running): nothing typed, re-armed as busy.
+        log = self.run_helper({"type": "user", "timestamp": iso(-120), "message": {"role": "user", "content": "go"}})
+        self.assertNotIn("would type", log)
+        self.assertIn("re-armed (the session went back to work", log)
+        self.assertTrue(self.read_flag().get("busy_rearm"))
 
     def test_stop_hook_asks_to_record_a_result_after_the_save(self):
-        self.write_flag(agents_wait=1, busy_rearm=True)
+        self.write_flag(busy_rearm=True)
         tp = self.transcript(turn_end(1, -3), notification("a456", 'Agent "fix the bug" completed'))
         out = json.loads(self.stop(tp, SAVE_CLEAR_KILL_BACKGROUND_TASKS="on").stdout)
         self.assertEqual(out["decision"], "block")
@@ -2093,23 +2174,12 @@ class Subagents(Base):
         self.assertIn("status?", reason)
         self.assertIn("a456", reason)
 
-    def test_waiting_flag_outlives_the_15_minute_limit(self):
-        old = int(time.time() * 1000) - 20 * 60 * 1000
-        tp = self.transcript(turn_end(1, -3))
-        self.write_flag(ts=old, armed_at=old)
-        self.assertEqual(self.stop(tp).stdout, "", "a plain flag that old is dropped")
-        self.write_flag(ts=old, armed_at=old, agents_wait=1)
-        self.assertIn("as soon as the session is free", self.stop(tp).stdout)
-        self.write_flag(ts=old, armed_at=old, agents_wait=1)
-        self.assertEqual(self.stop(tp, SAVE_CLEAR_AGENTS_MAX_AGE_MS="60000").stdout, "", "given up after the wait limit")
-        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
-
     def test_resume_names_running_subagents_only_if_listed(self):
         for body, named in (("## Running subagents\nnone\n", False), ("", False),
                             ("## Running subagents\n- a4be7f19: vision, worktree ~/wt/v, brief /tmp/b.md\n", True)):
             self.arm(self.snapshot("# Session\n## Last topic\nx\n" + body))
             ctx = json.loads(self.start(CLAUDE_PID=4242).stdout)["hookSpecificOutput"]["additionalContext"]
-            self.assertEqual("Subagents were running when the previous session saved" in ctx, named, body)
+            self.assertEqual("each result arrives in THIS conversation as a task notification" in ctx, named, body)
 
 
 EXAMPLE = os.path.join(ROOT, "config.example.json")

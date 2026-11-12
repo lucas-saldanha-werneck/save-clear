@@ -17,9 +17,10 @@ Safety rules:
   file shows a new conversation id (bg). Only then is the resume request typed.
 - A user message after the save, or a session that goes back to work: it does not clear. It
   re-arms the flag and exits: the next Stop hook decides.
-- Background subagents of this session still running (the turn ended, but `claude agents` stays
-  "busy"): it does not clear and never asks Claude to stop them. It re-arms with `agents_wait`; each
-  subagent's result starts a new turn, and the /clear happens after the last one.
+- Background work still running (subagents, run_in_background commands): `claude agents` keeps saying
+  "busy" although the turn ended. That alone does not hold the /clear (the turn's end record is the
+  newest in the transcript; the screen must show no "esc to interrupt"). It survives /clear and a
+  subagent's result reaches the new conversation as a notification, so nothing is stopped or waited for.
 
 Usage: save-clear-send <tmux|bg> <target> <session_id> <flag-json> <transcript>
        save-clear-send --check <tmux|iterm> <target> <session_id>   (0 ok, 1 refused, 2 unknown)
@@ -36,7 +37,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from common import (BIN, MARGIN_MS, ancestors, claude_bin, clear_key, draft_why,  # noqa: E402
                     log as _log, notify, now_ms, prompt_block, prompt_text, ps_parents, resume_msg,
-                    run_hook_command, short, squash, subagents_running, tmux_bin, user_messages_since,
+                    run_hook_command, short, squash, subagent_reports_since, tmux_bin, turn_over, user_messages_since,
                     write_clear)
 
 CLAUDE = claude_bin()
@@ -134,12 +135,9 @@ def refuse(why):
     sys.exit(3)
 
 
-def rearm(why, busy=False, agents=0):
+def rearm(why, busy=False):
     """Write this session's flag back so the next Stop hook tries again. busy=True: the session stayed
-    busy (with kill_background_tasks on, the Stop hook then asks Claude to stop leftover background tasks).
-    agents=N: the turn ended but N background subagents still run. That wait is not a failed attempt:
-    each subagent's result ends a turn and fires the Stop hook again, so it does not count toward the
-    5 re-arms, and it is never marked busy (a subagent is work in progress, not a leftover task)."""
+    busy (with kill_background_tasks on, the Stop hook then asks Claude to stop leftover background tasks)."""
     try:
         flag = json.loads(flag_json)
     except Exception:
@@ -148,16 +146,6 @@ def rearm(why, busy=False, agents=0):
         log(f"not re-armed ({why}): empty flag")
         return
     flag["armed_at"] = now_ms()
-    if agents:
-        if not flag.get("agents_wait"):
-            notify(f"save-clear: the /clear waits for {agents} subagent(s) of this session to finish.", success=True)
-        flag["agents_wait"] = agents
-        flag.pop("busy_rearm", None)
-        flag["key"] = flag.get("key") or (clear_key(job=target) if mode == "bg" else clear_key(flag.get("session_id") or sid))
-        write_clear(flag)
-        log(f"re-armed ({why}); the next end of turn tries again")
-        return
-    flag.pop("agents_wait", None)
     flag["rearms"] = flag.get("rearms", 0) + 1
     if flag["rearms"] > 5:
         log(f"gave up ({why}): already re-armed 5 times")
@@ -185,6 +173,19 @@ def new_messages():
     except Exception:
         return []
     return user_messages_since(transcript, since)
+
+
+def new_reports():
+    """Subagent results that reached this conversation after the save (and were not recorded yet:
+    `rearm --subagents` moves ts forward). Up to 20 rounds, like the Stop hook."""
+    try:
+        flag = json.loads(flag_json)
+        since = flag.get("ts", 0) - MARGIN_MS
+        if int(flag.get("agent_rounds") or 0) >= 20:
+            return []
+    except Exception:
+        return []
+    return subagent_reports_since(transcript, since)
 
 
 # ----- bg mode: no terminal of its own; attach in a hidden tmux, type, detach -----
@@ -299,10 +300,6 @@ def run_bg():
         if st and st != "working":
             break
         if time.time() - t0 > BG_WAIT:
-            n = subagents_running(transcript)
-            if n:
-                rearm(f"{n} background subagent(s) of this job still running; the /clear waits for them", agents=n)
-                return 0
             rearm(f"the job stayed {st or 'unknown'} for {int(BG_WAIT)} s; typed nothing", busy=True)
             return 0
         time.sleep(1)
@@ -367,7 +364,7 @@ def ready_for_enter(text):
     ag, why = ours()
     if ag is None:
         return False, why or "no Claude in the pane"
-    if ag.get("status") != "idle":
+    if not idle(ag):
         return False, "busy"
     s = screen()
     if "esc to interrupt" in s:
@@ -378,12 +375,29 @@ def ready_for_enter(text):
     return True, ""
 
 
+def erase_typed(text):
+    """Erase `text` from the prompt, only if the pane still runs the expected session and the prompt
+    holds exactly `text` (so a draft of the user's is never touched). True = erased."""
+    ag, _ = ours()
+    p = prompt_block(screen())
+    if ag is None or p is None or squash(p) != squash(text):
+        return False
+    keys(*["BSpace"] * len(text))
+    return True
+
+
 def press_enter(text):
-    """Enter only after ready_for_enter; otherwise refuse and leave the typed text in the prompt."""
+    """Enter only after ready_for_enter. A turn that started during the pause (a subagent's result,
+    a queued message, another hook) makes it erase the typed text and return False: Enter would send
+    the text into the running turn, and the notification must not be mixed with it. Anything else
+    that fails: refuse and leave the typed text in the prompt."""
     if DRY:
         keys("Enter")
-        return
+        return True
     ok, why = ready_for_enter(text)
+    if not ok and why == "busy" and erase_typed(text):
+        log(f"a turn started while {text[:30]!r} was in the prompt; erased it, Enter not sent")
+        return False
     if not ok:
         refuse(f"check before Enter failed ({why}). Enter not sent; {text[:30]!r} is still in the prompt")
     if text == "/clear":
@@ -394,22 +408,34 @@ def press_enter(text):
             notify("save-clear: a message arrived after the save, so the session was not cleared.")
             sys.exit(0)
     keys("Enter")
+    return True
 
 
-def waiting_for_subagents():
-    """N > 0: the turn ended and the screen is not working, but N background subagents still run."""
-    n = subagents_running(transcript)
-    return n if n and "esc to interrupt" not in screen() else 0
+def idle(ag):
+    """Idle, or "busy" only because of background work (subagents, run_in_background commands, also
+    a subagent's own): the turn's end record is the newest main-thread record. That work survives
+    /clear and a subagent's result reaches the new conversation (checked on 2.1.322), so it never
+    holds the /clear. The callers still check the screen for "esc to interrupt" and an empty prompt."""
+    if ag.get("status") == "idle":
+        return True
+    if ag.get("status") != "busy":  # "waiting": a permission prompt or question is open (also a subagent's)
+        return False
+    ended, n = turn_over(transcript)
+    if ended and not EXPECT.get("bg_logged"):
+        EXPECT["bg_logged"] = True
+        log(f"turn over, background work still running ({n} subagent(s)): it survives the /clear, not waiting")
+    return ended
 
 
 def free():
-    """(free, reason). Free = expected session + idle + empty prompt. "subagents" = the turn ended, but
-    background subagents of this session still run (`claude agents` says busy until they finish)."""
+    """(free, reason). Free = expected session + idle (see idle()) + empty prompt."""
     ag, why = ours()
     if ag is None:
         return False, why
-    if ag.get("status") != "idle":
-        return False, "subagents" if waiting_for_subagents() else "busy"
+    if not idle(ag):
+        if ag.get("status") == "waiting":  # typing would answer the dialog: wait until it is answered
+            return False, "waiting: a permission prompt or question is open"
+        return False, "busy"
     s = screen()
     if "esc to interrupt" in s:
         return False, "busy"
@@ -427,15 +453,29 @@ def trigger():
             + "\" rearm " + EXPECT["sid"] + ". The /clear follows.")
 
 
+def trigger_reports(reports):
+    ids = ", ".join(r[0] for r in reports[-5:])
+    return ("save-clear (automatic): subagent result(s) arrived after the save (" + ids + "). Add to the snapshot, "
+            "section \"## After the save\", one line per subagent (id, what it returned, what is still open) and run: "
+            "python3 \"" + os.path.join(BIN, "save-clear") + "\" rearm " + EXPECT["sid"] + " --subagents. The /clear follows.")
+
+
 def stop_if_new(step):
-    """A user message after the save: do not clear. Re-arm and, if free, ask Claude to save the rest."""
+    """A user message, or a subagent's result, after the save: do not clear (the /clear would wipe the
+    answer Claude gave to it). Re-arm and, if free, ask Claude to save the rest. Seen live: a result
+    whose turn started and ended while the helper was retrying the /clear, with no Stop hook to catch it
+    (the helper holds the flag meanwhile)."""
     msgs = new_messages()
-    if not msgs:
+    reports = [] if msgs else new_reports()
+    if not msgs and not reports:
         return
-    rearm(f"{step}: new message after the save ({msgs[-1][:40]!r})")
+    if msgs:
+        rearm(f"{step}: new message after the save ({msgs[-1][:40]!r})")
+    else:
+        rearm(f"{step}: subagent result after the save ({reports[-1][0]})")
     ok, _ = free()
     if ok:
-        text = trigger()
+        text = trigger() if msgs else trigger_reports(reports)
         keys("-l", text)
         time.sleep(1)
         press_enter(text)
@@ -451,7 +491,8 @@ def type_line(text):
         return False, why
     keys("-l", text)
     time.sleep(1)  # separate Enter: long text becomes a "paste" and swallows the Enter
-    press_enter(text)  # checks owner, idle and the exact prompt again; refuses and exits if changed
+    if not press_enter(text):  # checks owner, idle and the exact prompt again; refuses and exits if changed
+        return False, "busy"  # a turn started meanwhile: the text was erased, the caller waits and retries
     return True, ""
 
 
@@ -472,10 +513,6 @@ def run_tmux():
         if ok:
             stop_if_new("before starting")
             break
-        if why == "subagents":
-            n = waiting_for_subagents() or 1
-            rearm(f"{n} background subagent(s) of this session still running; the /clear waits for them", agents=n)
-            return 0
         if why == "busy":
             busy_since = busy_since or time.time()
             if time.time() - busy_since > 8:
@@ -500,15 +537,13 @@ def run_tmux():
         stop_if_new("before /clear")
         sent, why = False, ""
         for _ in range(5):
+            stop_if_new("before /clear")  # a turn that ran meanwhile may have been a subagent's result
             sent, why = type_line("/clear")
             if sent or why != "busy":
                 break
             time.sleep(1)
         if not sent:
-            if why == "subagents":
-                rearm("before /clear: a background subagent of this session is running", agents=waiting_for_subagents() or 1)
-            else:
-                rearm(f"before /clear: {why}")
+            rearm(f"before /clear: {why}")
             return 0
         if DRY:
             log("dry-run: stopped before confirming /clear (nothing was typed)")

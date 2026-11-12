@@ -24,7 +24,8 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    log, process): done → leave it out; could not check → mark it "(not checked)". Items the user
    postponed go in with their trigger ("before the meeting"). Subagents this session started that are
    still running (Agent tool, background) are work in progress, not leftovers: never stop them for the
-   save; list them under `## Running subagents` (step 3).
+   save. They survive the /clear and their results arrive in the new conversation, so list each one
+   under `## Running subagents` (step 3) with enough to act on its result there.
 
 2. **Update persistent memory, if the project has it.** Claude Code's auto memory lives in
    `~/.claude/projects/<project>/memory/` with a `MEMORY.md` index. If that folder exists:
@@ -41,8 +42,7 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    line says now: stop the background tasks THIS session started that are still running (TaskStop with
    each task id) and list them under `## Stopped background tasks` in the snapshot (that heading stays in
    English, exactly, even when the snapshot is in another language: the resume looks for it). Never stop anything
-   this session did not start, and never stop a subagent (Agent tool task): the automatic /clear waits for
-   it. That option off (no such line) = leave background tasks alone.
+   this session did not start, and never stop a subagent (Agent tool task): it survives the /clear. That option off (no such line) = leave background tasks alone.
    Write `<folder>/SESSION-SUMMARY-<YYYYMMDD-HHMMSS>-<short-slug>.md`:
 
    ```markdown
@@ -61,7 +61,7 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    ## Next steps (in order)
    ## Open items / risks
    ## Useful paths, commands and IDs
-   ## Running subagents (ONLY when subagents of this session are still running: one line each - agent id, what it does, brief path, branch/worktree, what to do with its result)
+   ## Running subagents (ONLY when subagents of this session are still running. One entry each: agent id; description; brief summary - goal, repo/worktree/branch, what it will deliver, whether it merges or installs by itself; brief path; what to do when its result arrives)
    ## Stopped background tasks (ONLY when kill_background_tasks is on: one line per task - id, what it did, restart needed? - or "none")
    ```
 
@@ -100,7 +100,7 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    > Saved: memory (<files touched, or "none">), summary in `<snapshot path>`, auto-resume armed. You can /clear now.
 
    In save-and-clear mode, end with "clearing by itself in a moment." instead, but only when step 8
-   armed an automatic clear (with subagents still running: "clearing by itself after the subagents finish.").
+   armed an automatic clear.
 
 8. **Save-and-clear mode: arm the automatic /clear.** Only when asked, and ALWAYS with step 6 armed.
    Run:
@@ -155,15 +155,17 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
         turn ends. If `clear_session` refuses, turn Remote Control back on at once (`enabled: true`) when
         you turned it off, and change the reply to "You can /clear now."
 
-   **Subagents still running.** A running background subagent keeps the session "busy" even with the
-   turn over, and its result would be lost in the /clear. So the /clear waits for it:
-   - **`tmux` or `bg`**: end the turn as usual. The helper sees the subagents and re-arms without
-     typing. Each result arrives as a notification; the Stop hook then asks you to record it under
-     `## After the save` and run the `save-clear rearm <session id> --subagents` command it gives. The
-     /clear happens after the last one finishes (the wait is given up after 4 hours, with a notice).
-   - **`app`** or **`manual`**: do not call `clear_session`. Reply "Saved ... You can /clear once the
-     subagents finish." and stop.
-   Never stop a subagent to make the /clear happen sooner, unless the user asks.
+   **Subagents still running.** Do not stop them and do not wait for them: a background subagent
+   survives the /clear, and its result arrives in the new conversation as a notification. The
+   `## Running subagents` section is what lets the next session understand that result, so fill it in
+   fully. If a result reaches THIS conversation after the save but before the /clear, the Stop hook asks
+   you to record it under `## After the save` and run the `save-clear rearm <session id> --subagents`
+   command it gives. Stop a subagent only when the user asks.
+
+   **Long work goes to background subagents.** During the session, hand long jobs (builds, long
+   tests, research, anything over a few minutes) to background subagents (Agent tool with
+   `run_in_background`), not to the main thread: subagents survive the /clear, so save-clear never
+   has to wait for them.
 
    **Busy session (kill_background_tasks on).** If the helper found the session still busy, the Stop
    hook blocks once and asks you to stop this session's leftover background tasks (Bash, Monitor; never
