@@ -5,7 +5,7 @@ next steps to a summary file, checks that the file is on disk, clears its own co
 session starts from that summary. You keep what matters from a long session without doing the save
 and the `/clear` by hand.
 
-You do not even have to ask: when the context passes 300k tokens (30% of a 1M window), Claude runs
+You do not even have to ask: when the context passes 150k tokens, Claude runs
 it by itself at the end of the turn. Change the number with `context_cap_tokens`, or set it to `0`
 to turn it off.
 
@@ -110,7 +110,7 @@ it, and an existing file is never overwritten, so edit it freely.
 | `snapshot_dir` | `SAVE_CLEAR_SNAPSHOT_DIR` | `~/.claude/snapshots` | Where summaries and the compaction backups go |
 | `notify_command` | `SAVE_CLEAR_NOTIFY` | empty (off) | A program called with one line of text when the automatic `/clear` fails, is refused or stops halfway, and when it succeeds in tmux |
 | `publish_link` | `SAVE_CLEAR_PUBLISH_LINK` | `off` | `on`: the skill publishes the summary as a private claude.ai page (when the Artifact tool is available), and the next session shows that link first |
-| `context_cap_tokens` | `SAVE_CLEAR_CAP_TOKENS` | `300000` | When the context passes this many tokens, Claude runs save-clear at the end of the turn. `0` = off. With a 200k window, set it lower (e.g. `150000`), or compaction comes first |
+| `context_cap_tokens` | `SAVE_CLEAR_CAP_TOKENS` | `150000` | When the context passes this many tokens, Claude runs save-clear at the end of the turn. `0` = off. A long conversation re-reads its whole context on every turn, so clearing around 150k saves usage. Before 0.13.0 the default was `300000` |
 | `idle_minutes` | `SAVE_CLEAR_IDLE_MINUTES` | `50` | Idle trigger only (after `./install.sh --idle`): minutes a session must be idle before it runs save-clear. `0` = off |
 | `idle_min_tokens` | `SAVE_CLEAR_IDLE_MIN_TOKENS` | `80000` | Idle trigger only: sessions with a smaller context are left alone |
 | `language` | `SAVE_CLEAR_LANGUAGE` | empty | Language of the snapshot and of the first reply after the resume (e.g. `Portuguese`) |
