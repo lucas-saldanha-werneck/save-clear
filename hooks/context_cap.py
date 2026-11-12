@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stop hook: when the context passes a token limit, ask Claude to run save-clear at the end of the turn.
 
-The limit is the plugin option context_cap_tokens (or $SAVE_CLEAR_CAP_TOKENS); default 300000,
+The limit is the plugin option context_cap_tokens (or $SAVE_CLEAR_CAP_TOKENS); default 150000,
 0 turns it off. It only acts when Claude ends its turn, never in the middle of a task.
 It does nothing when:
 - the session is headless (claude -p or the Agent SDK), or the stop hook is already active;
@@ -22,7 +22,7 @@ import resume  # noqa: E402
 from common import (STATE, clear_key, clear_path, log, now_ms, read_hook_input, read_json, setting,  # noqa: E402
                     tail_lines, write_json)
 
-DEFAULT_CAP = 300000
+DEFAULT_CAP = 150000
 REPEAT_AFTER = 50000
 RECENT_SAVE_MS = 15 * 60 * 1000
 MARK_MAX_AGE_S = 7 * 24 * 3600

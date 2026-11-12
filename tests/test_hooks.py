@@ -985,18 +985,18 @@ class ContextCap(Base):
         return self.run_py("hooks/context_cap.py", stdin=hook, **env)
 
     def test_below_default_limit_is_silent(self):
-        self.assertEqual(self.cap(299000).stdout, "")
+        self.assertEqual(self.cap(149000).stdout, "")
 
     def test_above_default_limit_blocks_once(self):
-        out = json.loads(self.cap(310000).stdout)
+        out = json.loads(self.cap(160000).stdout)
         self.assertEqual(out["decision"], "block")
-        self.assertIn("310k", out["reason"])
-        self.assertIn("limit 300k", out["reason"])
-        self.assertEqual(self.cap(320000).stdout, "", "no second ask until +50k")
-        self.assertIn('"block"', self.cap(361000).stdout, "asks again after +50k")
+        self.assertIn("160k", out["reason"])
+        self.assertIn("limit 150k", out["reason"])
+        self.assertEqual(self.cap(170000).stdout, "", "no second ask until +50k")
+        self.assertIn('"block"', self.cap(211000).stdout, "asks again after +50k")
 
     def test_user_can_change_or_turn_off_the_limit(self):
-        self.assertIn("limit 150k", self.cap(160000, SAVE_CLEAR_CAP_TOKENS="150000").stdout)
+        self.assertIn("limit 300k", self.cap(310000, SAVE_CLEAR_CAP_TOKENS="300000").stdout)
         self.assertIn("limit 200k", self.cap(250000, sid=SID_B, CLAUDE_PLUGIN_OPTION_CONTEXT_CAP_TOKENS="200000").stdout)
         self.assertEqual(self.cap(900000, sid=SID_NEW, SAVE_CLEAR_CAP_TOKENS="0").stdout, "")
 
@@ -1023,9 +1023,9 @@ class ContextCap(Base):
         self.assertEqual(self.cap(400000, CLAUDE_JOB_DIR=os.path.join(self.t, "jobs", "j1")).stdout, "")
 
     def test_asks_again_after_the_context_shrinks(self):
-        self.assertIn('"block"', self.cap(310000).stdout)
+        self.assertIn('"block"', self.cap(160000).stdout)
         self.assertEqual(self.cap(100000).stdout, "", "after a compaction")
-        self.assertIn('"block"', self.cap(310000).stdout, "past the limit again: ask again")
+        self.assertIn('"block"', self.cap(160000).stdout, "past the limit again: ask again")
 
     def test_zero_usage_row_is_skipped(self):
         p = self.transcript(400000)
@@ -1043,7 +1043,7 @@ class ContextCap(Base):
         self.assertEqual(r.stdout, "")
         r = self.run_py("hooks/context_cap.py", stdin=None, CLAUDE_CODE_ENTRYPOINT="cli")
         self.assertEqual((r.returncode, r.stdout), (0, ""))
-        self.assertIn("limit 300k", self.cap(400000, SAVE_CLEAR_CAP_TOKENS="abc").stdout, "bad value = default")
+        self.assertIn("limit 150k", self.cap(400000, SAVE_CLEAR_CAP_TOKENS="abc").stdout, "bad value = default")
 
 
 def read_text(path):
@@ -1612,7 +1612,7 @@ class UserConfig(Base):
 
     def test_number_zero_and_false_in_the_file_are_values(self):
         self.config(context_cap_tokens=0, idle_minutes=0, publish_link=False)
-        out = self.py("print(common.setting('context_cap_tokens', '300000'), common.setting('idle_minutes', '50'),"
+        out = self.py("print(common.setting('context_cap_tokens', '150000'), common.setting('idle_minutes', '50'),"
                       " common.setting('publish_link', 'x'))")
         self.assertEqual(out, "0 0 false", "0 = off must not fall back to the default")
 
