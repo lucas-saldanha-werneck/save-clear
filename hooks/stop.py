@@ -9,6 +9,9 @@ No flag: exits at once. Rules:
   `save-clear-send --check` confirms the target runs this session.
 - A user message that arrived after the save blocks the stop (up to 3 rounds): Claude answers it,
   adds it to the snapshot and re-arms. The message never vanishes in the /clear.
+- A background subagent's result that arrived after the save blocks the stop the same way: Claude
+  records it in the snapshot and re-arms. While subagents still run, the helper waits for them
+  (flag `agents_wait`, kept up to AGENTS_MAX_AGE_MS) instead of asking Claude to stop them.
 """
 import json
 import os
@@ -18,11 +21,13 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
 from common import (BIN, CLEAR_DIR, MARGIN_MS, clear_key, clear_path, kill_background_tasks, log,  # noqa: E402
-                    notify, now_ms, read_hook_input, read_json, stop_tasks_instruction, user_messages_since,
-                    write_json)
+                    notify, now_ms, read_hook_input, read_json, stop_tasks_instruction, subagent_reports_since,
+                    user_messages_since, write_json)
 
 MAX_DELTAS = 3
 MAX_AGE_MS = 15 * 60 * 1000
+MAX_AGENT_ROUNDS = 20
+AGENTS_MAX_AGE_MS = int(os.environ.get("SAVE_CLEAR_AGENTS_MAX_AGE_MS", str(4 * 3600 * 1000)))  # waiting for subagents
 
 
 FLAG = {"path": ""}
@@ -79,7 +84,13 @@ def main():
     flag = find_flag(hook, job)
     if not flag:
         return
-    if now_ms() - int(flag.get("armed_at") or flag.get("ts") or 0) > MAX_AGE_MS:
+    age = now_ms() - int(flag.get("armed_at") or flag.get("ts") or 0)
+    if flag.get("agents_wait") and age > AGENTS_MAX_AGE_MS:
+        drop_flag()
+        log("stop", f"gave up: subagents still running {age // 60000} min after the save")
+        notify("save-clear: gave up waiting for this session's subagents. Type /clear yourself when they finish.")
+        return
+    if not flag.get("agents_wait") and age > MAX_AGE_MS:
         drop_flag()
         return
 
@@ -105,6 +116,8 @@ def main():
 
     deltas = int(flag.get("deltas") or 0)
     fresh = user_messages_since(hook.get("transcript_path"), int(flag.get("ts") or 0) - MARGIN_MS)
+    reports = subagent_reports_since(hook.get("transcript_path"), int(flag.get("ts") or 0) - MARGIN_MS)
+    listed = "; ".join(f"{tid} ({st or 'done'}): {summ}" for tid, st, summ in reports[-5:])
     if fresh and deltas < MAX_DELTAS:
         snap = my_snapshot(hook) or "(the one you wrote; it is this session's entry in the save-clear status output)"
         quoted = "; ".join('"' + " ".join(m[:300].split()) + '"' for m in fresh[-5:])
@@ -114,9 +127,26 @@ def main():
             "reason": (f"save-clear: a message from the user arrived after the save: {quoted}. Not cleared yet. "
                        "1) If you have not answered it, answer it (if it asks for work, do it). "
                        f"2) Add to the snapshot {snap} a section \"## After the save\" with only what came "
-                       "after: the message, your answer, what changed and any open question. Do not rewrite "
+                       "after: the message, your answer, what changed and any open question"
+                       + (f", and these subagent results: {listed}" if reports else "") + ". Do not rewrite "
                        f"the rest. 3) Run `{rearm}` and end the turn with one short line. "
                        "The /clear follows by itself."),
+        }))
+        return
+
+    if reports and int(flag.get("agent_rounds") or 0) < MAX_AGENT_ROUNDS:
+        snap = my_snapshot(hook) or "(the one you wrote; it is this session's entry in the save-clear status output)"
+        rearm = f"python3 \"{os.path.join(BIN, 'save-clear')}\" rearm {flag.get('session_id') or ''} --subagents"
+        log("stop", f"asked Claude to record {len(reports)} subagent result(s) that came after the save")
+        print(json.dumps({
+            "decision": "block",
+            "reason": (f"save-clear: background subagent result(s) arrived after the save: {listed}. Not cleared "
+                       "yet. 1) Handle each result as you normally would (check what it claims). "
+                       f"2) Add to the snapshot {snap}, in a section \"## After the save\", one line per subagent: "
+                       "its id, what it returned (PR, commit, numbers, paths), what you did with it and what is "
+                       "still open; mark it finished under \"## Running subagents\". Do not rewrite the rest. "
+                       f"3) Run `{rearm}` and end the turn with one short line. Do not stop the subagents "
+                       "still running: the /clear follows by itself after the last one finishes."),
         }))
         return
 

@@ -8,7 +8,7 @@ own entry. A global flag would hand the summary to whichever session starts firs
 import os
 import re
 
-from common import (app_host, RESUME_FLAG, RESUME_LOCK, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
+from common import (app_host, RESUME_FLAG, RESUME_LOCK, RUNNING_SECTION, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
                     read_json, write_json)
 
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
@@ -182,15 +182,27 @@ STOPPED_RE = re.compile(r"^" + re.escape(STOPPED_SECTION) + r"\b[^\n]*\n(.*?)(?=
 NONE_WORDS = {"", "none", "nothing", "-", "n/a"}
 
 
-def stopped_tasks(summary):
-    """True when the snapshot's stopped-tasks section lists at least one task (not just "none")."""
-    m = STOPPED_RE.search(summary)
+RUNNING_RE = re.compile(r"^" + re.escape(RUNNING_SECTION) + r"\b[^\n]*\n(.*?)(?=^#{1,2} |\Z)", re.M | re.S | re.I)
+
+
+def _lists_items(summary, rx, section):
+    m = rx.search(summary)
     if not m:
         return False
     heading = summary[m.start():].split("\n", 1)[0]
     words = [ln.strip(" \t-*").strip(".").lower() for ln in m.group(1).splitlines()]
-    words += [heading[len(STOPPED_SECTION):].strip(" ():.").lower()]  # "## Stopped background tasks (none)"
+    words += [heading[len(section):].strip(" ():.").lower()]  # "## Stopped background tasks (none)"
     return any(w not in NONE_WORDS for w in words)
+
+
+def stopped_tasks(summary):
+    """True when the snapshot's stopped-tasks section lists at least one task (not just "none")."""
+    return _lists_items(summary, STOPPED_RE, STOPPED_SECTION)
+
+
+def running_subagents(summary):
+    """True when the snapshot's running-subagents section lists at least one subagent."""
+    return _lists_items(summary, RUNNING_RE, RUNNING_SECTION)
 
 
 URL_RE = re.compile(r"^summary_url:\s*(https://\S+)\s*$", re.M)
@@ -216,6 +228,12 @@ def resume_text(snapshot_path, extra=""):
     if stopped_tasks(summary):
         lines += [f'The previous session stopped background tasks before the /clear (section "{STOPPED_SECTION[3:]}" '
                   "below). Name them in your summary, and say which ones need to be started again.", ""]
+    if running_subagents(summary):
+        lines += [f'Subagents were running when the previous session saved (section "{RUNNING_SECTION[3:]}" '
+                  'below). Their results normally come before the /clear, under "After the save". For one with '
+                  "no result there, do not assume it is still running or that SendMessage still reaches it: "
+                  "check its branch, worktree or PR first, then say whether it must be started again from its "
+                  "brief. Name them in your summary.", ""]
     if extra:
         lines += ["## From your on_resume_command (do this first)", "", extra, ""]
     lines += [summary, "", "---",

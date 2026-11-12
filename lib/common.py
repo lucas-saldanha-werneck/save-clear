@@ -322,6 +322,8 @@ def kill_background_tasks():
 
 # Snapshot section where Claude lists the background tasks it stopped before the automatic /clear.
 STOPPED_SECTION = "## Stopped background tasks"
+# Snapshot section where Claude lists the subagents still running at the save (never stopped by save-clear).
+RUNNING_SECTION = "## Running subagents"
 
 
 def stop_tasks_instruction(when, snapshot=""):
@@ -329,8 +331,10 @@ def stop_tasks_instruction(when, snapshot=""):
     background tasks (TaskStop); a hook cannot tell them apart from other processes, so it never kills."""
     return (f"kill_background_tasks: on. {when} stop every background task THIS session started that is still "
             "running (Bash commands run with run_in_background, Monitor watches): use the TaskStop tool "
-            "(KillShell in older versions) with each task id. Never stop anything this session did not start "
-            "(other sessions, the user's own programs, servers it did not launch). Then add to the snapshot "
+            "(KillShell in older versions) with each task id. Never stop a subagent (an Agent tool task): it is "
+            "work in progress, and the automatic /clear waits until it finishes. Never stop anything this "
+            "session did not start (other sessions, the user's own programs, servers it did not launch). "
+            "Then add to the snapshot "
             + (f"{snapshot} " if snapshot else "") + "a "
             f"section \"{STOPPED_SECTION}\" (this heading in English, exactly, whatever the snapshot's language) "
             "with one line per task (id, what it was doing, whether it must be started again), or \"none\" if "
@@ -532,6 +536,68 @@ def tail_lines(path, max_bytes=3 * 1024 * 1024):
             return f.read().decode("utf8", "ignore").splitlines()
     except Exception:
         return []
+
+
+def subagents_running(transcript):
+    """Background subagents still running while the main loop waits for input.
+
+    With a subagent running, `claude agents --json` keeps saying "busy" although the turn ended and the
+    prompt is empty (checked on 2.1.322). The turn's own end record (system/turn_duration) carries
+    pendingBackgroundAgentCount; it counts only while it is still the newest main-thread message
+    (a newer user or assistant record = a new turn started). 0 = none, or the turn did not end."""
+    for line in reversed(tail_lines(transcript) if transcript else []):
+        if '"timestamp"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("isSidechain"):
+            continue
+        if d.get("type") == "system" and d.get("subtype") == "turn_duration":
+            try:
+                return max(0, int(d.get("pendingBackgroundAgentCount") or 0))
+            except (TypeError, ValueError):
+                return 0
+        if d.get("type") in ("user", "assistant"):
+            return 0
+    return 0
+
+
+TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
+SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.S)
+STATUS_RE = re.compile(r"<status>\s*([^<\s]+)\s*</status>")
+
+
+def subagent_reports_since(transcript, since_ms):
+    """Subagent results that reached the main thread after since_ms: [(task id, status, summary)].
+
+    Claude Code delivers a finished background subagent as a <task-notification> user record whose
+    summary starts with "Agent"; background Bash commands use the same tag with another summary."""
+    out, seen = [], set()
+    for line in tail_lines(transcript) if transcript else []:
+        if "task-notification" not in line or '"timestamp"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") != "user" or d.get("isSidechain"):
+            continue
+        t = _ts_ms(d)
+        if t is None or t <= since_ms:
+            continue
+        txt = _text_of((d.get("message") or {}).get("content"))
+        for block in txt.split("<task-notification>")[1:]:
+            tid, summ = TASK_ID_RE.search(block), SUMMARY_RE.search(block)
+            if not tid or not summ or not summ.group(1).strip().startswith("Agent"):
+                continue
+            if tid.group(1) in seen:
+                continue
+            seen.add(tid.group(1))
+            st = STATUS_RE.search(block)
+            out.append((tid.group(1), st.group(1) if st else "", " ".join(summ.group(1).split())[:200]))
+    return out
 
 
 def user_messages_since(transcript, since_ms):

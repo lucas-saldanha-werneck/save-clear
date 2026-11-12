@@ -233,9 +233,29 @@ keep the session busy, so the helper never sees it idle and only re-arms the `/c
 
 The plugin itself never kills a process. Hooks and the helper cannot tell this session's background
 tasks apart from other processes (MCP servers, other sessions, your own programs), and only Claude
-can stop its own tasks, so this works through instructions to Claude, not from a hook. It was not
-watched in a live session whether a running background task makes `claude agents` report the session
-as busy.
+can stop its own tasks, so this works through instructions to Claude, not from a hook.
+
+### Subagents still running
+
+A background subagent (Agent tool) is work in progress, not a leftover. While one runs, `claude agents`
+reports the session as `busy` even after the turn ended with an empty prompt (watched on Claude Code
+2.1.322). Before 0.11.0 the helper took that for a leftover task, and with `kill_background_tasks` on
+the Stop hook asked Claude to stop "every background task", so subagents were stopped mid-work and
+their results lost. Now:
+
+- The helper reads the turn's end record in the transcript (`pendingBackgroundAgentCount`). Subagents
+  still running: it types nothing and re-arms with `agents_wait`. That wait does not count toward the
+  5 re-arms, is never treated as busy, and the request is kept for up to 4 hours
+  (`SAVE_CLEAR_AGENTS_MAX_AGE_MS`), then given up with a notice.
+- Each result arrives as a notification and ends a turn. The Stop hook then blocks and asks Claude to
+  record it under `## After the save` and run `save-clear rearm <session id> --subagents` (up to 20
+  rounds; they do not use up the 3 rounds kept for your own messages). The `/clear` happens after the
+  last subagent finishes.
+- The skill lists running subagents under `## Running subagents` (id, task, brief, branch or
+  worktree). After the `/clear`, the resume tells the new session to check any that has no result
+  before restarting it. In the desktop app or a terminal without tmux, the skill does not clear while
+  subagents run: it says "You can /clear once the subagents finish."
+- The stop-tasks instruction (`kill_background_tasks`) now says never to stop a subagent.
 
 Two backups run without the skill. Before any compaction, the full transcript is saved gzipped with
 an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker; the backup is readable by you only, and the 10 newest

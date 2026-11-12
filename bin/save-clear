@@ -6,7 +6,9 @@
   save-clear arm-resume <file>   run on_save_command (its output is appended to <file>), then: the next
                                  session started by /clear in THIS session gets <file>
   save-clear arm-clear           pick how the automatic /clear can be sent and arm the Stop hook
-  save-clear rearm [session_id]  after saving "what came after the save", arm THIS session's /clear again
+  save-clear rearm [session_id] [--subagents]
+                                 after saving "what came after the save", arm THIS session's /clear again
+                                 (--subagents: the round was a subagent's result, not a user message)
   save-clear status              print the pending resume entries and the pending /clear requests (JSON)
 """
 import json
@@ -162,19 +164,23 @@ def own_clear(sid, job):
 
 
 def cmd_rearm(args):
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or (args[0] if args else "")
+    pos = [a for a in args if not a.startswith("--")]
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or (pos[0] if pos else "")
     job = os.path.basename(os.environ.get("CLAUDE_JOB_DIR") or "")
     flag = own_clear(sid, job)
     if not flag:
         print(f"save-clear: no /clear request of this session to re-arm (session {sid[:8] or '?'})", file=sys.stderr)
         return 1
     flag["ts"] = flag["armed_at"] = now_ms()
-    flag["deltas"] = flag.get("deltas", 0) + 1
-    # This round was the user's message, which is what kept the session busy: not a leftover task.
+    subagents = "--subagents" in args
+    counter = "agent_rounds" if subagents else "deltas"  # subagent results do not use up the user's 3 rounds
+    flag[counter] = flag.get(counter, 0) + 1
+    # This round was the user's message (or a subagent's result), which is what kept the session busy:
+    # not a leftover task.
     flag.pop("busy_rearm", None)
     flag["key"] = flag.get("key") or (clear_key(job=job) if job and flag.get("mode") == "bg" else clear_key(sid))
     write_clear(flag)
-    print(f"re-armed (round {flag['deltas']} after the save)")
+    print(f"re-armed (round {flag[counter]} after the save" + (", subagent results)" if subagents else ")"))
     return 0
 
 
