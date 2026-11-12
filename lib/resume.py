@@ -131,6 +131,15 @@ def arm(snapshot, session_id=None, env=None):
     return True, msg
 
 
+def _readable(path):
+    try:
+        with open(path, encoding="utf8") as f:
+            f.read(1)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def take(hook, env, now):
     """Find and remove this session's entry. Returns (entry or None, why)."""
     with locked(RESUME_LOCK):  # an arm in another session waits instead of being overwritten
@@ -151,6 +160,12 @@ def _take(hook, env, now):
     misses = []
     for i, e in enumerate(live):
         ok, why = match(e, hook, env, now)
+        if ok and not _readable(e.get("snapshot")):
+            # Remove the entry only once its snapshot can be read: a later SessionStart can still take it.
+            log("resume", f"snapshot unreadable for {who}: {e.get('snapshot')}. Flag kept.")
+            if len(live) < len(entries):
+                write_entries(live)
+            return None, ""
         if ok:
             write_entries(live[:i] + live[i + 1:])
             log("resume", f"delivered {os.path.basename(e['snapshot'])} to {who} ({why})")

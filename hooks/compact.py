@@ -5,15 +5,53 @@
   compact.py post   PostCompact: keep the summary Claude Code wrote as COMPACT-SUMMARY-<ts>-<sid>.md
 """
 import datetime
+import glob
 import gzip
 import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from common import log, read_hook_input, snapshot_dir  # noqa: E402
+
+# Emergency backups kept in the snapshot folder (newest first); older ones are deleted. 0 = keep all.
+try:
+    KEEP = max(0, int(os.environ.get("SAVE_CLEAR_EMERGENCY_KEEP", "10")))
+except ValueError:
+    KEEP = 10
+
+
+def gzip_private(src_path, dst_path):
+    """Gzip src to dst readable by the owner only (0600), via a temporary file in the same folder:
+    a hook killed half way leaves no truncated backup under the final name."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst_path), prefix=".tmp-", suffix=".jsonl.gz")
+    try:
+        os.chmod(tmp, 0o600)
+        with open(src_path, "rb") as src, os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as dst:
+            shutil.copyfileobj(src, dst)
+        os.replace(tmp, dst_path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def prune(snap):
+    """Keep the KEEP newest EMERGENCY-COMPACT backups (gzip + marker); the names sort by time."""
+    if not KEEP:
+        return
+    gz = sorted(glob.glob(os.path.join(snap, "EMERGENCY-COMPACT-*.jsonl.gz")), key=os.path.basename)
+    for old in gz[:-KEEP]:
+        for path in (old, old[:-len(".jsonl.gz")] + ".md"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def pre(hook, snap, ts, sid8, iso):
@@ -21,14 +59,14 @@ def pre(hook, snap, ts, sid8, iso):
     if not tp or not os.path.isfile(tp):
         return None
     base = f"EMERGENCY-COMPACT-{ts}-{sid8}"
-    with open(tp, "rb") as src, gzip.open(os.path.join(snap, base + ".jsonl.gz"), "wb") as dst:
-        shutil.copyfileobj(src, dst)
+    gzip_private(tp, os.path.join(snap, base + ".jsonl.gz"))
     with open(os.path.join(snap, base + ".md"), "w", encoding="utf8") as f:
         f.write("\n".join([
             "---", "type: emergency-compact", f"session_id: {hook.get('session_id') or 'unknown'}",
             f"trigger: {hook.get('trigger') or 'unknown'}", f"original_transcript: {tp}", f"ts: {iso}", "---", "",
             "EMERGENCY snapshot from the PreCompact hook: the session compacted BEFORE a save-clear.",
             f"Automatic, NOT curated or verified. Full transcript: {base}.jsonl.gz (gunzip -k to open).", ""]))
+    prune(snap)
     return f"save-clear: emergency snapshot saved ({base})"
 
 

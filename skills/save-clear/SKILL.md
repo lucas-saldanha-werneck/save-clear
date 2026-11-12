@@ -163,7 +163,7 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
 ## Safety nets (no ritual needed)
 
 - **PreCompact**: before any compaction, the full transcript is saved gzipped with an
-  `EMERGENCY-COMPACT-<ts>-<sid>.md` marker in the snapshot folder.
+  `EMERGENCY-COMPACT-<ts>-<sid>.md` marker in the snapshot folder (the 10 newest are kept).
 - **PostCompact**: the summary Claude Code wrote is kept as `COMPACT-SUMMARY-<ts>-<sid>.md`.
 - On resume, a curated SESSION-SUMMARY is worth more than these. An EMERGENCY-COMPACT newer than the
   project's last SESSION-SUMMARY means the session compacted without a save: treat it as NOT verified.

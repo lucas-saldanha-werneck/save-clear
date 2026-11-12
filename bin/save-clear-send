@@ -173,7 +173,8 @@ def new_messages():
 # ----- bg mode: no terminal of its own; attach in a hidden tmux, type, detach -----
 def job_state():
     try:
-        with open(os.path.join(os.path.expanduser("~"), ".claude", "jobs", target, "state.json"), encoding="utf-8") as f:
+        config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+        with open(os.path.join(config, "jobs", target, "state.json"), encoding="utf-8") as f:
             v = json.load(f)
         return v if isinstance(v, dict) else {}
     except Exception:

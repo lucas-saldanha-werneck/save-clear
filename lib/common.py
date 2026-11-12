@@ -163,8 +163,13 @@ def seed_user_config():
 RESUME_MSG = ("save-clear: resuming. Start with the LAST topic (where we stopped and what is still open); "
               "then, in one short paragraph, the rest that was saved and the next steps.")
 
+# Records Claude Code writes as user messages, wrapped in one of its own tags. A message the user typed
+# that merely starts with "<" (say "<3 thanks") is still the user's.
+SYSTEM_TAG = (r"<(?:command-[a-z-]+|local-command-[a-z-]+|task-notification|system-reminder|bash-[a-z-]+|"
+              r"user-prompt-submit-hook|channel|teammate-message|cross-session-message|persisted-output|"
+              r"new-diagnostics|tick|ide_[a-z_]+|user-memory-input|scheduled-task)[\s>]")
 # Messages that are not the user's own words
-NOT_HUMAN = re.compile(r"^(<|Stop hook feedback|Base directory for this skill|save-clear: resuming|"
+NOT_HUMAN = re.compile(r"^(" + SYSTEM_TAG + r"|Stop hook feedback|Base directory for this skill|save-clear: resuming|"
                        r"save-clear \(automatic|\[Request interrupted|Caveat:|"
                        r"This session is being continued from a previous conversation)")
 MARGIN_MS = 15000  # a message delivered just before the flag may not be in the snapshot
@@ -194,13 +199,17 @@ def user_config():
 
 
 def setting(name, default=""):
-    """Plugin option (CLAUDE_PLUGIN_OPTION_<NAME>), then env var, then the copy in config.json,
-    then the user's own config file."""
-    for var in ("CLAUDE_PLUGIN_OPTION_" + name.upper(), OPTIONS.get(name, "")):
-        value = (os.environ.get(var) or "").strip() if var else ""
-        if value:
-            return value
-    return _as_text(_saved_config().get(name)) or _as_text(user_config().get(name)) or default
+    """Plugin option (CLAUDE_PLUGIN_OPTION_<NAME>, or in Bash, where it is not set, the copy the
+    SessionStart hook saved in config.json), then env var, then the user's own config file."""
+    value = (os.environ.get("CLAUDE_PLUGIN_OPTION_" + name.upper()) or "").strip()
+    if value:
+        return value
+    value = _as_text(_saved_config().get(name))
+    if value:
+        return value
+    var = OPTIONS.get(name, "")
+    value = (os.environ.get(var) or "").strip() if var else ""
+    return value or _as_text(user_config().get(name)) or default
 
 
 def _as_text(value):
@@ -495,10 +504,15 @@ def read_hook_input():
 
 
 def _text_of(content):
+    """The text of a message; an image with no text counts as "[image]" (it is a message too)."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+        blocks = [b for b in content if isinstance(b, dict)]
+        text = " ".join(b.get("text") or "" for b in blocks if b.get("type") == "text")
+        if not text.strip() and any(b.get("type") == "image" for b in blocks):
+            return "[image]"
+        return text
     return ""
 
 

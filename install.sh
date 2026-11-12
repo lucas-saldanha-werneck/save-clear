@@ -3,7 +3,7 @@
 #
 #   ./install.sh --idle               macOS: write and load a launchd job that runs it every 2 minutes
 #                                     Linux: print the cron line to add (nothing is changed)
-#   ./install.sh --idle --interval N  run every N seconds instead of 120 (Linux: a multiple of 60, at most 3540)
+#   ./install.sh --idle --interval N  run every N seconds instead of 120 (Linux: whole minutes that divide the hour)
 #   ./install.sh --uninstall          macOS: unload and delete the launchd job
 #   --dry-run                         print what would be done, change nothing
 #
@@ -46,22 +46,27 @@ STATE_DIR="$("$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import commo
 ERR_LOG="$STATE_DIR/idle-job.log"
 
 xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+# A value for the crontab line: single-quoted for sh, and % escaped (cron turns a bare % into a newline).
+cronq() { printf "'%s'" "$(printf '%s' "$1" | sed -e "s/'/'\\\\''/g" -e 's/%/\\%/g')"; }
 
 if [ "$OS" != "Darwin" ]; then
   if [ "$ACTION" = install ]; then
-    # cron steps in whole minutes and */N must divide the hour cleanly to mean "every N minutes".
-    if [ $((INTERVAL % 60)) -ne 0 ] || [ "$INTERVAL" -gt 3540 ]; then
-      echo "install.sh: on Linux (cron) --interval must be a multiple of 60 seconds, at most 3540; got $INTERVAL" >&2
+    # cron steps in whole minutes and */N must divide the hour cleanly to mean "every N minutes"
+    # (*/45 runs at :00 and :45).
+    MIN=$((INTERVAL / 60))
+    if [ $((INTERVAL % 60)) -ne 0 ] || [ "$MIN" -gt 30 ] || [ $((60 % MIN)) -ne 0 ]; then
+      echo "install.sh: on Linux (cron) --interval must be a multiple of 60 seconds that divides the hour" \
+           "(60, 120, 180, 240, 300, 360, 600, 720, 900, 1200 or 1800); got $INTERVAL" >&2
       exit 2
     fi
-    MIN=$((INTERVAL / 60))
     CFG=""
-    [ -n "${CLAUDE_CONFIG_DIR:-}" ] && CFG="CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR "
+    [ -n "${CLAUDE_CONFIG_DIR:-}" ] && CFG="CLAUDE_CONFIG_DIR=$(cronq "$CLAUDE_CONFIG_DIR") "
+    mkdir -p "$STATE_DIR"  # the line appends its errors there; cron would fail on a missing folder
     echo "launchd is macOS only. To run the idle trigger on this system, add this line with 'crontab -e':"
     echo
-    echo "*/$MIN * * * * ${CFG}PATH=$(dirname "$PY"):\$PATH:/usr/local/bin:/usr/bin:/bin $PY $SCRIPT >/dev/null 2>>$ERR_LOG"
+    echo "*/$MIN * * * * ${CFG}PATH=$(cronq "$(dirname "$PY")"):\$PATH:/usr/local/bin:/usr/bin:/bin $(cronq "$PY") $(cronq "$SCRIPT") >/dev/null 2>>$(cronq "$ERR_LOG")"
     echo
-    echo "It needs tmux and the claude CLI on that PATH. Nothing was changed."
+    echo "It needs tmux and the claude CLI on that PATH. Only the state folder was created ($STATE_DIR)."
   else
     echo "launchd is macOS only; remove the save-clear-idle line from 'crontab -e' if you added one."
   fi
