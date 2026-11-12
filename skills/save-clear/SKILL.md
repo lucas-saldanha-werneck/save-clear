@@ -22,7 +22,9 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    costly to find. Turn relative dates ("yesterday", "next week") into absolute dates. An open item
    inherited from an earlier summary goes in only after you checked it against the real state (file,
    log, process): done → leave it out; could not check → mark it "(not checked)". Items the user
-   postponed go in with their trigger ("before the meeting").
+   postponed go in with their trigger ("before the meeting"). Subagents this session started that are
+   still running (Agent tool, background) are work in progress, not leftovers: never stop them for the
+   save; list them under `## Running subagents` (step 3).
 
 2. **Update persistent memory, if the project has it.** Claude Code's auto memory lives in
    `~/.claude/projects/<project>/memory/` with a `MEMORY.md` index. If that folder exists:
@@ -39,7 +41,8 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    line says now: stop the background tasks THIS session started that are still running (TaskStop with
    each task id) and list them under `## Stopped background tasks` in the snapshot (that heading stays in
    English, exactly, even when the snapshot is in another language: the resume looks for it). Never stop anything
-   this session did not start. That option off (no such line) = leave background tasks alone.
+   this session did not start, and never stop a subagent (Agent tool task): the automatic /clear waits for
+   it. That option off (no such line) = leave background tasks alone.
    Write `<folder>/SESSION-SUMMARY-<YYYYMMDD-HHMMSS>-<short-slug>.md`:
 
    ```markdown
@@ -58,8 +61,11 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    ## Next steps (in order)
    ## Open items / risks
    ## Useful paths, commands and IDs
+   ## Running subagents (ONLY when subagents of this session are still running: one line each - agent id, what it does, brief path, branch/worktree, what to do with its result)
    ## Stopped background tasks (ONLY when kill_background_tasks is on: one line per task - id, what it did, restart needed? - or "none")
    ```
+
+   Both headings stay in English, exactly, whatever the snapshot's language: the resume looks for them.
 
    The frontmatter makes a **chain of snapshots**: each points to the previous one, so a multi-session
    project's history can be rebuilt.
@@ -94,7 +100,7 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
    > Saved: memory (<files touched, or "none">), summary in `<snapshot path>`, auto-resume armed. You can /clear now.
 
    In save-and-clear mode, end with "clearing by itself in a moment." instead, but only when step 8
-   armed an automatic clear.
+   armed an automatic clear (with subagents still running: "clearing by itself after the subagents finish.").
 
 8. **Save-and-clear mode: arm the automatic /clear.** Only when asked, and ALWAYS with step 6 armed.
    Run:
@@ -149,9 +155,20 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
         turn ends. If `clear_session` refuses, turn Remote Control back on at once (`enabled: true`) when
         you turned it off, and change the reply to "You can /clear now."
 
+   **Subagents still running.** A running background subagent keeps the session "busy" even with the
+   turn over, and its result would be lost in the /clear. So the /clear waits for it:
+   - **`tmux` or `bg`**: end the turn as usual. The helper sees the subagents and re-arms without
+     typing. Each result arrives as a notification; the Stop hook then asks you to record it under
+     `## After the save` and run the `save-clear rearm <session id> --subagents` command it gives. The
+     /clear happens after the last one finishes (the wait is given up after 4 hours, with a notice).
+   - **`app`** or **`manual`**: do not call `clear_session`. Reply "Saved ... You can /clear once the
+     subagents finish." and stop.
+   Never stop a subagent to make the /clear happen sooner, unless the user asks.
+
    **Busy session (kill_background_tasks on).** If the helper found the session still busy, the Stop
-   hook blocks once and asks you to stop this session's leftover background tasks and list them in the
-   snapshot. Do only that, end the turn with one short line, and the /clear follows.
+   hook blocks once and asks you to stop this session's leftover background tasks (Bash, Monitor; never
+   subagents) and list them in the snapshot. Do only that, end the turn with one short line, and the
+   /clear follows.
 
    **A user message during the save.** If one arrives while you save, answer it and put it in the
    snapshot before step 8. If it arrives after step 8, the Stop hook does not clear: it blocks and asks

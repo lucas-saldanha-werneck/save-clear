@@ -17,6 +17,9 @@ Safety rules:
   file shows a new conversation id (bg). Only then is the resume request typed.
 - A user message after the save, or a session that goes back to work: it does not clear. It
   re-arms the flag and exits: the next Stop hook decides.
+- Background subagents of this session still running (the turn ended, but `claude agents` stays
+  "busy"): it does not clear and never asks Claude to stop them. It re-arms with `agents_wait`; each
+  subagent's result starts a new turn, and the /clear happens after the last one.
 
 Usage: save-clear-send <tmux|bg> <target> <session_id> <flag-json> <transcript>
        save-clear-send --check <tmux|iterm> <target> <session_id>   (0 ok, 1 refused, 2 unknown)
@@ -33,7 +36,8 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 from common import (BIN, MARGIN_MS, ancestors, claude_bin, clear_key, draft_why,  # noqa: E402
                     log as _log, notify, now_ms, prompt_block, prompt_text, ps_parents, resume_msg,
-                    run_hook_command, short, squash, tmux_bin, user_messages_since, write_clear)
+                    run_hook_command, short, squash, subagents_running, tmux_bin, user_messages_since,
+                    write_clear)
 
 CLAUDE = claude_bin()
 RESUME_MSG = resume_msg()  # the resume_message option, else the default text
@@ -130,9 +134,12 @@ def refuse(why):
     sys.exit(3)
 
 
-def rearm(why, busy=False):
+def rearm(why, busy=False, agents=0):
     """Write this session's flag back so the next Stop hook tries again. busy=True: the session stayed
-    busy (with kill_background_tasks on, the Stop hook then asks Claude to stop leftover background tasks)."""
+    busy (with kill_background_tasks on, the Stop hook then asks Claude to stop leftover background tasks).
+    agents=N: the turn ended but N background subagents still run. That wait is not a failed attempt:
+    each subagent's result ends a turn and fires the Stop hook again, so it does not count toward the
+    5 re-arms, and it is never marked busy (a subagent is work in progress, not a leftover task)."""
     try:
         flag = json.loads(flag_json)
     except Exception:
@@ -141,6 +148,16 @@ def rearm(why, busy=False):
         log(f"not re-armed ({why}): empty flag")
         return
     flag["armed_at"] = now_ms()
+    if agents:
+        if not flag.get("agents_wait"):
+            notify(f"save-clear: the /clear waits for {agents} subagent(s) of this session to finish.", success=True)
+        flag["agents_wait"] = agents
+        flag.pop("busy_rearm", None)
+        flag["key"] = flag.get("key") or (clear_key(job=target) if mode == "bg" else clear_key(flag.get("session_id") or sid))
+        write_clear(flag)
+        log(f"re-armed ({why}); the next end of turn tries again")
+        return
+    flag.pop("agents_wait", None)
     flag["rearms"] = flag.get("rearms", 0) + 1
     if flag["rearms"] > 5:
         log(f"gave up ({why}): already re-armed 5 times")
@@ -282,6 +299,10 @@ def run_bg():
         if st and st != "working":
             break
         if time.time() - t0 > BG_WAIT:
+            n = subagents_running(transcript)
+            if n:
+                rearm(f"{n} background subagent(s) of this job still running; the /clear waits for them", agents=n)
+                return 0
             rearm(f"the job stayed {st or 'unknown'} for {int(BG_WAIT)} s; typed nothing", busy=True)
             return 0
         time.sleep(1)
@@ -375,13 +396,20 @@ def press_enter(text):
     keys("Enter")
 
 
+def waiting_for_subagents():
+    """N > 0: the turn ended and the screen is not working, but N background subagents still run."""
+    n = subagents_running(transcript)
+    return n if n and "esc to interrupt" not in screen() else 0
+
+
 def free():
-    """(free, reason). Free = expected session + idle + empty prompt."""
+    """(free, reason). Free = expected session + idle + empty prompt. "subagents" = the turn ended, but
+    background subagents of this session still run (`claude agents` says busy until they finish)."""
     ag, why = ours()
     if ag is None:
         return False, why
     if ag.get("status") != "idle":
-        return False, "busy"
+        return False, "subagents" if waiting_for_subagents() else "busy"
     s = screen()
     if "esc to interrupt" in s:
         return False, "busy"
@@ -444,6 +472,10 @@ def run_tmux():
         if ok:
             stop_if_new("before starting")
             break
+        if why == "subagents":
+            n = waiting_for_subagents() or 1
+            rearm(f"{n} background subagent(s) of this session still running; the /clear waits for them", agents=n)
+            return 0
         if why == "busy":
             busy_since = busy_since or time.time()
             if time.time() - busy_since > 8:
@@ -473,7 +505,10 @@ def run_tmux():
                 break
             time.sleep(1)
         if not sent:
-            rearm(f"before /clear: {why}")
+            if why == "subagents":
+                rearm("before /clear: a background subagent of this session is running", agents=waiting_for_subagents() or 1)
+            else:
+                rearm(f"before /clear: {why}")
             return 0
         if DRY:
             log("dry-run: stopped before confirming /clear (nothing was typed)")

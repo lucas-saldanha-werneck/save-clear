@@ -1956,6 +1956,162 @@ class KillBackgroundTasks(Base):
         self.assertIn("tail -f app.log", ctx)
 
 
+def turn_end(pending, offset_s=0):
+    """The record Claude Code writes when a turn ends (2.1.322), with background subagents still running."""
+    e = {"type": "system", "subtype": "turn_duration", "durationMs": 1000, "timestamp": iso(offset_s)}
+    if pending:
+        e["pendingBackgroundAgentCount"] = pending
+    return e
+
+
+def notification(task_id, summary, offset_s=1, status="completed"):
+    return {"type": "user", "timestamp": iso(offset_s), "message": {"role": "user", "content": (
+        f"<task-notification>\n<task-id>{task_id}</task-id>\n<tool-use-id>toolu_x</tool-use-id>\n"
+        f"<status>{status}</status>\n<summary>{summary}</summary>\n</task-notification>")}}
+
+
+class Subagents(Base):
+    """Background subagents: the /clear waits for them, never asks Claude to stop them, and their results
+    reach the snapshot before the /clear (seen on 12/11/2026: subagents stopped mid-work, results lost)."""
+    PANE_PID = 4242
+
+    def setUp(self):
+        super().setUp()
+        home = os.path.join(self.t, "home")
+        os.makedirs(home)
+        self.env.update(HOME=home, USERPROFILE=home)
+
+    def transcript(self, *entries):
+        p = os.path.join(self.proj, "t.jsonl")
+        with open(p, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        return p
+
+    def write_flag(self, **extra):
+        os.makedirs(self.flag_path("clear"), exist_ok=True)
+        f = {"session_id": SID_A, "mode": "manual-test", "target": "", "key": SID_A,
+             "ts": int(time.time() * 1000) - 5000}
+        f.update(extra)
+        with open(self.flag_path(f"clear/{SID_A}.json"), "w") as fh:
+            json.dump(f, fh)
+        return f
+
+    def read_flag(self):
+        with open(self.flag_path(f"clear/{SID_A}.json")) as f:
+            return json.load(f)
+
+    def stop(self, tp, **env):
+        return self.run_py("hooks/stop.py", stdin={"session_id": SID_A, "transcript_path": tp}, **env)
+
+    def common(self, expr):
+        code = f"import sys; sys.path.insert(0, {os.path.join(ROOT, 'lib')!r}); import common; print({expr})"
+        r = subprocess.run([PY, "-c", code], capture_output=True, text=True, env=self.env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def test_running_count_comes_from_the_last_turn_end(self):
+        user = {"type": "user", "timestamp": iso(), "message": {"role": "user", "content": "hi"}}
+        cases = [((user, turn_end(2)), "2"), ((user, turn_end(0)), "0"), ((turn_end(2), user), "0"),
+                 ((turn_end(3), {"type": "attachment", "timestamp": iso()}), "3"),
+                 ((turn_end(1), dict(user, isSidechain=True)), "1"), ((), "0")]
+        for entries, want in cases:
+            tp = self.transcript(*entries)
+            self.assertEqual(self.common(f"common.subagents_running({tp!r})"), want, entries)
+
+    def test_reports_keep_only_subagents_after_the_save(self):
+        tp = self.transcript(notification("aold", 'Agent "old one" completed', offset_s=-120),
+                             notification("b123", 'Background command "sleep 5" completed'),
+                             notification("a456", 'Agent "fix the bug" completed'),
+                             notification("a789", 'Agent "vision" was stopped', status="killed"))
+        since = int(time.time() * 1000) - 60000
+        out = self.common(f"[r[0] + ':' + r[1] for r in common.subagent_reports_since({tp!r}, {since})]")
+        self.assertEqual(out, "['a456:completed', 'a789:killed']")
+
+    def test_stop_tasks_instruction_never_includes_subagents(self):
+        self.assertIn("Never stop a subagent", self.common("common.stop_tasks_instruction('Now,')"))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_helper_waits_for_subagents_instead_of_marking_busy(self):
+        fake = os.path.join(self.t, "fake_claude.sh")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\necho '" + json.dumps([{"kind": "interactive", "pid": self.PANE_PID, "sessionId": SID_A,
+                                                       "status": "busy", "cwd": self.proj}]) + "'\n")
+        os.chmod(fake, 0o755)
+        user = {"type": "user", "timestamp": iso(-30), "message": {"role": "user", "content": "go"}}
+        tp = self.transcript(user, turn_end(2, -20))
+        flag = {"session_id": SID_A, "mode": "tmux", "target": "%7", "key": SID_A, "rearms": 4,
+                "ts": int(time.time() * 1000) - 60000}
+        r = self.run_py("bin/save-clear-send", ["tmux", "%7", SID_A, json.dumps(flag), tp], SAVE_CLEAR_CLAUDE=fake,
+                        FAKE_TMUX_PANES=f"{self.PANE_PID} %7", SAVE_CLEAR_START_DELAY="0", SAVE_CLEAR_MAX_WAIT="30")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = os.path.join(self.t, "tmux-calls.jsonl")
+        typed = ""
+        if os.path.exists(calls):
+            with open(calls) as fh:
+                typed = fh.read()
+        self.assertNotIn("send-keys", typed, "nothing typed while subagents run")
+        f = self.read_flag()
+        self.assertEqual(f.get("agents_wait"), 2)
+        self.assertNotIn("busy_rearm", f, "a subagent is not a leftover task")
+        self.assertEqual(f.get("rearms"), 4, "waiting for subagents does not use up the re-arms")
+        with open(self.flag_path("save-clear.log")) as fh:
+            self.assertIn("2 background subagent(s) of this session still running", fh.read())
+
+    def test_stop_hook_asks_to_record_a_result_after_the_save(self):
+        self.write_flag(agents_wait=1, busy_rearm=True)
+        tp = self.transcript(turn_end(1, -3), notification("a456", 'Agent "fix the bug" completed'))
+        out = json.loads(self.stop(tp, SAVE_CLEAR_KILL_BACKGROUND_TASKS="on").stdout)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("a456", out["reason"])
+        self.assertIn("## After the save", out["reason"])
+        self.assertIn(f"rearm {SID_A} --subagents", out["reason"])
+        self.assertNotIn("TaskStop", out["reason"])
+        self.assertTrue(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "flag kept")
+
+    def test_rearm_for_subagents_keeps_the_users_rounds(self):
+        self.write_flag(deltas=2)
+        r = self.run_py("bin/save-clear", ["rearm", SID_A, "--subagents"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("subagent results", r.stdout)
+        f = self.read_flag()
+        self.assertEqual((f.get("deltas"), f.get("agent_rounds")), (2, 1))
+        tp = self.transcript(notification("a456", 'Agent "fix the bug" completed', offset_s=-30))
+        out = self.stop(tp).stdout
+        self.assertNotIn('"decision": "block"', out, "a result recorded before the re-arm is not asked again")
+
+    def test_background_command_results_do_not_block(self):
+        self.write_flag()
+        tp = self.transcript(notification("b123", 'Background command "sleep 5" completed'))
+        self.assertNotIn('"decision": "block"', self.stop(tp).stdout)
+
+    def test_user_message_round_also_names_subagent_results(self):
+        self.write_flag()
+        tp = self.transcript(notification("a456", 'Agent "fix the bug" completed'),
+                             {"type": "user", "timestamp": iso(2), "message": {"role": "user", "content": "status?"}})
+        reason = json.loads(self.stop(tp).stdout)["reason"]
+        self.assertIn("status?", reason)
+        self.assertIn("a456", reason)
+
+    def test_waiting_flag_outlives_the_15_minute_limit(self):
+        old = int(time.time() * 1000) - 20 * 60 * 1000
+        tp = self.transcript(turn_end(1, -3))
+        self.write_flag(ts=old, armed_at=old)
+        self.assertEqual(self.stop(tp).stdout, "", "a plain flag that old is dropped")
+        self.write_flag(ts=old, armed_at=old, agents_wait=1)
+        self.assertIn("as soon as the session is free", self.stop(tp).stdout)
+        self.write_flag(ts=old, armed_at=old, agents_wait=1)
+        self.assertEqual(self.stop(tp, SAVE_CLEAR_AGENTS_MAX_AGE_MS="60000").stdout, "", "given up after the wait limit")
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+
+    def test_resume_names_running_subagents_only_if_listed(self):
+        for body, named in (("## Running subagents\nnone\n", False), ("", False),
+                            ("## Running subagents\n- a4be7f19: vision, worktree ~/wt/v, brief /tmp/b.md\n", True)):
+            self.arm(self.snapshot("# Session\n## Last topic\nx\n" + body))
+            ctx = json.loads(self.start(CLAUDE_PID=4242).stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertEqual("Subagents were running when the previous session saved" in ctx, named, body)
+
+
 EXAMPLE = os.path.join(ROOT, "config.example.json")
 SETTINGS_DUMP = """
 import json, sys
