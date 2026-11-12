@@ -229,11 +229,14 @@ def resume_text(snapshot_path, extra=""):
         lines += [f'The previous session stopped background tasks before the /clear (section "{STOPPED_SECTION[3:]}" '
                   "below). Name them in your summary, and say which ones need to be started again.", ""]
     if running_subagents(summary):
-        lines += [f'Subagents were running when the previous session saved (section "{RUNNING_SECTION[3:]}" '
-                  'below). Their results normally come before the /clear, under "After the save". For one with '
-                  "no result there, do not assume it is still running or that SendMessage still reaches it: "
-                  "check its branch, worktree or PR first, then say whether it must be started again from its "
-                  "brief. Name them in your summary.", ""]
+        lines += [f'Subagents of the previous session were still running at the /clear (section '
+                  f'"{RUNNING_SECTION[3:]}" below). They keep running: each result arrives in THIS conversation '
+                  "as a task notification with the subagent's id; one may already be here, before this text, "
+                  "if it finished during the /clear. Look for those first. Name them in your summary. When a result "
+                  "arrives, find its line in that section by id, check what it claims (PR, commit, CI, files) "
+                  "and do the follow-up that line names (install, test, tell the user). A result already listed "
+                  'under "After the save" is done. If one never reports, check its branch, worktree or PR before '
+                  "starting it again from its brief.", ""]
     if extra:
         lines += ["## From your on_resume_command (do this first)", "", extra, ""]
     lines += [summary, "", "---",

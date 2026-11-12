@@ -322,7 +322,8 @@ def kill_background_tasks():
 
 # Snapshot section where Claude lists the background tasks it stopped before the automatic /clear.
 STOPPED_SECTION = "## Stopped background tasks"
-# Snapshot section where Claude lists the subagents still running at the save (never stopped by save-clear).
+# Snapshot section where Claude lists the subagents still running at the save: they survive /clear and
+# their results reach the new conversation, which reads this section to know what each one is for.
 RUNNING_SECTION = "## Running subagents"
 
 
@@ -332,7 +333,7 @@ def stop_tasks_instruction(when, snapshot=""):
     return (f"kill_background_tasks: on. {when} stop every background task THIS session started that is still "
             "running (Bash commands run with run_in_background, Monitor watches): use the TaskStop tool "
             "(KillShell in older versions) with each task id. Never stop a subagent (an Agent tool task): it is "
-            "work in progress, and the automatic /clear waits until it finishes. Never stop anything this "
+            "work in progress, it survives the /clear and reports to the new conversation. Never stop anything this "
             "session did not start (other sessions, the user's own programs, servers it did not launch). "
             "Then add to the snapshot "
             + (f"{snapshot} " if snapshot else "") + "a "
@@ -538,13 +539,13 @@ def tail_lines(path, max_bytes=3 * 1024 * 1024):
         return []
 
 
-def subagents_running(transcript):
-    """Background subagents still running while the main loop waits for input.
+def turn_over(transcript):
+    """(ended, subagents): ended = the newest main-thread record is the turn's own end record
+    (system/turn_duration), so no turn is running; subagents = background subagents it left running.
 
-    With a subagent running, `claude agents --json` keeps saying "busy" although the turn ended and the
-    prompt is empty (checked on 2.1.322). The turn's own end record (system/turn_duration) carries
-    pendingBackgroundAgentCount; it counts only while it is still the newest main-thread message
-    (a newer user or assistant record = a new turn started). 0 = none, or the turn did not end."""
+    While background work runs (a subagent, or a run_in_background command, also one a subagent
+    started), `claude agents --json` keeps saying "busy" although the turn ended and the prompt is
+    empty (checked on 2.1.322). A newer user or assistant record = a new turn started."""
     for line in reversed(tail_lines(transcript) if transcript else []):
         if '"timestamp"' not in line:
             continue
@@ -556,12 +557,12 @@ def subagents_running(transcript):
             continue
         if d.get("type") == "system" and d.get("subtype") == "turn_duration":
             try:
-                return max(0, int(d.get("pendingBackgroundAgentCount") or 0))
+                return True, max(0, int(d.get("pendingBackgroundAgentCount") or 0))
             except (TypeError, ValueError):
-                return 0
+                return True, 0
         if d.get("type") in ("user", "assistant"):
-            return 0
-    return 0
+            return False, 0
+    return False, 0
 
 
 TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
@@ -657,27 +658,41 @@ def clean(line):
     return ANSI.sub("", DIM.sub("", line)).replace("\u00a0", " ")
 
 
+def _prompt_line(lines):
+    """Index of the input prompt's \u276f line, or None. The slash-command menu under the input box marks
+    its selected item with \u276f too, indented and also right under a border (seen live:
+    "  \u276f /clear  Start a new session..."). So the unindented \u276f line right under a box border
+    wins; otherwise the last \u276f line (older layouts, test screens)."""
+    marks = [i for i, ln in enumerate(lines) if "\u276f" in ln]
+    for i in reversed(marks):
+        above = clean(lines[i - 1]) if i else ""
+        if "\u2500" in above and BORDER.match(above) and clean(lines[i]).startswith("\u276f"):
+            return i
+    return marks[-1] if marks else None
+
+
 def prompt_text(text):
-    """Text typed after the last \u276f prompt (without the dim hint); None if there is no prompt."""
-    for ln in reversed(text.splitlines()):
-        if "\u276f" in ln:
-            return clean(ln.split("\u276f", 1)[1]).strip().strip("\u2502").strip()
-    return None
+    """Text typed after the \u276f prompt (without the dim hint); None if there is no prompt."""
+    lines = text.splitlines()
+    i = _prompt_line(lines)
+    if i is None:
+        return None
+    return clean(lines[i].split("\u276f", 1)[1]).strip().strip("\u2502").strip()
 
 
 def prompt_block(text):
     """Everything after the \u276f prompt, wrapped lines included; None if there is no prompt."""
     lines = text.splitlines()
-    for i in range(len(lines) - 1, -1, -1):
-        if "\u276f" in lines[i]:
-            parts = [clean(lines[i].split("\u276f", 1)[1])]
-            for ln in lines[i + 1:]:
-                c = clean(ln)
-                if not c.strip() or BORDER.match(c):
-                    break
-                parts.append(c)
-            return " ".join(p.strip().strip("\u2502").strip() for p in parts).strip()
-    return None
+    i = _prompt_line(lines)
+    if i is None:
+        return None
+    parts = [clean(lines[i].split("\u276f", 1)[1])]
+    for ln in lines[i + 1:]:
+        c = clean(ln)
+        if not c.strip() or BORDER.match(c):
+            break
+        parts.append(c)
+    return " ".join(p.strip().strip("\u2502").strip() for p in parts).strip()
 
 
 def squash(t):
