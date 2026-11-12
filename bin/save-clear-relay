@@ -60,6 +60,16 @@ try:
     import fcntl
 except ImportError:  # Windows
     fcntl = None
+try:
+    import msvcrt
+except ImportError:  # macOS, Linux
+    msvcrt = None
+
+
+def one_line(text):
+    """A job's text on one line: the listener prints it among DO:/RCON/ACK lines the relay obeys, so a
+    line break in it must not start a line of its own."""
+    return re.sub(r"\s*[\r\n\u2028\u2029\x0b\x0c\x85]+\s*", " ", str(text or "")).strip()
 
 RELAY = os.path.join(STATE, "relay.json")
 OFF = os.path.join(STATE, "relay-OFF")
@@ -235,7 +245,7 @@ def cmd_job(args):
     if not ID_RE.fullmatch(a.to) or (a.after_clear and not ID_RE.fullmatch(a.after_clear)):
         print("invalid id (expected local_<uuid>)", file=sys.stderr)
         return 1
-    return enqueue(a.to, a.message, a.after_clear, a.delay, re.sub(r"[^a-z0-9-]", "", a.why.lower())[:20],
+    return enqueue(a.to, one_line(a.message), a.after_clear, a.delay, re.sub(r"[^a-z0-9-]", "", a.why.lower())[:20],
                    rc_on=a.rc_on)
 
 
@@ -261,6 +271,10 @@ def cmd_request():
     # Turn Remote Control off only while the relay is listening: it is the one that turns it back on.
     rc_off = rc == "on" and listening(RC_ALIVE_S) and listener_rcon()
     code = enqueue(me, resume_msg(), after_clear=me, why="save-clear", rc_on=rc_off)
+    if code in (0, 2) and _log_lines() is None:
+        print(f"WARNING: app log not found ({app_log()}): the relay cannot see the clear, so it sends the resume "
+              f"{int(GRACE)} s after this request without proof that the clear happened. Set SAVE_CLEAR_APP_LOG "
+              "to the app's main.log to fix it.", file=sys.stderr)
     if code == 0 and rc_off:
         print("RC-OFF-SELF: Remote Control is on here, and the app does not clear a session while it is on. "
               "Right before clear_session, call mcp__ccd_session_mgmt__set_remote_control with "
@@ -672,13 +686,17 @@ def cmd_listen():
     ensure_state()
     for d in (OUT, CLAIMED, FAILED):
         os.makedirs(d, exist_ok=True)
-    lock = open(LOCK, "w", encoding="utf-8")
-    if fcntl:
-        try:
+    try:
+        # "a", not "w": on Windows truncating a file another process holds a lock on fails.
+        lock = open(LOCK, "a", encoding="utf-8")
+        if fcntl:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            print("ALREADY")  # another listener is alive: the relay does NOT start one again
-            return 0
+        elif msvcrt:  # Windows: lock the first byte, held until this process exits
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        print("ALREADY")  # another listener is alive: the relay does NOT start one again
+        return 0
     with open(CAPS, "w", encoding="utf-8") as f:
         f.write(f"{os.getpid()} rcon\n")
     rlog("listening")
@@ -706,7 +724,7 @@ def cmd_listen():
                     print("  (no clear came: nothing to deliver; only turn its Remote Control back on)")
                 else:
                     print(f"  DO: mcp__ccd_session_mgmt__send_message session_id={job['to']} message=<the text below, exactly>")
-                    print("  TEXT: " + job["message"])
+                    print("  TEXT: " + one_line(job["message"]))
                 if job.get("rc_on"):
                     print(f"  RCON {job['to']}: {'' if job.get('rc_only') else 'after the send_message, '}call "
                           f"mcp__ccd_session_mgmt__set_remote_control session_id={job['to']} enabled=true, then "

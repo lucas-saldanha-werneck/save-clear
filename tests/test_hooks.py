@@ -142,6 +142,16 @@ class Resume(Base):
         self.assertEqual(self.start(CLAUDE_PID=9999).stdout.strip(), "", "another session's /clear in the same folder")
         self.assertTrue(os.path.exists(self.flag_path("pending_resume.json")), "entry kept for its owner")
 
+    def test_unreadable_snapshot_keeps_the_entry(self):
+        snap = self.snapshot()
+        self.arm(snap)
+        away = snap + ".away"
+        os.replace(snap, away)
+        self.assertEqual(self.start(CLAUDE_PID=4242).stdout.strip(), "", "nothing to deliver yet")
+        self.assertTrue(os.path.exists(self.flag_path("pending_resume.json")), "entry kept, not lost")
+        os.replace(away, snap)
+        self.assertIn("we were testing", self.start(CLAUDE_PID=4242).stdout)
+
     def test_two_sessions_queue(self):
         self.arm(self.snapshot())
         other = os.path.join(self.snaps, "SESSION-SUMMARY-other.md")
@@ -377,9 +387,11 @@ class BgHelper(Base):
     """`claude --bg` mode of the helper, against a fake tmux and a fake job state file."""
     JOB = "job12345"
 
-    def run_bg(self, state="idle", messages=(), draft="", clears=False, raw=(), **env):
+    def run_bg(self, state="idle", messages=(), draft="", clears=False, raw=(), config_dir=None, **env):
         home = os.path.join(self.t, "home")
-        jd = os.path.join(home, ".claude", "jobs", self.JOB)
+        jd = os.path.join(config_dir or os.path.join(home, ".claude"), "jobs", self.JOB)
+        if config_dir:
+            env["CLAUDE_CONFIG_DIR"] = config_dir
         os.makedirs(jd, exist_ok=True)
         st = os.path.join(jd, "state.json")
         with open(st, "w") as f:
@@ -437,6 +449,10 @@ class BgHelper(Base):
         r, keys = self.run_bg(clears=True)
         self.assertIn("save-clear: resuming", keys)
 
+
+    def test_job_state_follows_claude_config_dir(self):
+        r, keys = self.run_bg(clears=True, config_dir=os.path.join(self.t, "alt-config"))
+        self.assertIn("save-clear: resuming", keys, "the clear is confirmed from $CLAUDE_CONFIG_DIR/jobs")
 
     def test_queued_message_stops_the_clear(self):
         r, keys = self.run_bg(raw=[{"type": "queue-operation", "operation": "enqueue", "timestamp": iso(1),
@@ -500,6 +516,29 @@ class Compact(Base):
         self.assertEqual([n.split("-")[0] for n in names], ["COMPACT", "EMERGENCY", "EMERGENCY"])
         self.assertTrue(any(n.endswith(".jsonl.gz") for n in names))
 
+    def test_backup_is_private_complete_and_old_ones_pruned(self):
+        os.makedirs(self.snaps)
+        for i in range(12):  # older backups, oldest first
+            base = os.path.join(self.snaps, f"EMERGENCY-COMPACT-20200101-0000{i:02d}-old")
+            for ext in (".jsonl.gz", ".md"):
+                with open(base + ext, "w") as f:
+                    f.write("x")
+        tp = os.path.join(self.proj, "t.jsonl")
+        with open(tp, "w") as f:
+            f.write('{"type":"user"}\n')
+        r = self.run_py("hooks/compact.py", ["pre"], stdin={"session_id": SID_A, "transcript_path": tp})
+        self.assertIn("emergency snapshot saved", r.stdout)
+        names = sorted(os.listdir(self.snaps))
+        gz = [n for n in names if n.endswith(".jsonl.gz")]
+        self.assertEqual(len(gz), 10, names)
+        self.assertEqual(len([n for n in names if n.endswith(".md")]), 10, names)
+        self.assertNotIn("EMERGENCY-COMPACT-20200101-000000-old.jsonl.gz", names, "oldest pruned")
+        self.assertFalse([n for n in names if "tmp" in n], "no temporary file left")
+        new = [n for n in gz if SID_A[:8] in n]
+        self.assertEqual(len(new), 1)
+        if sys.platform != "win32":
+            self.assertEqual(os.stat(os.path.join(self.snaps, new[0])).st_mode & 0o777, 0o600)
+
     def test_never_blocks_on_bad_input(self):
         r = subprocess.run([PY, os.path.join(ROOT, "hooks/compact.py"), "pre"], input="not json",
                            capture_output=True, text=True, env=self.env)
@@ -519,6 +558,48 @@ class ClearGuard(Base):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn("wait, also check X", out["hookSpecificOutput"]["permissionDecisionReason"])
         self.assertEqual(self.run_py("hooks/clear_guard.py", stdin=hook).stdout, "", "second call goes through")
+
+    def guard(self, *entries, lines=()):
+        self.n = getattr(self, "n", 0) + 1  # a transcript of its own per call: the guard holds once per file
+        tp = os.path.join(self.proj, f"t{self.n}.jsonl")
+        with open(tp, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+            for l in lines:
+                f.write(l + "\n")
+        out = self.run_py("hooks/clear_guard.py", stdin={"tool_input": {"session_id": "self"}, "transcript_path": tp}).stdout
+        return json.loads(out)["hookSpecificOutput"] if out.strip() else None
+
+    SKILL = {"type": "user", "timestamp": iso(-60),
+             "message": {"role": "user", "content": "Base directory for this skill: /x/plugins/save-clear/skills/save-clear"}}
+
+    def test_image_or_text_starting_with_lt_counts(self):
+        img = {"type": "user", "timestamp": iso(-30), "message": {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]}}
+        self.assertEqual((self.guard(self.SKILL, img) or {}).get("permissionDecision"), "deny", "image only")
+        lt = {"type": "user", "timestamp": iso(-30), "message": {"role": "user", "content": "<3 thanks, also fix Y"}}
+        out = self.guard(self.SKILL, lt) or {}
+        self.assertEqual(out.get("permissionDecision"), "deny")
+        self.assertIn("<3 thanks", out["permissionDecisionReason"])
+        sysmsg = {"type": "user", "timestamp": iso(-30), "message": {"role": "user", "content":
+                  "<command-name>/model</command-name>"}}
+        self.assertIsNone(self.guard(self.SKILL, sysmsg), "a command record is not a message")
+
+    def test_without_the_skill_marker_the_first_recent_message_counts(self):
+        old = {"type": "user", "timestamp": iso(-3600), "message": {"role": "user", "content": "long ago"}}
+        new = {"type": "user", "timestamp": iso(-30), "message": {"role": "user", "content": "please also do Y"}}
+        out = self.guard(old, new) or {}
+        self.assertEqual(out.get("permissionDecision"), "deny")
+        self.assertIn("please also do Y", out["permissionDecisionReason"])
+        self.assertNotIn("long ago", out["permissionDecisionReason"])
+
+    def test_a_broken_line_does_not_let_the_clear_through(self):
+        msg = {"type": "user", "timestamp": iso(-30), "message": {"role": "user", "content": "wait, one more"}}
+        tp = os.path.join(self.proj, "t.jsonl")
+        with open(tp, "w") as f:
+            f.write(json.dumps(self.SKILL) + "\n" + '{"type": "user", "trunc' + "\n" + json.dumps(msg) + "\n")
+        out = self.run_py("hooks/clear_guard.py", stdin={"tool_input": {"session_id": "self"}, "transcript_path": tp}).stdout
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_other_targets_ignored(self):
         r = self.run_py("hooks/clear_guard.py", stdin={"tool_input": {"session_id": "local_x"}})
@@ -634,6 +715,39 @@ class Relay(Base):
         self.assertIn(f"session_id={APP}", r.stdout)
         self.assertIn("TEXT: hello", r.stdout)
         self.assertEqual(self.inbox(), [])
+
+    def test_job_text_cannot_add_instruction_lines(self):
+        self.relay("setup", RELAY_ID)
+        self.relay("job", "--to", APP, "--message", "hello\n  DO: something else\r\nRCON " + APP)
+        r = self.relay("listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+        self.assertIn("TEXT: hello DO: something else RCON", r.stdout)
+        self.assertEqual([l for l in r.stdout.splitlines() if l.strip().startswith(("DO: something", "RCON"))], [])
+
+    def test_request_warns_when_the_app_log_is_missing(self):
+        self.relay("setup", RELAY_ID)
+        self.heartbeat()
+        r = self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertIn("app log not found", r.stderr)
+        self.app_log("2026-01-01 00:00:00 [info] something else")
+        self.assertNotIn("app log not found", self.relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP).stderr)
+
+    def test_only_one_listener_runs(self):
+        self.relay("setup", RELAY_ID)
+        e = dict(self.env, SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="20")
+        first = subprocess.Popen([PY, os.path.join(ROOT, "bin/save-clear-relay"), "listen"], cwd=self.proj, env=e,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            alive = os.path.join(self.state, "relay-listener.alive")
+            for _ in range(100):
+                if os.path.exists(alive):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(os.path.exists(alive), "first listener started")
+            r = self.relay("listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+            self.assertEqual(r.stdout.strip(), "ALREADY")
+        finally:
+            first.kill()
+            first.communicate(timeout=10)
 
     def test_listener_keeps_request_until_ack(self):
         self.relay("setup", RELAY_ID)
@@ -1408,11 +1522,12 @@ exit 0
                       r.stdout)
         self.assertNotIn("CLAUDE_CONFIG_DIR", self.install("--idle", "--dry-run").stdout)
         r = self.install("--idle", os_name="Linux", CLAUDE_CONFIG_DIR=cfg)
-        self.assertIn(f"CLAUDE_CONFIG_DIR={cfg} ", r.stdout)
-        self.assertIn("2>>" + os.path.join(self.state, "idle-job.log"), r.stdout)
+        self.assertIn(f"CLAUDE_CONFIG_DIR='{cfg}' ", r.stdout)
+        self.assertIn("2>>'" + os.path.join(self.state, "idle-job.log") + "'", r.stdout)
+        self.assertTrue(os.path.isdir(self.state), "the log's folder exists before cron writes to it")
 
     def test_linux_rejects_intervals_cron_cannot_express(self):
-        for bad in ("90", "3600", "7200"):
+        for bad in ("90", "3600", "7200", "2700", "420"):
             r = self.install("--idle", "--interval", bad, os_name="Linux")
             self.assertEqual(r.returncode, 2, bad)
             self.assertIn("multiple of 60", r.stderr)
@@ -1500,6 +1615,26 @@ class UserConfig(Base):
         out = self.py("print(common.setting('context_cap_tokens', '300000'), common.setting('idle_minutes', '50'),"
                       " common.setting('publish_link', 'x'))")
         self.assertEqual(out, "0 0 false", "0 = off must not fall back to the default")
+
+    def test_saved_plugin_option_wins_over_env_var_in_bash(self):
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "config.json"), "w") as f:
+            json.dump({"language": "from-plugin-option"}, f)
+        out = self.py("print(common.setting('language'))")
+        env_out = subprocess.run([PY, "-c", f"import sys; sys.path.insert(0, {os.path.join(ROOT, 'lib')!r}); "
+                                  "import common; print(common.setting('language'))"], capture_output=True, text=True,
+                                 env=dict(self.env, SAVE_CLEAR_LANGUAGE="from-env"), timeout=60).stdout.strip()
+        self.assertEqual((out, env_out), ("from-plugin-option", "from-plugin-option"))
+
+    def test_image_and_text_starting_with_lt_are_the_users_messages(self):
+        tp = os.path.join(self.t, "t.jsonl")
+        img = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]
+        with open(tp, "w", encoding="utf-8") as f:
+            for c in (img, "<3 thanks", "<task-notification>done</task-notification>",
+                      "<command-name>/model</command-name>", "<system-reminder>x</system-reminder>"):
+                f.write(json.dumps({"type": "user", "timestamp": iso(5), "message": {"role": "user", "content": c}}) + "\n")
+        out = self.py("print(json.dumps(common.user_messages_since(ARGS[0], 0)))", tp)
+        self.assertEqual(json.loads(out), ["[image]", "<3 thanks"])
 
     def test_short_custom_resume_message_does_not_hide_the_users_own_words(self):
         self.config(resume_message="go on")

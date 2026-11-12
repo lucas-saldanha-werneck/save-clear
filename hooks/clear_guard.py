@@ -12,8 +12,9 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import (STATE, ensure_state, log as _log, read_hook_input, read_json, run_hook_command,  # noqa: E402
-                    write_json)
+from common import (STATE, SYSTEM_TAG, _text_of as text_of, ensure_state, log as _log, read_hook_input,  # noqa: E402
+                    read_json, run_hook_command, write_json)
+import re  # noqa: E402
 
 GUARD_STATE = os.path.join(STATE, "clear-guard.json")  # transcript -> number of messages already asked about
 SKILL_MARK = "/skills/save-clear"
@@ -24,17 +25,12 @@ def log(msg):
     _log("clear-guard", msg)
 
 
-def text_of(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
-    return ""
+SYSTEM_RE = re.compile(SYSTEM_TAG)
 
 
 def is_noise(t):
     t = t.lstrip()
-    return (not t or t.startswith("<") or t.startswith("Stop hook feedback")
+    return (not t or SYSTEM_RE.match(t) or t.startswith("Stop hook feedback")
             or t.startswith("Base directory for this skill") or t.startswith("[Request interrupted"))
 
 
@@ -47,16 +43,16 @@ def ts_epoch(o):
 
 
 def new_messages(entries):
-    start = None
+    first = None  # the first entry to look at
     for i, o in enumerate(entries):
         txt = text_of((o.get("message") or {}).get("content"))
         if o.get("type") == "user" and SKILL_MARK in txt and "Base directory for this skill" in txt:
-            start = i
-    if start is None:
+            first = i + 1  # after the skill's own message
+    if first is None:  # no marker: every entry of the last WINDOW_S, the first recent one included
         now = time.time()
-        start = next((i for i, o in enumerate(entries) if (ts_epoch(o) or 0) >= now - WINDOW_S), len(entries))
+        first = next((i for i, o in enumerate(entries) if (ts_epoch(o) or 0) >= now - WINDOW_S), len(entries))
     found = []
-    for o in entries[start + 1:]:
+    for o in entries[first:]:
         t = o.get("type")
         if t == "queue-operation" and o.get("operation") in ("enqueue", "remove"):
             c = o.get("content")
@@ -90,10 +86,18 @@ def decide(data):
     path = data.get("transcript_path") or ""
     try:
         with open(path, encoding="utf8") as f:
-            entries = [json.loads(line) for line in f if line.strip()]
+            lines = [line for line in f if line.strip()]
     except Exception as e:
         log(f"no transcript ({e}); clear allowed")
         return True
+    entries = []
+    for line in lines:  # a cut or broken line is skipped, not a reason to let the clear through
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(o, dict):
+            entries.append(o)
     found = new_messages(entries)
     name = os.path.basename(path)[:8]
     if not found:

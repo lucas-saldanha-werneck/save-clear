@@ -90,7 +90,7 @@ set; another path with `SAVE_CLEAR_CONFIG`). Same keys as the option names:
 
 **Your values survive plugin updates.** Plugin options are stored by Claude Code under
 `pluginConfigs` in your `settings.json`, and the config file lives outside the plugin folder; an
-update replaces only the plugin's code. Precedence: plugin option, then environment variable, then
+update replaces only the plugin's code. Precedence: plugin option (in Bash, the copy the SessionStart hook saved), then environment variable, then
 the config file. Keep your personal behavior in small scripts next to that file instead of editing
 the plugin.
 
@@ -238,7 +238,8 @@ watched in a live session whether a running background task makes `claude agents
 as busy.
 
 Two backups run without the skill. Before any compaction, the full transcript is saved gzipped with
-an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker. After it, the summary Claude Code wrote is kept as
+an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker; the backup is readable by you only, and the 10 newest
+are kept (`SAVE_CLEAR_EMERGENCY_KEEP`, 0 = keep all). After it, the summary Claude Code wrote is kept as
 `COMPACT-SUMMARY-<timestamp>-<id>.md`.
 
 ### Idle trigger (optional)
@@ -305,7 +306,8 @@ Most runs start no process: it looks at transcript times first and asks `claude 
 when one is in the window. The job gets the `PATH` and `CLAUDE_CONFIG_DIR` (if set) of the shell you
 ran `install.sh` from; if your sessions use another config folder, set it and run `install.sh` again
 (no transcripts found is logged once). The job's own errors go to `idle-job.log` in the state folder.
-On Linux, `--interval` must be a multiple of 60 seconds, at most 3540 (cron counts in minutes).
+On Linux, `--interval` must be whole minutes that divide the hour (60, 120, 180, 240, 300, 360, 600, 720,
+900, 1200 or 1800 seconds): cron counts in minutes, and `*/45` would run at :00 and :45.
 
 ### Desktop app relay
 
