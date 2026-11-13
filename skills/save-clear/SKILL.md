@@ -46,11 +46,11 @@ The numbered steps below are the full procedure.
    under `## Running subagents` (step 3) with enough to act on its result there.
 
 2. **Update persistent memory, if the project has it.** Claude Code's auto memory lives in
-   the memory folder of the project under ~/.claude/projects with a MEMORY.md index. If that folder exists:
+   `~/.claude/projects/<project>/memory/` with a `MEMORY.md` index. If that folder exists:
    update an existing file on the same topic before creating a new one; a new fact = a new file with
-   frontmatter (name, description, type) + one line in MEMORY.md. Memory keeps the durable
+   frontmatter (name, description, type) + one line in `MEMORY.md`. Memory keeps the durable
    (decisions, rules, state); the episodic goes in the snapshot. No memory folder → skip this step.
-   Do not edit CLAUDE.md unless the user asked.
+   Do not edit `CLAUDE.md` unless the user asked.
 
 3. **Write the snapshot.** Run `save-clear dir`; it prints the snapshot folder (first line) and
    whether `publish_link` is on. If it also prints `language: <L>`, write the snapshot (headings
