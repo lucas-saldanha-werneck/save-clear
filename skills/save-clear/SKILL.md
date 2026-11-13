@@ -210,19 +210,19 @@ The numbered steps below are the full procedure.
 
 ## Prerequisites
 
-- Claude Code with the plugin enabled; Python 3 runs the command.
-- Nothing else is required. tmux, a notifier, a desktop-app relay and a scheduler are optional (see the README).
+- Claude Code with the plugin enabled, macOS or Linux, and `python3` 3.8 or newer (the hooks call it).
+- The automatic /clear also needs the `claude` CLI on `PATH`. tmux, a notifier, a desktop-app relay and a scheduler are optional (see the README).
 
 ## Limitations
 
-- Without tmux the automatic /clear is not possible: Claude tells the user to type /clear, and the summary still comes back by itself.
-- On Windows the user always types /clear.
+- In a terminal without tmux the automatic /clear is not possible: Claude tells the user to type /clear, and the summary still comes back by itself.
+- On Windows save and resume work, but the user always types /clear.
 - The idle trigger never runs unless a scheduler is installed (launchd on macOS, cron on Linux).
 
 ## Troubleshooting
 
 - The /clear did not happen by itself: the session is not in a tmux pane (or tmux is missing). Ask the user to type /clear.
-- Memory step skipped: the project has no memory folder under the Claude projects directory; this is expected.
+- Memory step skipped: the project has no `~/.claude/projects/<project>/memory/` folder; this is expected.
 - An EMERGENCY-COMPACT marker newer than the last SESSION-SUMMARY means the session compacted without a save: treat that state as not verified.
 
 ## Examples
