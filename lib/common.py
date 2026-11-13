@@ -325,6 +325,9 @@ STOPPED_SECTION = "## Stopped background tasks"
 # Snapshot section where Claude lists the subagents still running at the save: they survive /clear and
 # their results reach the new conversation, which reads this section to know what each one is for.
 RUNNING_SECTION = "## Running subagents"
+# Snapshot section with the user's messages sent DURING the save and the answers given: the /clear wipes
+# those answers from the screen, so the new session shows them first.
+ANSWERS_SECTION = "## Answers given during the save"
 
 
 def stop_tasks_instruction(when, snapshot=""):

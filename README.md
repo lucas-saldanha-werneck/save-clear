@@ -33,7 +33,7 @@ Claude sees this (output of a real run, path shortened):
 
 Snapshot: `/home/you/.claude/snapshots/SESSION-SUMMARY-20261108-101500-billing.md`
 
-ORDER: write the summary as a TEXT message before asking any question. A question first ends the turn and the user never sees the summary.
+ORDER: your first turn after the /clear ends with the summary as a plain TEXT message and NO AskUserQuestion (or any other question dialog) in that turn. On a phone (Remote Control) and in the app, the question dialog hides the text written before it, and the user never sees the summary. Any question or decision waits for the next turn; at the end of the summary you may say in one line that a decision is waiting.
 
 ---
 session_id: 3f2a9c1e-5b7d-4e2a-9f10-2c4b6d8e0a11

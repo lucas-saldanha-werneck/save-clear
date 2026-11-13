@@ -73,6 +73,7 @@ The numbered steps below are the full procedure.
    ## Next steps (in order)
    ## Open items / risks
    ## Useful paths, commands and IDs
+   ## Answers given during the save (ONLY when the user sent a message while you saved: the FULL text of each message, then your answer, short but complete enough to be read alone. The /clear wipes the answer from the screen; the next session shows this section first)
    ## Running subagents (ONLY when subagents of this session are still running. One entry each: agent id; description; brief summary - goal, repo/worktree/branch, what it will deliver, whether it merges or installs by itself; brief path; what to do when its result arrives)
    ## Stopped background tasks (ONLY when kill_background_tasks is on: one line per task - id, what it did, restart needed? - or "none")
    ```
@@ -185,7 +186,9 @@ The numbered steps below are the full procedure.
    /clear follows.
 
    **A user message during the save.** If one arrives while you save, answer it and put it in the
-   snapshot before step 8. If it arrives after step 8, the Stop hook does not clear: it blocks and asks
+   snapshot before step 8, in the section `## Answers given during the save`: the full text of the
+   message and your answer (short, but readable alone). Not only as an item of "Last topic": the next
+   session shows this section first, because the /clear wipes your answer from the screen. If it arrives after step 8, the Stop hook does not clear: it blocks and asks
    for three things: (1) answer it; (2) add to the snapshot a section `## After the save` with only what
    came after; (3) run the `save-clear rearm <session id>` command it gives. In the desktop app the clear-guard hook holds the first
    `clear_session` call the same way; answer, add the section, and call `clear_session` again in the
