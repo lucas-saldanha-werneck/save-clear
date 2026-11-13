@@ -8,7 +8,7 @@ own entry. A global flag would hand the summary to whichever session starts firs
 import os
 import re
 
-from common import (app_host, RESUME_FLAG, RESUME_LOCK, RUNNING_SECTION, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
+from common import (app_host, RESUME_FLAG, RESUME_LOCK, ANSWERS_SECTION, RUNNING_SECTION, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
                     read_json, write_json)
 
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
@@ -205,6 +205,21 @@ def running_subagents(summary):
     return _lists_items(summary, RUNNING_RE, RUNNING_SECTION)
 
 
+ANSWERS_RE = re.compile(r"^" + re.escape(ANSWERS_SECTION) + r"\b[^\n]*\n(.*?)(?=^#{1,2} |\Z)", re.M | re.S | re.I)
+AFTER_SECTION = "## After the save"
+AFTER_RE = re.compile(r"^" + re.escape(AFTER_SECTION) + r"\b[^\n]*\n(.*?)(?=^#{1,2} |\Z)", re.M | re.S | re.I)
+
+
+def answers_given(summary):
+    """True when the snapshot lists answers to messages the user sent during the save."""
+    return _lists_items(summary, ANSWERS_RE, ANSWERS_SECTION)
+
+
+def after_save(summary):
+    """True when the snapshot has an "After the save" section with content."""
+    return _lists_items(summary, AFTER_RE, AFTER_SECTION)
+
+
 URL_RE = re.compile(r"^summary_url:\s*(https://\S+)\s*$", re.M)
 
 
@@ -223,8 +238,21 @@ def resume_text(snapshot_path, extra=""):
     lang = language()
     if lang:
         lines += [f"Write your replies in {lang}.", ""]
-    lines += ["ORDER: write the summary as a TEXT message before asking any question. A question first "
-              "ends the turn and the user never sees the summary.", ""]
+    lines += ["ORDER: your first turn after the /clear ends with the summary as a plain TEXT message and NO "
+              "AskUserQuestion (or any other question dialog) in that turn. On a phone (Remote Control) and in the "
+              "app, the question dialog hides the text written before it, and the user never sees the summary. Any "
+              "question or decision waits for the next turn; at the end of the summary you may say in one line "
+              "that a decision is waiting.", ""]
+    if answers_given(summary):
+        lines += [f'The user sent messages during the save and you answered them, but the /clear wiped those answers '
+                  f'from the screen (section "{ANSWERS_SECTION[3:]}" below). Right at the start of your first reply '
+                  "(after the first line above, if any), before the rest of the summary, show each message with its "
+                  "answer, and say they were erased from the screen by the /clear.", ""]
+    elif after_save(summary):
+        lines += [f'The section "{AFTER_SECTION[3:]}" below may hold answers to messages the user sent during the '
+                  "save. The /clear wiped those answers from the screen: if it does, show each message with its "
+                  "answer right at the start of your first reply, before the rest of the summary, and say they were "
+                  "erased by the /clear. Ignore subagent lines for this.", ""]
     if stopped_tasks(summary):
         lines += [f'The previous session stopped background tasks before the /clear (section "{STOPPED_SECTION[3:]}" '
                   "below). Name them in your summary, and say which ones need to be started again.", ""]

@@ -2181,6 +2181,29 @@ class Subagents(Base):
             ctx = json.loads(self.start(CLAUDE_PID=4242).stdout)["hookSpecificOutput"]["additionalContext"]
             self.assertEqual("each result arrives in THIS conversation as a task notification" in ctx, named, body)
 
+    def ctx_for(self, body):
+        self.arm(self.snapshot("# Session\n## Last topic\nx\n" + body))
+        return json.loads(self.start(CLAUDE_PID=4242).stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def test_resume_shows_answers_given_during_the_save(self):
+        marker = "wiped those answers from the screen"
+        ctx = self.ctx_for("## Answers given during the save\n- User: 1\n  Answer: option 1 chosen\n")
+        self.assertIn(marker, ctx)
+        self.assertIn("erased from the screen by the /clear", ctx)
+        for body in ("", "## Answers given during the save\nnone\n"):
+            self.assertNotIn(marker, self.ctx_for(body), body)
+            self.assertNotIn("may hold answers", self.ctx_for(body), body)
+
+    def test_resume_after_the_save_section_asks_to_show_user_answers(self):
+        ctx = self.ctx_for("## After the save\n- User: also rename it. Answer: done\n")
+        self.assertIn("may hold answers to messages the user sent during the save", ctx)
+        self.assertNotIn("may hold answers", self.ctx_for("## After the save\nnone\n"))
+
+    def test_resume_first_turn_has_no_question_dialog(self):
+        ctx = self.ctx_for("")
+        self.assertIn("NO AskUserQuestion", ctx)
+        self.assertIn("any question or decision waits for the next turn".lower(), ctx.lower())
+
 
 EXAMPLE = os.path.join(ROOT, "config.example.json")
 SETTINGS_DUMP = """
