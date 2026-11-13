@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml/badge.svg)](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/lucas-saldanha-werneck/save-clear)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.14.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.14.1-blue)](CHANGELOG.md)
+[![save-clear score](https://img.shields.io/badge/skill%20score-98.8%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator)
 
 Say "save and clear" at the end of a Claude Code session. Claude writes the decisions, findings and
 next steps to a summary file, checks that the file is on disk, clears its own context, and the next

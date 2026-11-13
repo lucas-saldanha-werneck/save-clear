@@ -2,6 +2,10 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.14.1 (2026-11-13)
+
+- Skill schema and score: add version and tags, a Purpose section, Prerequisites, Limitations and Troubleshooting; add SkillEvaluator badges.
+
 ## 0.14.0 (2026-11-13)
 
 - Show answers given during the save in the new session; no question dialog in the first resume turn.

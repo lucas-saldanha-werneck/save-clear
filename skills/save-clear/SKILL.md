@@ -2,11 +2,17 @@
 name: save-clear
 description: >-
   End-of-session ritual. Saves persistent memory and a verified SESSION-SUMMARY snapshot, arms the auto-resume, and (in "save and clear" mode) clears the context by itself so the next session starts from the summary. Use whenever the user says "save and clear", "save-clear", "salvalimpa", "checkpoint", "save the session", "wrap up the session", "prepare for /clear", "can I clear?", or when the context is close to full and state must be preserved. Also when a message starts with "save-clear (automatic" (the context limit or the idle trigger asking for it): run it in "save and clear" mode. Also for "what needs to survive this session?".
+version: "0.14.1"
 metadata:
   author: Lucas Saldanha Werneck <lucas@2olhares.com>
+  tags: [session, memory, resume]
 ---
 
 # save-clear
+
+## Purpose
+
+Make sure nothing important lives only in the context: save persistent memory and a verified snapshot, so the next session (or the resume after /clear) starts from it.
 
 Golden rule: **nothing important may live only in the context.** The next session (or the resume
 after /clear) must not rediscover anything.
@@ -201,6 +207,23 @@ The numbered steps below are the full procedure.
 - **PostCompact**: the summary Claude Code wrote is kept as `COMPACT-SUMMARY-<ts>-<sid>.md`.
 - On resume, a curated SESSION-SUMMARY is worth more than these. An EMERGENCY-COMPACT newer than the
   project's last SESSION-SUMMARY means the session compacted without a save: treat it as NOT verified.
+
+## Prerequisites
+
+- Claude Code with the plugin enabled, macOS or Linux, and `python3` 3.8 or newer (the hooks call it).
+- The automatic /clear also needs the `claude` CLI on `PATH`. tmux, a notifier, a desktop-app relay and a scheduler are optional (see the README).
+
+## Limitations
+
+- In a terminal without tmux the automatic /clear is not possible: Claude tells the user to type /clear, and the summary still comes back by itself.
+- On Windows save and resume work, but the user always types /clear.
+- The idle trigger never runs unless a scheduler is installed (launchd on macOS, cron on Linux).
+
+## Troubleshooting
+
+- The /clear did not happen by itself: the session is not in a tmux pane (or tmux is missing). Ask the user to type /clear.
+- Memory step skipped: the project has no `~/.claude/projects/<project>/memory/` folder; this is expected.
+- An EMERGENCY-COMPACT marker newer than the last SESSION-SUMMARY means the session compacted without a save: treat that state as not verified.
 
 ## Examples
 
