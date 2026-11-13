@@ -2,6 +2,8 @@
 name: save-clear
 description: >-
   End-of-session ritual. Saves persistent memory and a verified SESSION-SUMMARY snapshot, arms the auto-resume, and (in "save and clear" mode) clears the context by itself so the next session starts from the summary. Use whenever the user says "save and clear", "save-clear", "salvalimpa", "checkpoint", "save the session", "wrap up the session", "prepare for /clear", "can I clear?", or when the context is close to full and state must be preserved. Also when a message starts with "save-clear (automatic" (the context limit or the idle trigger asking for it): run it in "save and clear" mode. Also for "what needs to survive this session?".
+metadata:
+  author: Lucas Saldanha Werneck <lucas@2olhares.com>
 ---
 
 # save-clear
@@ -15,6 +17,15 @@ Two modes:
   happens by itself when possible.
 
 The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (written `save-clear` from here on).
+
+## Instructions
+
+1. List what must survive the session (decisions, verified state, next steps, open items).
+2. Update the project's persistent memory, then write the snapshot with `save-clear dir`.
+3. Verify the files on disk, then arm the auto-resume with the command in step 6.
+4. In "save and clear" mode, also arm the automatic /clear (step 8); the next session starts from the summary.
+
+The numbered steps below are the full procedure.
 
 ## Steps
 
@@ -187,3 +198,10 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
 - **PostCompact**: the summary Claude Code wrote is kept as `COMPACT-SUMMARY-<ts>-<sid>.md`.
 - On resume, a curated SESSION-SUMMARY is worth more than these. An EMERGENCY-COMPACT newer than the
   project's last SESSION-SUMMARY means the session compacted without a save: treat it as NOT verified.
+
+## Examples
+
+- The user types "save and clear" at the end of a long session: Claude writes memory and the summary, checks them on disk, clears the context by itself, and the next session opens from the summary.
+- The user types "checkpoint" (or "save-clear" without clearing): steps 1-7 only; the user types /clear when ready.
+- The context passes the limit and a message starts with "save-clear (automatic": run it in "save and clear" mode without asking.
+- The user asks "can I clear?": check what would be lost, save it, and answer in the fixed short format (step 7).
