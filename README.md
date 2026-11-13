@@ -1,9 +1,23 @@
 # save-clear
 
+[![CI](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml/badge.svg)](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml)
+[![License](https://img.shields.io/github/license/lucas-saldanha-werneck/save-clear)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.14.0-blue)](CHANGELOG.md)
+
 Say "save and clear" at the end of a Claude Code session. Claude writes the decisions, findings and
 next steps to a summary file, checks that the file is on disk, clears its own context, and the next
 session starts from that summary. You keep what matters from a long session without doing the save
 and the `/clear` by hand.
+
+[![save-clear demo: tap to open the video](https://github.com/user-attachments/assets/c69f7507-4d92-49b4-9298-57287662640e)](https://lucas-saldanha-werneck.github.io/save-clear/demo.mp4)
+
+<table>
+<tr>
+<td align="center"><img src="https://github.com/user-attachments/assets/9a8ee53c-06f2-4fbd-a0e9-4c687810b861" alt="The terminal when the context passes the cap" width="320"><br>In the terminal</td>
+<td align="center"><img src="https://github.com/user-attachments/assets/b9633c73-ce7e-402c-9392-baad5e6c1168" alt="The desktop app after saying save and clear" width="320"><br>In the desktop app</td>
+<td align="center"><img src="https://github.com/user-attachments/assets/ffbdd8ef-f84f-4adc-bdbf-42380f2cf598" alt="Summary: you focus on the work, it handles the context" width="320"><br>The idea in short</td>
+</tr>
+</table>
 
 You do not even have to ask: when the context passes 150k tokens, Claude runs
 it by itself at the end of the turn. Change the number with `context_cap_tokens`, or set it to `0`
@@ -461,3 +475,7 @@ bash tests/run.sh        # tmux integration on a separate tmux server; skips wit
 MIT
 
 Built with Claude Code
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report a vulnerability and what this plugin accesses.
