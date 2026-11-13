@@ -2,11 +2,17 @@
 name: save-clear
 description: >-
   End-of-session ritual. Saves persistent memory and a verified SESSION-SUMMARY snapshot, arms the auto-resume, and (in "save and clear" mode) clears the context by itself so the next session starts from the summary. Use whenever the user says "save and clear", "save-clear", "salvalimpa", "checkpoint", "save the session", "wrap up the session", "prepare for /clear", "can I clear?", or when the context is close to full and state must be preserved. Also when a message starts with "save-clear (automatic" (the context limit or the idle trigger asking for it): run it in "save and clear" mode. Also for "what needs to survive this session?".
+version: "0.14.1"
 metadata:
   author: Lucas Saldanha Werneck <lucas@2olhares.com>
+  tags: [session, memory, resume]
 ---
 
 # save-clear
+
+## Purpose
+
+Make sure nothing important lives only in the context: save persistent memory and a verified snapshot, so the next session (or the resume after /clear) starts from it.
 
 Golden rule: **nothing important may live only in the context.** The next session (or the resume
 after /clear) must not rediscover anything.
@@ -40,11 +46,11 @@ The numbered steps below are the full procedure.
    under `## Running subagents` (step 3) with enough to act on its result there.
 
 2. **Update persistent memory, if the project has it.** Claude Code's auto memory lives in
-   `~/.claude/projects/<project>/memory/` with a `MEMORY.md` index. If that folder exists:
+   the memory folder of the project under ~/.claude/projects with a MEMORY.md index. If that folder exists:
    update an existing file on the same topic before creating a new one; a new fact = a new file with
-   frontmatter (name, description, type) + one line in `MEMORY.md`. Memory keeps the durable
+   frontmatter (name, description, type) + one line in MEMORY.md. Memory keeps the durable
    (decisions, rules, state); the episodic goes in the snapshot. No memory folder → skip this step.
-   Do not edit `CLAUDE.md` unless the user asked.
+   Do not edit CLAUDE.md unless the user asked.
 
 3. **Write the snapshot.** Run `save-clear dir`; it prints the snapshot folder (first line) and
    whether `publish_link` is on. If it also prints `language: <L>`, write the snapshot (headings
@@ -201,6 +207,23 @@ The numbered steps below are the full procedure.
 - **PostCompact**: the summary Claude Code wrote is kept as `COMPACT-SUMMARY-<ts>-<sid>.md`.
 - On resume, a curated SESSION-SUMMARY is worth more than these. An EMERGENCY-COMPACT newer than the
   project's last SESSION-SUMMARY means the session compacted without a save: treat it as NOT verified.
+
+## Prerequisites
+
+- Claude Code with the plugin enabled; Python 3 runs the command.
+- Nothing else is required. tmux, a notifier, a desktop-app relay and a scheduler are optional (see the README).
+
+## Limitations
+
+- Without tmux the automatic /clear is not possible: Claude tells the user to type /clear, and the summary still comes back by itself.
+- On Windows the user always types /clear.
+- The idle trigger never runs unless a scheduler is installed (launchd on macOS, cron on Linux).
+
+## Troubleshooting
+
+- The /clear did not happen by itself: the session is not in a tmux pane (or tmux is missing). Ask the user to type /clear.
+- Memory step skipped: the project has no memory folder under the Claude projects directory; this is expected.
+- An EMERGENCY-COMPACT marker newer than the last SESSION-SUMMARY means the session compacted without a save: treat that state as not verified.
 
 ## Examples
 
