@@ -2,6 +2,10 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.16.1 (2026-11-15)
+
+- Without the `language` option, the resume now tells Claude to reply in the language the user writes in (the snapshot's language), not in English because the resume message is in English. The skill also says to write the snapshot in the user's language when no language is set. With `language` set, nothing changes.
+
 ## 0.16.0 (2026-11-15)
 
 - The relay now wakes itself after the Claude app quits or restarts (before, its listener stayed dead until someone typed a wake message into it, and the resume and "pending questions" messages were lost). The SessionStart hook of any app session runs the new `save-clear-relay wake-claim`; when the listener has been dead for 5 minutes and the relay is usable, that session is told, silently, to make one `send_message` to the relay with the wake text. One wake per 10-minute cool-down (atomic claim, stamp file `relay-wake.stamp`), never from the relay session itself, never in terminal sessions, never when the relay is off or archived.
