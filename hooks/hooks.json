@@ -15,7 +15,20 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/resume_turn_guard.py", "prompt"], "timeout": 5 }
+        ]
+      }
+    ],
     "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion|mcp__ccd_turn__wrap_up",
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/resume_turn_guard.py", "ask"], "timeout": 5 }
+        ]
+      },
       {
         "matcher": "mcp__ccd_session_mgmt__clear_session",
         "hooks": [

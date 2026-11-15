@@ -2,6 +2,10 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.14.2 (2026-11-14)
+
+- The first turn after a resume can no longer call AskUserQuestion (or a wrap_up with a question): a PreToolUse hook denies it and asks Claude to write the summary as text and ask in the next turn. SessionStart writes a marker per session; the user's next prompt (not the resume message) lifts it, so Stop-hook continuations stay covered. A marker older than 12 h is ignored.
+
 ## 0.14.1 (2026-11-13)
 
 - Skill: add version and tags, a Purpose section, Prerequisites, Limitations and Troubleshooting; SkillEvaluator badges in the README.
