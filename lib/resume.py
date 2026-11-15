@@ -238,6 +238,9 @@ def resume_text(snapshot_path, extra="", session_id=""):
     lang = language()
     if lang:
         lines += [f"Write your replies in {lang}.", ""]
+    else:
+        lines += ["Write your replies in the language the user writes in (the language of the snapshot below), "
+                  "even though this message is in English.", ""]
     flag_cmd = f'python3 "{os.path.join(BIN, "save-clear")}" decision-waiting {session_id}'.strip()
     lines += ["ORDER: your first turn after the /clear ends with the summary as a plain TEXT message and NO "
               "AskUserQuestion (or any other question dialog) in that turn. On a phone (Remote Control) and in the "

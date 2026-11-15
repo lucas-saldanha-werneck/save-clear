@@ -54,7 +54,8 @@ The numbered steps below are the full procedure.
 
 3. **Write the snapshot.** Run `save-clear dir`; it prints the snapshot folder (first line) and
    whether `publish_link` is on. If it also prints `language: <L>`, write the snapshot (headings
-   included) and your replies in <L>. If it prints an `extra steps` block, those are the user's own
+   included) and your replies in <L>; without that line, write them in the language the user writes in
+   (headings included). If it prints an `extra steps` block, those are the user's own
    steps for this ritual: follow them, at the point they name (no point named = before step 6). If it
    prints a line starting with `kill_background_tasks: on` and this is save-and-clear mode, do what that
    line says now: stop the background tasks THIS session started that are still running (TaskStop with

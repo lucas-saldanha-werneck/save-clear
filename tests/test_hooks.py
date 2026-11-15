@@ -1980,11 +1980,20 @@ class UserConfig(Base):
         out = self.start(CLAUDE_PID=4242, HOOK_PRINT="Run the page poll again in the background.")
         ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Write your replies in Portuguese.", ctx)
+        self.assertNotIn("the language the user writes in", ctx)
         self.assertIn("Run the page poll again in the background.", ctx)
         self.assertLess(ctx.index("page poll again"), ctx.index("we were testing"), "before the summary")
         [call] = self.hook_calls()
         self.assertEqual((call["SAVE_CLEAR_EVENT"], call["SAVE_CLEAR_SNAPSHOT"], call["SAVE_CLEAR_SESSION_ID"],
                           call["SAVE_CLEAR_PREVIOUS_SESSION_ID"]), ("resume", snap, SID_NEW, SID_A))
+
+    def test_without_language_the_reply_follows_the_user(self):
+        snap = self.snapshot()
+        self.arm(snap)
+        out = self.start(CLAUDE_PID=4242)
+        ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Write your replies in the language the user writes in", ctx)
+        self.assertNotIn("Write your replies in Portuguese", ctx)
 
     def test_failing_on_resume_still_delivers_the_summary(self):
         self.config(on_resume_command=self.cmd)
