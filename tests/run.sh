@@ -156,6 +156,43 @@ typed | grep -q 'clear' && bad "Enter sent: $(typed | tr '\n' '|')" || ok "Enter
 [ -f "$(FL)" ] && ok "request re-armed" || bad "not re-armed; log: $(logf)"
 "$TM" capture-pane -p -t "$PANE" | grep '❯' | tail -1 | grep -q '/clear' && bad "/clear left in the prompt" || ok "typed /clear erased from the prompt"
 
+C=cccccccc-0000-0000-0000-00000000000c
+FU='{"followup":true,"ts":'"$(($(date +%s)*1000))"'}'
+echo "== T15: 2nd message, right session, empty prompt -> typed and sent once"
+new_case newsid
+"$PY" "$R/bin/save-clear-send" tmux "$PANE" "$C" "$FU" ""; rc=$?
+[ $rc -eq 0 ] && ok "exit 0" || bad "rc=$rc; log: $(logf)"
+[ "$(typed | wc -l | tr -d ' ')" = 1 ] && typed | grep -q '^save-clear: pending questions' && ok "pane got the 2nd message once" || bad "typed: $(typed | tr '\n' '|')"
+
+echo "== T16: 2nd message, the user is typing -> nothing typed, draft untouched"
+new_case newsid
+"$TM" send-keys -t "$PANE" -l "my own draft"
+"$PY" "$R/bin/save-clear-send" tmux "$PANE" "$C" "$FU" ""; rc=$?
+[ -z "$(typed)" ] && ok "nothing submitted" || bad "typed: $(typed | tr '\n' '|')"
+logf | grep -q "the user is already typing" && ok "log says the user is typing" || bad "log: $(logf)"
+"$TM" capture-pane -p -t "$PANE" | grep '❯' | tail -1 | grep -q 'my own draft$' && ok "draft intact" || bad "draft changed"
+
+echo "== T17: 2nd message, the user wrote after the summary -> not sent"
+new_case newsid
+TP="$D/transcript.jsonl"
+printf '{"type":"user","timestamp":"%s","message":{"content":"one more thing"}}\n' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$TP"
+"$PY" "$R/bin/save-clear-send" tmux "$PANE" "$C" "$FU" "$TP"
+[ -z "$(typed)" ] && ok "nothing typed" || bad "typed: $(typed | tr '\n' '|')"
+
+echo "== T18: 2nd message, pane runs ANOTHER session -> refused, nothing typed"
+new_case mismatch
+"$PY" "$R/bin/save-clear-send" tmux "$PANE" "$C" "$FU" ""; rc=$?
+[ $rc -eq 3 ] && [ -z "$(typed)" ] && ok "refused, nothing typed" || bad "rc=$rc typed: $(typed)"
+
+echo "== T19: Stop hook of the resume turn with a decision waiting -> helper types the 2nd message"
+new_case newsid
+mkdir -p "$D/state/resume-turn"
+printf '{"ts":%s,"pending":true}' "$(($(date +%s)*1000))" > "$D/state/resume-turn/$C.json"
+echo "{\"session_id\":\"$C\",\"transcript_path\":\"\"}" | TMUX_PANE="$PANE" "$PY" "$R/hooks/resume_turn_guard.py" stop
+for _ in $(seq 1 30); do typed | grep -q '^save-clear: pending questions' && break; sleep 1; done
+typed | grep -q '^save-clear: pending questions' && ok "2nd message typed by the hook's helper" || bad "typed: $(typed); log: $(logf)"
+[ -f "$D/state/resume-turn/$C.json" ] && bad "marker left" || ok "marker removed (turn 2 may ask)"
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

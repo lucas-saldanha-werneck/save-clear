@@ -2,6 +2,11 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.15.0 (2026-11-14)
+
+- The questions now come right after the summary, with nothing typed by you. If a decision is waiting, Claude runs `save-clear decision-waiting` in the resume turn (it sets a flag in the session's resume-turn marker). When that turn ends, a Stop hook deletes the marker (so turn 2 may ask) and sends a second message, "save-clear: pending questions", once: in a terminal through `save-clear-send` (same checks as the resume message: right session, idle, empty prompt, Enter re-checked), in the app through the relay. Not sent when no decision is waiting, when you wrote something after the resume, or when the target is not proven. Claude then asks with AskUserQuestion.
+- The 2nd message is never counted as one of your own messages.
+
 ## 0.14.2 (2026-11-14)
 
 - The first turn after a resume can no longer call AskUserQuestion (or a wrap_up with a question): a PreToolUse hook denies it and asks Claude to write the summary as text and ask in the next turn. SessionStart writes a marker per session; the user's next prompt (not the resume message) lifts it, so Stop-hook continuations stay covered. A marker older than 12 h is ignored.

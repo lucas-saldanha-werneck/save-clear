@@ -678,6 +678,110 @@ class ResumeTurnGuard(Base):
         self.assertTrue(pre and "mcp__ccd_turn__wrap_up" in pre[0]["matcher"])
         self.assertIn("resume_turn_guard.py", json.dumps(h["UserPromptSubmit"]))
 
+    # ----- the 2nd message: the questions right after the summary -----
+    HOST = "local_12345678-1234-1234-1234-123456789abc"
+
+    def flag_decision(self, sid=SID_NEW):
+        return self.run_py("bin/save-clear", ["decision-waiting", sid])
+
+    def stop(self, sid=SID_NEW, transcript="", **env):
+        return self.run_py("hooks/resume_turn_guard.py", ["stop"],
+                           stdin={"session_id": sid, "transcript_path": transcript}, **env)
+
+    def relay_on(self):
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "relay.json"), "w") as f:
+            json.dump({"local_id": "local_aaaaaaaa-1234-1234-1234-123456789abc"}, f)
+
+    def jobs(self):
+        d = os.path.join(self.state, "relay-inbox")
+        out = []
+        for n in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            if not n.startswith("."):
+                with open(os.path.join(d, n)) as f:
+                    out.append(json.load(f))
+        return out
+
+    def test_resume_text_names_the_flag_command_with_the_session_id(self):
+        self.arm(self.snapshot())
+        ctx = json.loads(self.start(CLAUDE_PID=4242).stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"save-clear\" decision-waiting {SID_NEW}", ctx)
+        self.assertIn("pending questions", ctx)
+
+    def test_decision_waiting_marks_the_marker_only_in_a_resume_turn(self):
+        self.assertEqual(self.flag_decision().returncode, 0)  # no marker: harmless, creates nothing
+        self.assertFalse(os.path.exists(self.marker()))
+        self.resume()
+        self.assertEqual(self.flag_decision().returncode, 0)
+        with open(self.marker()) as f:
+            self.assertIs(json.load(f)["pending"], True)
+        self.assertEqual(self.ask()["permissionDecision"], "deny", "still no question in turn 1")
+
+    def test_no_decision_waiting_no_second_message(self):
+        self.resume()
+        self.relay_on()
+        r = self.stop(CLAUDE_CODE_HOST_SESSION_ID=self.HOST)
+        self.assertEqual((r.returncode, r.stdout), (0, ""))
+        self.assertEqual(self.jobs(), [])
+        self.assertTrue(os.path.exists(self.marker()), "the block stays until the user's next prompt")
+
+    def test_app_decision_waiting_sends_one_message_through_the_relay(self):
+        self.resume()
+        self.relay_on()
+        self.flag_decision()
+        self.stop(CLAUDE_CODE_HOST_SESSION_ID=self.HOST)
+        jobs = self.jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["to"], self.HOST)
+        self.assertTrue(jobs[0]["message"].startswith("save-clear: pending questions"))
+        self.assertIsNone(jobs[0]["after_clear"])
+        self.assertFalse(os.path.exists(self.marker()))
+        self.assertIsNone(self.ask(), "turn 2 may ask")
+        self.stop(CLAUDE_CODE_HOST_SESSION_ID=self.HOST)  # a later Stop: sent once only
+        self.assertEqual(len(self.jobs()), 1)
+
+    def test_second_message_not_sent_when_the_user_already_wrote(self):
+        self.resume()
+        self.relay_on()
+        self.flag_decision()
+        tp = os.path.join(self.t, "t.jsonl")
+        with open(tp, "w") as f:
+            f.write(json.dumps({"type": "user", "timestamp": iso(1), "message": {"content": "wait, one more thing"}}) + "\n")
+        self.stop(transcript=tp, CLAUDE_CODE_HOST_SESSION_ID=self.HOST)
+        self.assertEqual(self.jobs(), [])
+
+    def test_the_resume_and_followup_texts_are_not_the_users_own(self):
+        self.resume()
+        self.relay_on()
+        self.flag_decision()
+        tp = os.path.join(self.t, "t.jsonl")
+        with open(tp, "w") as f:
+            for text in (RESUME_MSG, "save-clear: pending questions. Now ask"):
+                f.write(json.dumps({"type": "user", "timestamp": iso(1), "message": {"content": text}}) + "\n")
+        self.stop(transcript=tp, CLAUDE_CODE_HOST_SESSION_ID=self.HOST)
+        self.assertEqual(len(self.jobs()), 1)
+
+    def test_app_without_a_relay_sends_nothing(self):
+        self.resume()
+        self.flag_decision()
+        self.stop(CLAUDE_CODE_HOST_SESSION_ID=self.HOST)
+        self.assertEqual(self.jobs(), [])
+        with open(os.path.join(self.state, "save-clear.log")) as f:
+            self.assertIn("NOT sent (no relay configured)", f.read())
+
+    def test_terminal_pane_not_proven_sends_nothing(self):
+        self.resume()
+        self.flag_decision()
+        self.stop(TMUX_PANE="%0")  # claude cannot be listed in tests: the pane is not proven to run this session
+        with open(os.path.join(self.state, "save-clear.log")) as f:
+            self.assertIn("2nd message NOT sent", f.read())
+
+    def test_hooks_json_registers_the_stop_mode(self):
+        with open(os.path.join(ROOT, "hooks", "hooks.json")) as f:
+            h = json.load(f)["hooks"]
+        self.assertTrue(any("resume_turn_guard.py" in a and "stop" in c["args"] for g in h["Stop"] for c in g["hooks"]
+                            for a in c["args"]))
+
 
 class StateDir(Base):
     def test_plugin_data_reaches_bash_through_pointer(self):
@@ -2275,7 +2379,7 @@ class Subagents(Base):
     def test_resume_first_turn_has_no_question_dialog(self):
         ctx = self.ctx_for("")
         self.assertIn("NO AskUserQuestion", ctx)
-        self.assertIn("any question or decision waits for the next turn".lower(), ctx.lower())
+        self.assertIn("do not ask it now", ctx.lower())
 
 
 EXAMPLE = os.path.join(ROOT, "config.example.json")

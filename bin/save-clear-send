@@ -35,7 +35,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import (BIN, MARGIN_MS, ancestors, claude_bin, clear_key, draft_why,  # noqa: E402
+from common import (BIN, FOLLOWUP_MSG, MARGIN_MS, ancestors, claude_bin, clear_key, draft_why,  # noqa: E402
                     log as _log, notify, now_ms, prompt_block, prompt_text, ps_parents, resume_msg,
                     run_hook_command, short, squash, subagent_reports_since, tmux_bin, turn_over, user_messages_since,
                     write_clear)
@@ -593,6 +593,45 @@ def run_tmux():
     return 0
 
 
+def run_followup():
+    """The 2nd message after the summary turn (started by hooks/resume_turn_guard.py stop). Same checks as the
+    resume request (right session, idle, EMPTY prompt, Enter re-checked) plus: the user wrote nothing since the
+    resume. Never re-arms and never waits long: if the moment passed, the user asks next turn."""
+    time.sleep(float(os.environ.get("SAVE_CLEAR_START_DELAY", "2")))  # let the other Stop hooks finish
+    t0, busy_since, last = time.time(), None, ""
+    while time.time() - t0 < 60:
+        if new_messages():
+            log("2nd message not sent: the user wrote after the summary")
+            return 0
+        ok, why = free()
+        if ok:
+            sent, why = type_line(FOLLOWUP_MSG)
+            if sent:
+                break
+        if why.startswith("draft"):
+            log("2nd message not sent: the user is already typing")
+            return 0
+        if why == "busy":
+            busy_since = busy_since or time.time()
+            if time.time() - busy_since > 8:
+                log("2nd message not sent: the session went back to work")
+                return 0
+        else:
+            busy_since = None
+        if why != last:
+            log(f"2nd message waiting: {why}")
+            last = why
+        time.sleep(2)
+    else:
+        log("2nd message not sent: the session was not free within 60 s")
+        return 1
+    time.sleep(3)
+    if squash(prompt_block(screen())) == squash(FOLLOWUP_MSG):  # Enter swallowed by the paste
+        press_enter(FOLLOWUP_MSG)
+    log("sent the 2nd message (pending questions)")
+    return 0
+
+
 log(f"helper started (session {short(sid)})")
 if mode == "bg":
     sys.exit(run_bg())
@@ -601,5 +640,5 @@ if not sid:
 if mode == "iterm":
     sys.exit(run_iterm())
 if mode == "tmux":
-    sys.exit(run_tmux())
+    sys.exit(run_followup() if json.loads(flag_json or "{}").get("followup") else run_tmux())
 refuse(f"unknown mode {mode!r}")
