@@ -24,6 +24,8 @@ its own, and nothing is ever typed into a text box.
   save-clear-relay rc-ack <id> ok|failed  the relay reports turning a session's Remote Control off
   save-clear-relay rc-on-ack <id> ok|failed  the relay reports turning a session's Remote Control back on
                                         after its clear (requests made with Remote Control on)
+  save-clear-relay wake-claim           (SessionStart hook) when the listener has been dead for a while, claim the
+                                        wake (once per cool-down) and print the text to send_message to the relay
   save-clear-relay clear-count          how many clears of the relay the app log shows
   save-clear-relay wait-clear --base N  the waker waits until the relay's clear shows up in the app log
 
@@ -99,6 +101,10 @@ CREATE_LOCK = os.path.join(STATE, "relay-create.lock")
 COOLDOWN = os.path.join(STATE, "relay-create.failed")
 COOLDOWN_S = float(os.environ.get("SAVE_CLEAR_RELAY_COOLDOWN_S", "3600"))
 IMPORT_S = float(os.environ.get("SAVE_CLEAR_RELAY_IMPORT_S", "40"))  # wait for the app to import the new session
+WAKE_STAMP = os.path.join(STATE, "relay-wake.stamp")
+WAKE_LOCK = os.path.join(STATE, "relay-wake.lock")
+WAKE_AFTER_S = float(os.environ.get("SAVE_CLEAR_RELAY_WAKE_AFTER_S", "300"))  # dead this long = really dead
+WAKE_COOLDOWN_S = float(os.environ.get("SAVE_CLEAR_RELAY_WAKE_COOLDOWN_S", "600"))  # at most one wake per this
 DEFAULT_TITLE = "Don't touch it, relay"
 DEFAULT_MODEL = "haiku"
 # Permission modes the CLI takes. A relay in plan mode could not run its listener: plan -> default.
@@ -202,6 +208,58 @@ def listener_rcon():
 
 def wake_text():
     return f"RELAY listen. Run `{CMD} rules` and follow the cycle from step 1."
+
+
+def beat_age():
+    """Seconds since the listener's last heartbeat; None when there is no readable heartbeat."""
+    try:
+        with open(ALIVE, encoding="utf-8") as f:
+            return time.time() - int(f.read().split()[1])
+    except Exception:
+        return None
+
+
+def cmd_wake_claim():
+    """Run by the SessionStart hook of any app session. Prints one line (the message to send to the relay)
+    only when the relay should be woken now; prints nothing and exits 0 otherwise. Claiming is atomic and
+    writes a stamp, so at most one session wakes the relay per cool-down, however many start together."""
+    me = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", "")
+    rid = relay_id()
+    if not rid or not is_app_session() or me == rid or os.path.exists(OFF) or not relay_auto():
+        return 0
+    if archived(rid) is not False:  # archived, or not found in the app: a wake would go nowhere
+        return 0
+    if listening():
+        return 0
+    age = beat_age()
+    if age is not None and age < WAKE_AFTER_S:  # it may be re-arming, or its own clear is being handled by the waker
+        return 0
+    ensure_state()
+    try:  # lock; a lock left by a crash for more than 30 s is stale
+        if time.time() - os.path.getmtime(WAKE_LOCK) > 30:
+            os.unlink(WAKE_LOCK)
+    except OSError:
+        pass
+    try:
+        os.close(os.open(WAKE_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except OSError:
+        return 0
+    try:
+        try:
+            if time.time() - os.path.getmtime(WAKE_STAMP) < WAKE_COOLDOWN_S:
+                return 0
+        except OSError:
+            pass
+        with open(WAKE_STAMP, "w", encoding="utf-8") as f:
+            f.write(f"{me}\n")
+        rlog(f"listener dead for {'unknown time' if age is None else str(int(age)) + ' s'}: asking {me} to wake {rid}")
+        print(f"{rid} {wake_text()}")
+        return 0
+    finally:
+        try:
+            os.unlink(WAKE_LOCK)
+        except OSError:
+            pass
 
 
 def enqueue(to, message, after_clear=None, delay=0.0, why="", rc_on=False):
@@ -930,6 +988,8 @@ def main(argv):
         return cmd_rc_ack(args)
     if cmd == "rc-on-ack":
         return cmd_rc_on_ack(args)
+    if cmd == "wake-claim":
+        return cmd_wake_claim()
     if cmd == "clear-count":
         print(clear_count(relay_id()))
         return 0

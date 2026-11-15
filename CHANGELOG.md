@@ -2,6 +2,10 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.16.0 (2026-11-15)
+
+- The relay now wakes itself after the Claude app quits or restarts (before, its listener stayed dead until someone typed a wake message into it, and the resume and "pending questions" messages were lost). The SessionStart hook of any app session runs the new `save-clear-relay wake-claim`; when the listener has been dead for 5 minutes and the relay is usable, that session is told, silently, to make one `send_message` to the relay with the wake text. One wake per 10-minute cool-down (atomic claim, stamp file `relay-wake.stamp`), never from the relay session itself, never in terminal sessions, never when the relay is off or archived.
+
 ## 0.15.0 (2026-11-14)
 
 - The questions now come right after the summary, with nothing typed by you. If a decision is waiting, Claude runs `save-clear decision-waiting` in the resume turn (it sets a flag in the session's resume-turn marker). When that turn ends, a Stop hook deletes the marker (so turn 2 may ask) and sends a second message, "save-clear: pending questions", once: in a terminal through `save-clear-send` (same checks as the resume message: right session, idle, empty prompt, Enter re-checked), in the app through the relay. Not sent when no decision is waiting, when you wrote something after the resume, or when the target is not proven. Claude then asks with AskUserQuestion.

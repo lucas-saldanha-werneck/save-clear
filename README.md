@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml/badge.svg)](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/lucas-saldanha-werneck/save-clear)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.15.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.16.0-blue)](CHANGELOG.md)
 [![save-clear score](https://img.shields.io/badge/skill%20score-98.8%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator)
 [![plugin score (proposal)](https://img.shields.io/badge/plugin%20score%20(proposal)-97.5%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator/issues/508)
 
@@ -408,6 +408,14 @@ resume keeps waiting for the clear (up to 15 minutes). It turns it off only when
 the last 15 seconds. A session started from Remote Control (phone or claude.ai) has its switch locked by the app,
 so it is never cleared by a tool: `request` prints `RC-LOCKED` and the skill says "You can /clear now."
 When the relay is not listening it prints `RC-KEEP` and nothing is turned off.
+
+**It wakes itself after an app restart.** Quitting or restarting the app kills the relay's listener, and
+nothing messages the relay afterwards. So the SessionStart hook of every app session asks
+`save-clear-relay wake-claim` whether the listener has been dead for 5 minutes (`SAVE_CLEAR_RELAY_WAKE_AFTER_S`).
+If so, and the relay is configured, not archived, not turned off and not the starting session itself, that one
+session gets a silent instruction to make one `send_message` call to the relay with the wake text. At most one
+wake per 10 minutes (`SAVE_CLEAR_RELAY_WAKE_COOLDOWN_S`), claimed atomically, so many sessions opening together
+send one. Terminal sessions never do this. `relay.log` records each claim.
 
 Other commands:
 
