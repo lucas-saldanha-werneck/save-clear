@@ -1141,6 +1141,100 @@ class RelayAuto(Base):
         self.assertEqual(self.created(), [])
 
 
+class RelayWake(Base):
+    """SessionStart of an app session wakes a dead relay (the app was quit or restarted): once per cool-down."""
+    def setUp(self):
+        super().setUp()
+        self.sessions = os.path.join(self.t, "app-sessions")
+        os.makedirs(os.path.join(self.sessions, "acct", "org"))
+        self.env.update(SAVE_CLEAR_APP_SESSIONS=self.sessions)
+        self.app_row(RELAY_ID)
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "relay.json"), "w") as f:
+            json.dump({"local_id": RELAY_ID}, f)
+        self.beat(age=3600)
+
+    def app_row(self, sid, **fields):
+        with open(os.path.join(self.sessions, "acct", "org", sid + ".json"), "w") as f:
+            json.dump(dict({"sessionId": sid, "isArchived": False}, **fields), f)
+
+    def beat(self, age=0, pid=None):
+        with open(os.path.join(self.state, "relay-listener.alive"), "w") as f:
+            f.write(f"{pid or os.getpid()} {int(time.time() - age)}\n")
+
+    def app_start(self, me=APP, **env):
+        e = dict(CLAUDE_CODE_ENTRYPOINT="claude-desktop", CLAUDE_CODE_HOST_SESSION_ID=me)
+        e.update(env)
+        return self.start(source="startup", **e)
+
+    def context(self, r):
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout.strip() else ""
+
+    def test_dead_listener_makes_the_session_send_the_wake_message_silently(self):
+        r = self.app_start()
+        ctx = self.context(r)
+        self.assertIn("mcp__ccd_session_mgmt__send_message", ctx)
+        self.assertIn(f"session_id={RELAY_ID}", ctx)
+        self.assertIn("RELAY listen. Run", ctx)
+        self.assertNotIn("systemMessage", json.loads(r.stdout), "no visible noise for the user")
+        with open(os.path.join(self.state, "relay.log"), encoding="utf-8") as f:
+            self.assertIn("to wake " + RELAY_ID, f.read())
+
+    def test_only_one_wake_per_cooldown(self):
+        self.assertIn("send_message", self.context(self.app_start()))
+        self.assertEqual(self.context(self.app_start()), "")
+        self.assertEqual(self.context(self.app_start(me="local_33333333-3333-3333-3333-333333333333")), "")
+        os.utime(os.path.join(self.state, "relay-wake.stamp"), (1, 1))  # cool-down over
+        self.assertIn("send_message", self.context(self.app_start()))
+
+    def test_stale_lock_does_not_block_and_a_fresh_lock_does(self):
+        lock = os.path.join(self.state, "relay-wake.lock")
+        open(lock, "w").close()
+        self.assertEqual(self.context(self.app_start()), "")  # another session is claiming right now
+        os.utime(lock, (1, 1))
+        self.assertIn("send_message", self.context(self.app_start()))
+
+    def test_live_listener_means_no_wake(self):
+        self.beat(age=0)
+        self.assertEqual(self.context(self.app_start()), "")
+
+    def test_recently_dead_listener_means_no_wake_yet(self):
+        self.beat(age=120)  # past the 60 s heartbeat limit but inside the 5 min wait (re-arming / waker's turn)
+        self.assertEqual(self.context(self.app_start()), "")
+
+    def test_missing_heartbeat_counts_as_dead(self):
+        os.unlink(os.path.join(self.state, "relay-listener.alive"))
+        self.assertIn("send_message", self.context(self.app_start()))
+
+    def test_never_wakes_from_the_relay_session_itself(self):
+        self.assertEqual(self.context(self.app_start(me=RELAY_ID)), "")
+
+    def test_terminal_session_never_wakes(self):
+        self.assertEqual(self.context(self.start(source="startup", CLAUDE_CODE_ENTRYPOINT="cli")), "")
+        self.assertEqual(self.context(self.start(source="startup", CLAUDE_CODE_ENTRYPOINT="cli",
+                                                 CLAUDE_CODE_HOST_SESSION_ID=APP)), "")
+
+    def test_off_archived_or_no_relay_means_no_wake(self):
+        open(os.path.join(self.state, "relay-OFF"), "w").close()
+        self.assertEqual(self.context(self.app_start()), "")
+        os.unlink(os.path.join(self.state, "relay-OFF"))
+        self.assertEqual(self.context(self.app_start(SAVE_CLEAR_RELAY="off")), "")
+        self.app_row(RELAY_ID, isArchived=True)
+        self.assertEqual(self.context(self.app_start()), "")
+        self.app_row(RELAY_ID)
+        os.unlink(os.path.join(self.state, "relay.json"))
+        self.assertEqual(self.context(self.app_start()), "")
+
+    def test_wake_is_appended_to_the_resume_summary(self):
+        self.assertEqual(self.arm(self.snapshot()).returncode, 0)
+        r = self.start(CLAUDE_PID=4242, CLAUDE_CODE_ENTRYPOINT="claude-desktop", CLAUDE_CODE_HOST_SESSION_ID=APP)
+        ctx = self.context(r)
+        self.assertIn("we were testing", ctx)
+        self.assertIn(f"session_id={RELAY_ID}", ctx)
+        self.assertIn("summary of the previous session loaded", json.loads(r.stdout)["systemMessage"])
+
+
 class ContextCap(Base):
     """Token-limit hook: asks for a save-clear at the end of a turn when the context is too big."""
     def transcript(self, tokens, sidechain_tokens=None):
