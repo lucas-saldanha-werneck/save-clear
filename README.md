@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml/badge.svg)](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/lucas-saldanha-werneck/save-clear)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.14.2-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.15.0-blue)](CHANGELOG.md)
 [![save-clear score](https://img.shields.io/badge/skill%20score-98.8%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator)
 [![plugin score (proposal)](https://img.shields.io/badge/plugin%20score%20(proposal)-97.5%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator/issues/508)
 
@@ -35,7 +35,7 @@ one tap away, which helps on the phone, where the chat is wiped by the `/clear`.
 
 ## What Claude sees
 
-After the `/clear`, the plugin's SessionStart hook adds the summary to the new session's context. While that first turn runs, a PreToolUse hook denies `AskUserQuestion` (the question dialog hides the summary on a phone); the next message you send lifts the block.
+After the `/clear`, the plugin's SessionStart hook adds the summary to the new session's context. While that first turn runs, a PreToolUse hook denies `AskUserQuestion` (the question dialog hides the summary on a phone); the next message lifts the block. If a decision is waiting, Claude flags it with `save-clear decision-waiting`; when the summary turn ends, save-clear sends a second message ("save-clear: pending questions") by itself, typed into the tmux pane in a terminal or delivered by the relay in the app, and Claude asks the decision then. Nothing is sent when no decision is waiting, when you already typed something, or when the prompt or session is not provably free. It is sent once.
 You see one line:
 
 ```
@@ -49,7 +49,7 @@ Claude sees this (output of a real run, path shortened):
 
 Snapshot: `/home/you/.claude/snapshots/SESSION-SUMMARY-20261108-101500-billing.md`
 
-ORDER: your first turn after the /clear ends with the summary as a plain TEXT message and NO AskUserQuestion (or any other question dialog) in that turn. On a phone (Remote Control) and in the app, the question dialog hides the text written before it, and the user never sees the summary. Any question or decision waits for the next turn; at the end of the summary you may say in one line that a decision is waiting.
+ORDER: your first turn after the /clear ends with the summary as a plain TEXT message and NO AskUserQuestion (or any other question dialog) in that turn. On a phone (Remote Control) and in the app, the question dialog hides the text written before it, and the user never sees the summary. If a decision is waiting (something the user has to choose or approve), do NOT ask it now and do not announce it in the text. Before writing the summary, run once: `python3 ".../bin/save-clear" decision-waiting <session id>` (nothing else: no extra text about it). When the turn ends, save-clear sends you a second message by itself ("save-clear: pending questions"); ask the waiting decisions then, with AskUserQuestion. If no decision is waiting, do not run it: nothing follows the summary.
 
 ---
 session_id: 3f2a9c1e-5b7d-4e2a-9f10-2c4b6d8e0a11

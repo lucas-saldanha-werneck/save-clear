@@ -164,13 +164,18 @@ def seed_user_config():
 RESUME_MSG = ("save-clear: resuming. Start with the LAST topic (where we stopped and what is still open); "
               "then, in one short paragraph, the rest that was saved and the next steps.")
 
+# The 2nd automatic message: sent after the summary turn ends, only when Claude flagged a waiting decision
+# (`save-clear decision-waiting`). Starts with "save-clear: pending questions" so it is never the user's own.
+FOLLOWUP_MSG = ("save-clear: pending questions. Now ask, with AskUserQuestion, the decision(s) you said were "
+                "waiting after the summary. If the user already moved on to something else, skip this.")
+
 # Records Claude Code writes as user messages, wrapped in one of its own tags. A message the user typed
 # that merely starts with "<" (say "<3 thanks") is still the user's.
 SYSTEM_TAG = (r"<(?:command-[a-z-]+|local-command-[a-z-]+|task-notification|system-reminder|bash-[a-z-]+|"
               r"user-prompt-submit-hook|channel|teammate-message|cross-session-message|persisted-output|"
               r"new-diagnostics|tick|ide_[a-z_]+|user-memory-input|scheduled-task)[\s>]")
 # Messages that are not the user's own words
-NOT_HUMAN = re.compile(r"^(" + SYSTEM_TAG + r"|Stop hook feedback|Base directory for this skill|save-clear: resuming|"
+NOT_HUMAN = re.compile(r"^(" + SYSTEM_TAG + r"|Stop hook feedback|Base directory for this skill|save-clear: resuming|save-clear: pending questions|"
                        r"save-clear \(automatic|\[Request interrupted|Caveat:|"
                        r"This session is being continued from a previous conversation)")
 MARGIN_MS = 15000  # a message delivered just before the flag may not be in the snapshot

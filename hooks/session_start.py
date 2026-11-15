@@ -31,7 +31,7 @@ def main():
         "SAVE_CLEAR_SNAPSHOT": entry["snapshot"], "SAVE_CLEAR_SESSION_ID": hook.get("session_id") or "",
         "SAVE_CLEAR_PREVIOUS_SESSION_ID": entry.get("session_id") or "",
         "SAVE_CLEAR_PROJECT_DIR": hook.get("cwd") or ""}, timeout=5)
-    text = resume.resume_text(entry["snapshot"], extra if rc == 0 else "")
+    text = resume.resume_text(entry["snapshot"], extra if rc == 0 else "", hook.get("session_id") or "")
     if not text:
         return
     if hook.get("session_id"):  # the resume turn may not ask questions (hooks/resume_turn_guard.py)

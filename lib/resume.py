@@ -8,7 +8,7 @@ own entry. A global flag would hand the summary to whichever session starts firs
 import os
 import re
 
-from common import (app_host, RESUME_FLAG, RESUME_LOCK, ANSWERS_SECTION, RUNNING_SECTION, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
+from common import (BIN, app_host, RESUME_FLAG, RESUME_LOCK, ANSWERS_SECTION, RUNNING_SECTION, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
                     read_json, write_json)
 
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
@@ -223,7 +223,7 @@ def after_save(summary):
 URL_RE = re.compile(r"^summary_url:\s*(https://\S+)\s*$", re.M)
 
 
-def resume_text(snapshot_path, extra=""):
+def resume_text(snapshot_path, extra="", session_id=""):
     try:
         with open(snapshot_path, encoding="utf8") as f:
             summary = f.read()
@@ -238,11 +238,15 @@ def resume_text(snapshot_path, extra=""):
     lang = language()
     if lang:
         lines += [f"Write your replies in {lang}.", ""]
+    flag_cmd = f'python3 "{os.path.join(BIN, "save-clear")}" decision-waiting {session_id}'.strip()
     lines += ["ORDER: your first turn after the /clear ends with the summary as a plain TEXT message and NO "
               "AskUserQuestion (or any other question dialog) in that turn. On a phone (Remote Control) and in the "
-              "app, the question dialog hides the text written before it, and the user never sees the summary. Any "
-              "question or decision waits for the next turn; at the end of the summary you may say in one line "
-              "that a decision is waiting.", ""]
+              "app, the question dialog hides the text written before it, and the user never sees the summary. "
+              "If a decision is waiting (something the user has to choose or approve), do NOT ask it now and do "
+              f"not announce it in the text. Before writing the summary, run once: `{flag_cmd}` (nothing else: "
+              "no extra text about it). When the turn ends, save-clear sends you a second message by itself "
+              '("save-clear: pending questions"); ask the waiting decisions then, with AskUserQuestion. '
+              "If no decision is waiting, do not run it: nothing follows the summary.", ""]
     if answers_given(summary):
         lines += [f'The user sent messages during the save and you answered them, but the /clear wiped those answers '
                   f'from the screen (section "{ANSWERS_SECTION[3:]}" below). Right at the start of your first reply '

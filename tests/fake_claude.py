@@ -15,6 +15,8 @@ if sc == "mismatch":
     sid = B
 elif sc == "match":
     sid = C if "/clear" in typed else A
+elif sc == "newsid":          # after the /clear: the pane already runs the new session
+    sid = C
 elif sc == "otherproc":
     if "/clear" in typed:
         pid, sid = child, C
