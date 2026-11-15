@@ -606,6 +606,79 @@ class ClearGuard(Base):
         self.assertEqual(r.stdout, "")
 
 
+class ResumeTurnGuard(Base):
+    """The first turn after a resume may not ask a question (the dialog hides the summary on a phone)."""
+
+    def resume(self):
+        self.arm(self.snapshot())
+        self.assertIn("we were testing", self.start(CLAUDE_PID=4242).stdout)
+
+    def marker(self, sid=SID_NEW):
+        return os.path.join(self.state, "resume-turn", sid + ".json")
+
+    def ask(self, tool="AskUserQuestion", sid=SID_NEW, **tool_input):
+        out = self.run_py("hooks/resume_turn_guard.py", ["ask"], stdin={
+            "session_id": sid, "tool_name": tool, "tool_input": tool_input}).stdout
+        return json.loads(out)["hookSpecificOutput"] if out.strip() else None
+
+    def prompt(self, text, sid=SID_NEW):
+        return self.run_py("hooks/resume_turn_guard.py", ["prompt"], stdin={"session_id": sid, "prompt": text})
+
+    def test_question_denied_in_the_resume_turn(self):
+        self.resume()
+        out = self.ask(questions=[{"question": "which?"}])
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("plain text", out["permissionDecisionReason"])
+        self.assertEqual(self.ask(tool="mcp__ccd_turn__wrap_up", ask="which one?")["permissionDecision"], "deny")
+        self.assertIsNone(self.ask(tool="mcp__ccd_turn__wrap_up"), "a wrap_up without a question goes through")
+        self.assertIsNone(self.ask(sid=SID_B), "another session is not affected")
+
+    def test_block_holds_through_stop_hook_continuations_and_the_resume_message(self):
+        self.resume()
+        self.assertEqual(self.prompt(RESUME_MSG).returncode, 0)  # the typed resume request is not the user's own
+        self.assertTrue(os.path.exists(self.marker()))
+        self.assertEqual(self.ask()["permissionDecision"], "deny")
+        # a Stop hook pushing the turn on sends no UserPromptSubmit, so a second question is denied too
+        self.assertEqual(self.ask()["permissionDecision"], "deny")
+
+    def test_question_allowed_after_the_next_user_prompt(self):
+        self.resume()
+        self.prompt(RESUME_MSG)
+        self.prompt("ok, now do the next thing")
+        self.assertFalse(os.path.exists(self.marker()))
+        self.assertIsNone(self.ask())
+
+    def test_stale_marker_is_ignored_and_deleted(self):
+        self.resume()
+        old = int(time.time() * 1000) - 13 * 3600 * 1000
+        with open(self.marker(), "w") as f:
+            json.dump({"ts": old}, f)
+        self.assertIsNone(self.ask())
+        self.assertFalse(os.path.exists(self.marker()))
+
+    def test_unreadable_marker_allows(self):
+        self.resume()
+        with open(self.marker(), "w") as f:
+            f.write("not json")
+        self.assertIsNone(self.ask())
+
+    def test_no_marker_allows(self):
+        self.assertIsNone(self.ask())
+        self.assertEqual(self.prompt("hello").returncode, 0)
+        self.assertEqual(self.run_py("hooks/resume_turn_guard.py", ["ask"], stdin={}).stdout, "")
+
+    def test_plain_session_start_writes_no_marker(self):
+        self.assertEqual(self.start(source="startup").stdout.strip(), "")
+        self.assertFalse(os.path.exists(self.marker()))
+
+    def test_hooks_json_registers_the_guard(self):
+        with open(os.path.join(ROOT, "hooks", "hooks.json")) as f:
+            h = json.load(f)["hooks"]
+        pre = [g for g in h["PreToolUse"] if "AskUserQuestion" in g.get("matcher", "")]
+        self.assertTrue(pre and "mcp__ccd_turn__wrap_up" in pre[0]["matcher"])
+        self.assertIn("resume_turn_guard.py", json.dumps(h["UserPromptSubmit"]))
+
+
 class StateDir(Base):
     def test_plugin_data_reaches_bash_through_pointer(self):
         data = os.path.join(os.path.dirname(self.state), "plugin-data")

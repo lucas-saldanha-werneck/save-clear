@@ -12,8 +12,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (RESUME_FLAG, log, now_ms, read_hook_input, run_hook_command, save_config,  # noqa: E402
-                    save_pointer, seed_user_config)
+from common import (RESUME_FLAG, RESUME_TURN_DIR, log, now_ms, read_hook_input, resume_turn_marker,  # noqa: E402
+                    run_hook_command, save_config, save_pointer, seed_user_config, write_json)
 
 
 def main():
@@ -34,6 +34,12 @@ def main():
     text = resume.resume_text(entry["snapshot"], extra if rc == 0 else "")
     if not text:
         return
+    if hook.get("session_id"):  # the resume turn may not ask questions (hooks/resume_turn_guard.py)
+        try:
+            os.makedirs(RESUME_TURN_DIR, exist_ok=True)
+            write_json(resume_turn_marker(hook["session_id"]), {"ts": now_ms(), "snapshot": entry["snapshot"]})
+        except OSError as e:
+            log("resume", f"resume-turn marker not written: {e!r}")
     print(json.dumps({
         "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text},
         "systemMessage": "save-clear: summary of the previous session loaded. Send any message (e.g. ok) to see it.",

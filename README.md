@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml/badge.svg)](https://github.com/lucas-saldanha-werneck/save-clear/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/lucas-saldanha-werneck/save-clear)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.14.1-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.14.2-blue)](CHANGELOG.md)
 [![save-clear score](https://img.shields.io/badge/skill%20score-98.8%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator)
 [![plugin score (proposal)](https://img.shields.io/badge/plugin%20score%20(proposal)-97.5%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator/issues/508)
 
@@ -35,7 +35,7 @@ one tap away, which helps on the phone, where the chat is wiped by the `/clear`.
 
 ## What Claude sees
 
-After the `/clear`, the plugin's SessionStart hook adds the summary to the new session's context.
+After the `/clear`, the plugin's SessionStart hook adds the summary to the new session's context. While that first turn runs, a PreToolUse hook denies `AskUserQuestion` (the question dialog hides the summary on a phone); the next message you send lifts the block.
 You see one line:
 
 ```
@@ -438,7 +438,7 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
 
 ## Limits
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 139 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 193 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
   (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. On Windows, CI runs the unit tests

@@ -106,6 +106,7 @@ LOG = os.path.join(STATE, "save-clear.log")
 RESUME_FLAG = os.path.join(STATE, "pending_resume.json")
 RESUME_LOCK = os.path.join(STATE, "pending_resume.lock")
 CLEAR_DIR = os.path.join(STATE, "clear")
+RESUME_TURN_DIR = os.path.join(STATE, "resume-turn")
 
 # Plugin option name -> environment variable name
 OPTIONS = {
@@ -438,6 +439,11 @@ def read_json(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def resume_turn_marker(session_id):
+    """Marker file: this session is in the first turn after a resume (no question dialog allowed)."""
+    return os.path.join(RESUME_TURN_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", session_id) + ".json")
 
 
 def now_ms():
