@@ -16,10 +16,11 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import (APP_WAIT_MAX_AGE_MS, STATE, SYSTEM_TAG, _text_of as text_of, app_wait_expired,  # noqa: E402
-                    describe_subagents, drop_app_wait, ensure_state, hold_resume_requests, log as _log,
-                    mark_app_wait, pending_subagents, process_start_ms, read_app_wait, read_hook_input,
-                    read_json, release_resume_requests, run_hook_command, write_json)
+from common import (APP_WAIT_MAX_AGE_MS, BIN, STATE, SYSTEM_TAG, _text_of as text_of, app_session_info,  # noqa: E402
+                    app_wait_expired, describe_subagents, drop_app_wait, ensure_state,
+                    hold_resume_requests, log as _log, mark_app_wait, pending_subagents, process_start_ms,
+                    read_app_wait, read_hook_input, read_json, release_resume_requests, run_hook_command,
+                    write_json)
 import re  # noqa: E402
 
 GUARD_STATE = os.path.join(STATE, "clear-guard.json")  # transcript -> number of messages already asked about
@@ -85,16 +86,39 @@ def deny(reason):
 def hold_for_subagents(data):
     """Deny while this session's background subagents would be cut off (True = denied)."""
     sid = data.get("session_id") or ""
+    host = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or ""
+    info = app_session_info(host)
+    if info.get("remoteControlSpawn"):
+        # Started from Remote Control: the app never lets a tool clear it (`save-clear-relay request` prints
+        # RC-LOCKED, the reply is "You can /clear now."), and a /clear the user types keeps the process, so
+        # its subagents live on (seen on 11/11/2026). Nothing to hold.
+        if drop_app_wait(sid):
+            release_resume_requests(host)
+        return False
     try:
         start = process_start_ms()
         agents = pending_subagents(data.get("transcript_path") or "", sid, start)
     except Exception as e:  # a broken check must not block every clear
         log(f"{sid[:8]}: subagent check failed ({e!r}); not held for subagents")
         return False
-    host = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or ""
     if not agents:
         if drop_app_wait(sid):
             log(f"{sid[:8]}: the subagents it waited for are done")
+            if info.get("remoteControlUserEnabled"):
+                # clear_session called on its own after a hold, not through the Stop hook's finish steps (they
+                # run `save-clear-relay request` again, which prints the Remote Control line). The hold's deny
+                # asked to turn Remote Control back on, and the app does not clear a session while it is on.
+                # Asked once: the hold is gone, so the next call goes through.
+                relay = os.path.join(BIN, "save-clear-relay")
+                log(f"{sid[:8]}: called after the hold with Remote Control on; asked once to redo the relay steps")
+                deny("save-clear: not cleared yet: the background subagents the clear waited for are done, but "
+                     "Remote Control is on here, and the app does not clear a session while it is on. Do the "
+                     f"desktop app part of step 8 again: run `python3 \"{relay}\" ensure`, then "
+                     f"`python3 \"{relay}\" request` (the request made before the wait was taken out of the "
+                     "queue), and follow what they print: with RC-OFF-SELF, turn Remote Control off right before "
+                     "clear_session (the relay turns it back on after the clear). Then call clear_session again "
+                     "in this turn, unless they print RC-KEEP: then do not clear and reply \"You can /clear now.\"")
+                return True
             release_resume_requests(host)
         return False
     hold = read_app_wait(sid, start)

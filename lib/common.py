@@ -635,6 +635,12 @@ UNKNOWN_START_WINDOW_MS = 2 * 3600 * 1000  # process start unknown: active this 
 # ps reports whole seconds, so the computed start is up to 1 s LATER than the real one: an agent of THIS
 # process can look up to 1 s older than the start (pending side), never the other way (cut-off side).
 START_MARGIN_MS = 2000
+# A subagent whose own transcript was written this long after its last result (task notification, or the
+# tool result of a foreground one) is at work again: continued with SendMessage, or resumed by the user from
+# its transcript view ("it is running again", 2.1.319). Its meta keeps "finished": true and its first
+# notification stays in the transcript (101 of 112 subagents with several notifications worked between
+# them, seen on 23/11/2026). A finished one's last write is within 0.4 s of its notification (p90).
+REVIVED_MS = 10 * 1000
 
 
 def _etime_seconds(text):
@@ -709,34 +715,54 @@ def subagent_dir(transcript, session_id=""):
     return os.path.join(folder, sid, "subagents") if sid else ""
 
 
-def _notifications(transcript):
-    """(ended, delivered): task ids with a <task-notification> anywhere in the transcript's tail (the task
-    ended), and those whose result Claude has read: a user record (it started a turn), the queue's `remove`
-    record (taken in mid-turn; reason absorbed_mid_turn or none), or the subagent's hand-back: a user record
-    whose origin has handback true and the agent id in `from` (its final report; terminal, 2.1.330). The
-    `enqueue` record and the queued_command attachment are written as soon as the task ends, before Claude
-    reads it."""
-    ended, delivered = set(), set()
-    for line in tail_lines(transcript) if transcript else []:
-        if "<task-notification>" not in line and '"handback"' not in line:
-            continue
-        try:
-            d = json.loads(line)
-        except Exception:
-            continue
-        origin = d.get("origin") if isinstance(d.get("origin"), dict) else {}
-        if d.get("type") == "user" and origin.get("handback") and origin.get("from"):
-            ended.add(str(origin["from"]))
-            delivered.add(str(origin["from"]))
-        read = d.get("type") == "user" or (d.get("type") == "queue-operation" and d.get("operation") == "remove"
-                                           and d.get("reason") in (None, "absorbed_mid_turn"))
-        for block in line.split("<task-notification>")[1:]:
-            tid = TASK_ID_RE.search(block)
-            if tid:
-                ended.add(tid.group(1))
-                if read:
-                    delivered.add(tid.group(1))
-    return ended, delivered
+def _notifications(transcripts, tool_ids=()):
+    """(ended, read, returned) from the tails of these transcripts:
+    ended: {task id: newest time (ms, 0 = no timestamp) a <task-notification> for it was written (the task
+    ended; also "was resumed by the user"), or its hand-back}; read: {task id: newest time Claude read one}:
+    a user record (it started a turn), the queue's `remove` record (taken in mid-turn; reason
+    absorbed_mid_turn or none), or the subagent's hand-back: a user record whose origin has handback true and
+    the agent id in `from` (its final report; terminal, 2.1.330). The `enqueue` record and the queued_command
+    attachment are written as soon as the task ends, before Claude reads it.
+    returned: {tool use id in tool_ids: time its tool result was written} (a foreground subagent returned)."""
+    ended, read, returned = {}, {}, {}
+    wanted = [t for t in tool_ids if t]
+    for transcript in transcripts:
+        for line in tail_lines(transcript) if transcript else []:
+            note = "<task-notification>" in line or '"handback"' in line
+            result = bool(wanted) and '"tool_result"' in line and any(t in line for t in wanted)
+            if not (note or result):
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            t = _ts_ms(d) or 0
+            if result and d.get("type") == "user":
+                content = (d.get("message") or {}).get("content")
+                for b in content if isinstance(content, list) else []:
+                    if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in wanted:
+                        returned[b["tool_use_id"]] = max(returned.get(b["tool_use_id"], 0), t)
+            if not note:
+                continue
+            origin = d.get("origin") if isinstance(d.get("origin"), dict) else {}
+            if d.get("type") == "user" and origin.get("handback") and origin.get("from"):
+                k = str(origin["from"])
+                ended[k] = max(ended.get(k, 0), t)
+                read[k] = max(read.get(k, 0), t)
+            is_read = d.get("type") == "user" or (d.get("type") == "queue-operation" and d.get("operation") == "remove"
+                                                  and d.get("reason") in (None, "absorbed_mid_turn"))
+            written = d.get("type") == "user" or (d.get("type") == "queue-operation" and d.get("operation") == "enqueue")
+            for block in line.split("<task-notification>")[1:]:
+                tid = TASK_ID_RE.search(block)
+                if not tid:
+                    continue
+                k = tid.group(1)
+                ended[k] = max(ended.get(k, 0), t if written else 0)
+                if is_read:
+                    read[k] = max(read.get(k, 0), t)
+    return ended, read, returned
 
 
 def _interrupted(path):
@@ -762,39 +788,107 @@ def _interrupted(path):
     return False
 
 
-def subagents(transcript, session_id=""):
+def app_sessions_dir():
+    """Where the desktop app keeps one JSON per session (as in bin/save-clear-relay)."""
+    env = os.environ.get("SAVE_CLEAR_APP_SESSIONS")
+    if env:
+        return os.path.expanduser(env)
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions")
+    if os.name == "nt":
+        return os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code-sessions")
+    return os.path.expanduser("~/.config/Claude/claude-code-sessions")
+
+
+def app_session_info(host_id):
+    """The desktop app's JSON for local_<id> (cliSessionId, remoteControlSpawn, remoteControlUserEnabled...),
+    or {} when it cannot be found."""
+    if not re.fullmatch(r"local_[0-9a-f-]{36}", host_id or ""):
+        return {}
+    try:
+        hits = glob.glob(os.path.join(glob.escape(app_sessions_dir()), "**", host_id + ".json"), recursive=True)
+        hits.sort(key=os.path.getmtime, reverse=True)
+    except OSError:
+        return {}
+    for p in hits:
+        v = read_json(p)
+        if isinstance(v, dict):
+            return v
+    return {}
+
+
+def earlier_conversations(transcript, session_id, host_id=None):
+    """[(transcript, session id)] of the earlier conversation of this desktop app session that may still run in
+    THIS process: a /clear typed in the app keeps the process (SessionStart source "clear", seen twice on
+    11/11/2026) and its background subagents run on under the earlier session id, which the app's JSON still
+    names as cliSessionId. A desktop-app clear_session would end them with the process."""
+    host = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") if host_id is None else host_id
+    old = str(app_session_info(host).get("cliSessionId") or "")
+    if not re.fullmatch(r"[0-9a-f-]{36}", old) or old == session_id or not transcript:
+        return []
+    tp = os.path.join(os.path.dirname(transcript), old + ".jsonl")
+    if not os.path.exists(tp) and not os.path.isdir(os.path.join(os.path.dirname(transcript), old)):
+        tp = transcript_of(old)
+    return [(tp, old)] if tp else []
+
+
+def subagents(transcript, session_id="", earlier=()):
     """A session's background subagents, read from Claude Code's agent-<id>.meta.json files:
     [{id, description, state, active_ms, delivered}], oldest activity first. state: "finished" (the meta
     says so, or its task notification is in the transcript), "stopped" (stopped by the user) or "running"
-    (none of these: running, or killed with its process). active_ms: last write to its meta or transcript."""
-    folder = subagent_dir(transcript, session_id)
-    try:
-        names = os.listdir(folder) if folder else []
-    except OSError:
-        return []
-    ended, delivered = _notifications(transcript)
-    out = []
-    for n in names:
-        if not (n.startswith("agent-") and n.endswith(".meta.json")):
+    (none of these: running, or killed with its process; or written again after its last result: continued).
+    A foreground subagent ends inside its turn and is left out, unless it was continued after its tool
+    result (SendMessage): then it runs on and reports like a background one (seen on 2.1.299).
+    active_ms: last write to its meta or transcript. delivered: Claude read its newest result.
+    earlier: more (transcript, session id) whose subagents count too (see earlier_conversations)."""
+    convs = [(transcript, session_id)] + list(earlier)
+    found = []
+    for tp, sid in convs:
+        folder = subagent_dir(tp, sid)
+        try:
+            names = os.listdir(folder) if folder else []
+        except OSError:
             continue
-        meta = read_json(os.path.join(folder, n))
-        if not isinstance(meta, dict) or meta.get("requestShape") != "background":
-            continue  # a foreground subagent ends inside its turn
-        aid = n[len("agent-"):-len(".meta.json")]
+        for n in names:
+            if not (n.startswith("agent-") and n.endswith(".meta.json")):
+                continue
+            meta = read_json(os.path.join(folder, n))
+            if isinstance(meta, dict) and meta.get("requestShape") in ("background", "foreground"):
+                found.append((folder, n[len("agent-"):-len(".meta.json")], meta))
+    if not found:
+        return []
+    tool_ids = [str(m.get("toolUseId") or "") for _, _, m in found if m.get("requestShape") == "foreground"]
+    ended, read, returned = _notifications([tp for tp, _ in convs], tool_ids)
+    out = []
+    for folder, aid, meta in found:
+        jsonl = os.path.join(folder, f"agent-{aid}.jsonl")
         times = []
-        for p in (os.path.join(folder, n), os.path.join(folder, f"agent-{aid}.jsonl")):
+        for p in (os.path.join(folder, f"agent-{aid}.meta.json"), jsonl):
             try:
                 times.append(os.path.getmtime(p))
             except OSError:
                 pass
-        if meta.get("finished") or aid in ended:
+        try:
+            wrote = int(os.path.getmtime(jsonl) * 1000)
+        except OSError:
+            wrote = 0
+        last = ended.get(aid, 0)
+        if meta.get("requestShape") == "foreground":
+            last = max(last, returned.get(str(meta.get("toolUseId") or ""), 0))
+            if not last or (wrote <= last + REVIVED_MS and aid not in ended):
+                continue  # still inside its turn, or returned and done: nothing runs on after the turn
+        revived = bool(last) and wrote > last + REVIVED_MS
+        if (meta.get("finished") or aid in ended) and not revived:
             state = "finished"
-        elif meta.get("stoppedByUser") or _interrupted(os.path.join(folder, f"agent-{aid}.jsonl")):
+        elif (meta.get("stoppedByUser") and not revived) or _interrupted(jsonl):
             state = "stopped"
         else:
             state = "running"
+        # The record that reads a notification can carry a slightly older timestamp than its enqueue (1 of
+        # 2379 pairs a second earlier, real transcripts 23/11/2026): a few seconds of slack.
         out.append({"id": aid, "description": str(meta.get("description") or "")[:80], "state": state,
-                    "active_ms": int(max(times) * 1000) if times else 0, "delivered": aid in delivered})
+                    "active_ms": int(max(times) * 1000) if times else 0,
+                    "delivered": aid in read and read[aid] >= ended.get(aid, 0) - 5000})
     return sorted(out, key=lambda a: a["active_ms"])
 
 
@@ -802,11 +896,12 @@ def pending_subagents(transcript, session_id="", start_ms=-1):
     """Subagents a desktop-app clear would cut off: [subagent + why]. why "running": still running in
     THIS process; "reporting": finished in the last REPORTING_MS, its result not in the conversation yet.
     One last active before this process started ran in a process that is gone (an app restart, a resumed
-    session): it is not waited for."""
+    session): it is not waited for. Includes the earlier conversation of the same app session when a typed
+    /clear kept this process (earlier_conversations)."""
     start = process_start_ms() if start_ms == -1 else start_ms
     now = now_ms()
     out = []
-    for a in subagents(transcript, session_id):
+    for a in subagents(transcript, session_id, earlier_conversations(transcript, session_id)):
         if a["state"] == "running":
             if now - a["active_ms"] >= STALE_MS:
                 continue  # no write for STALE_MS: hung, not waited for

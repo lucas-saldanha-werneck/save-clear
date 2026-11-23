@@ -271,9 +271,19 @@ because it took the terminal behavior below for granted. Since 0.17.0:
   (`CLAUDE_PID`, `ps` elapsed time; without `ps`, as on Windows: active in the last 2 hours). One with no
   write for 30 minutes (hung), or whose transcript ends with "[Request interrupted by user" (stopped with
   TaskStop, which writes neither key), does not count. One that finished in the last 2 minutes and whose
-  notification Claude has not read yet holds the clear once, so Claude reads it first.
+  newest notification Claude has not read yet holds the clear once, so Claude reads it first.
+- A subagent continued after its result (`SendMessage`, or resumed by you from its transcript view)
+  counts as at work again when its own transcript was written more than 10 seconds after its newest
+  notification: Claude Code keeps `finished` in its meta and the first notification in the transcript
+  (in real files on 23/11/2026, 101 of 112 subagents with several notifications worked between them).
+  A foreground subagent counts only in that case, when it was written after its tool result.
+- The check also covers the conversation before a `/clear` you typed in the app: that `/clear` keeps the
+  process (SessionStart `clear`, seen twice in the save-clear log on 11/11/2026), its subagents run on
+  under the earlier session id, and the app's session file still names that id (`cliSessionId`).
 - Only desktop app sessions wait (a `local_` host id and the `clear_session` tool); IDE and SDK sessions
-  keep the old "type /clear" step.
+  keep the old "type /clear" step. A session started from Remote Control does not wait either: the app
+  never lets a tool clear it (`RC-LOCKED`, "You can /clear now."), and the `/clear` you type keeps the
+  process and its subagents.
 - `save-clear arm-clear` checks first. With a subagent at work it prints `subagents running: ...`, and
   Claude ends the turn without the relay steps or `clear_session`.
 - The clear-guard hook refuses `clear_session` on the same check, as often as needed (also when a
@@ -286,7 +296,9 @@ because it took the terminal behavior below for granted. Since 0.17.0:
   of a session, so the request made before the wait is not sent twice. If you wrote after the hold, the
   Stop hook does not clear: it shows a note, and you say "save-clear" when you want it. A hold older than
   12 hours lets the clear through; a hold left by an earlier process (the app quit during the wait) is
-  dropped.
+  dropped. When Claude calls `clear_session` on its own once none is left, with Remote Control on (the
+  hold asked to turn it back on), the guard refuses once and asks for relay `ensure` and `request` again,
+  so the `RC-OFF-SELF` step comes back.
 - Safety net: when a clear cuts subagents off anyway (one made outside this check), the next session's
   resume lists each one that never finished and was last active before the new process started (in the
   last 30 minutes, or named in the snapshot), with its transcript, and asks Claude to see how far it got
@@ -505,7 +517,8 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
   clear-guard held it, the subagent wrote its file, and the clear came after (once through the Stop
   hook's request, once with Claude calling `clear_session` again on its own). In the same setup a
   `/clear` typed in a terminal left a running subagent alive. Not run: a real desktop app clear with
-  0.17.0, and whether a `/clear` typed in the app also replaces the process.
+  0.17.0. A `/clear` typed in the app kept the process twice in the save-clear log (11/11/2026, one of
+  them in a session started from Remote Control); not watched with a running subagent.
 - Not tested live: the desktop app relay round trip (request, clear, `send_message`, ack, resume),
   the waker, and `claude --bg` sessions. The unit tests cover their decision logic only. The
   `claude --bg` clear confirmation reads `resumeSessionId` from `~/.claude/jobs/<id>/state.json`;
