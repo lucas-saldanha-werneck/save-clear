@@ -1164,6 +1164,7 @@ class RelayUpgrade(Base):
         e.update({k: str(v) for k, v in env.items()})
         return subprocess.run([PY, path, *args], capture_output=True, text=True, cwd=self.proj, env=e, timeout=60)
 
+    @unittest.skipIf(sys.platform == "win32", "no re-exec on Windows (os.execv starts a new process there)")
     def test_listener_restarts_from_a_newer_install(self):
         old = self.install("cache", "1.0.0")
         new = self.install("cache", "1.1.0")
