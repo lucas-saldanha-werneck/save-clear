@@ -2,6 +2,16 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.17.1 (2026-11-23)
+
+Fixes from the review of 0.17.0 (desktop app subagent hold):
+
+- A subagent continued after its result (`SendMessage`, or resumed from its transcript view) was taken for finished: its meta keeps `finished: true` and its first notification stays in the transcript, so the clear could stop it mid-work and the next resume did not list it. It now counts as at work when its transcript was written more than 10 seconds after its newest notification, and its result counts as read only when the newest notification was read (seen in real files: 101 of 112 subagents with several notifications worked between them).
+- A foreground subagent continued with `SendMessage` after its tool result runs on after the turn with its meta still `foreground` (seen on 2.1.299). It now counts the same way, from its tool result.
+- A `/clear` typed in the app keeps the process (SessionStart `clear`, seen twice on 11/11/2026), so subagents of the earlier conversation run on under the earlier session id. The hold now checks that conversation too (the app's session file still names it in `cliSessionId`).
+- A session started from Remote Control no longer waits: the app never lets a tool clear it (`RC-LOCKED`) and the `/clear` typed there keeps the process, so the hold only delayed "You can /clear now." and forced an extra turn.
+- When Claude calls `clear_session` on its own after a hold, with Remote Control on (the hold asked to turn it back on), the guard refuses once and asks for the relay steps again, so `RC-OFF-SELF` comes back. Before, the call went through with Remote Control on and the app did not clear.
+
 ## 0.17.0 (2026-11-23)
 
 - Desktop app: the automatic clear no longer stops background subagents. `clear_session` ends the session's process when the turn ends (the new session starts with SessionStart `startup`), and every subagent still running died with it (seen on Claude Code 2.1.330: four subagents stopped mid-work, their results lost). Now `save-clear arm-clear` and the clear-guard hook check the session's subagents (Claude Code's `agent-<id>.meta.json`: not finished, not stopped, active since this process started; or finished less than 2 minutes ago with a result Claude has not read yet) and hold the clear while any is at work. At the end of the first turn with none left, the Stop hook asks Claude once to finish the clear. A hold older than 12 hours is dropped.

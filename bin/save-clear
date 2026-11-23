@@ -22,7 +22,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (BIN, all_clears, clear_key, describe_subagents, desktop_app_session, extra_steps,  # noqa: E402
+from common import (BIN, all_clears, app_session_info, clear_key, describe_subagents, desktop_app_session,  # noqa: E402
+                    extra_steps,
                     hold_resume_requests, kill_background_tasks, language, process_start_ms, log, mark_app_wait, now_ms, pending_subagents, publish_link, read_json,
                     resume_turn_marker, run_hook_command, seed_user_config, setting, snapshot_dir,
                     stop_tasks_instruction, tmux_bin, transcript_of, write_clear, write_json)
@@ -146,8 +147,12 @@ def cmd_arm_clear(args):
             # The app's clear ends this process; a subagent still at work would die with it (see common.py).
             # Only the desktop app's clear_session ends the process; IDE and SDK sessions have no such tool.
             # Only subagents still running wait here; one that just finished is handled by the clear guard.
+            # A session started from Remote Control is never cleared by a tool (the relay prints RC-LOCKED and
+            # the reply is "You can /clear now."), and a /clear the user types keeps the process and its
+            # subagents (seen on 11/11/2026): nothing to wait for.
             agents, start = [], None
-            if sid and desktop_app_session():
+            spawned = app_session_info(env.get("CLAUDE_CODE_HOST_SESSION_ID") or "").get("remoteControlSpawn")
+            if sid and desktop_app_session() and not spawned:
                 try:
                     start = process_start_ms()
                     agents = [a for a in pending_subagents(transcript_of(sid), sid, start) if a.get("why") == "running"]

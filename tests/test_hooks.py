@@ -2567,8 +2567,17 @@ class AppClearWaitsForSubagents(Base):
         self.projdir = os.path.join(self.cfg, "projects", "-tmp-project")
         os.makedirs(self.projdir)
         # This session's process started 10 minutes ago.
-        self.env.update(CLAUDE_CONFIG_DIR=self.cfg,
+        self.sessions = os.path.join(self.t, "app-sessions")
+        os.makedirs(self.sessions)
+        self.env.update(CLAUDE_CONFIG_DIR=self.cfg, SAVE_CLEAR_APP_SESSIONS=self.sessions,
                         SAVE_CLEAR_PROCESS_START_MS=str(int(time.time() * 1000) - 600000))
+
+    def app_row(self, **fields):
+        """The desktop app's JSON for this app session (APP)."""
+        row = {"sessionId": APP, "cliSessionId": SID_A, "isArchived": False}
+        row.update(fields)
+        with open(os.path.join(self.sessions, APP + ".json"), "w") as f:
+            json.dump(row, f)
 
     def transcript(self, sid, *entries):
         tp = os.path.join(self.projdir, sid + ".jsonl")
@@ -2928,6 +2937,105 @@ class AppClearWaitsForSubagents(Base):
         self.assertEqual(r.stdout.count("JOB "), 1, r.stdout)
         self.assertEqual([n for n in os.listdir(inbox) if n.endswith(".json")], [])
         self.assertEqual(len([n for n in os.listdir(os.path.join(inbox, "out")) if n.endswith(".replaced")]), 1)
+
+    def test_a_subagent_continued_after_its_result_holds_again(self):
+        # Seen on 23/11/2026 in real files: a subagent continued with SendMessage (or resumed by the user)
+        # keeps "finished": true in its meta and its first notification in the transcript, and works again.
+        tp = self.transcript(SID_A, ClearGuard.SKILL,
+                             notification("ar1", 'Agent "job ar1" completed', offset_s=-60))
+        self.agent("ar1", finished=True, age_s=-1)       # written after its result: at work again
+        out = self.guard(tp)
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("still at work", out["permissionDecisionReason"])
+        self.assertIn("ar1", out["permissionDecisionReason"])
+        # It ends again: a new notification, queued but not read yet, is the newest one.
+        self.agent("ar1", finished=True, age_s=1)
+        text = notification("ar1", 'Agent "job ar1" completed')["message"]["content"]
+        self.add(tp, {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(), "content": text})
+        out = self.guard(tp)
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("its result is not in this conversation yet", out["permissionDecisionReason"],
+                      "an older result that was read does not count for the newest one")
+        self.add(tp, notification("ar1", 'Agent "job ar1" completed', offset_s=2))
+        self.assertIsNone(self.guard(tp), "the newest result was read: the clear goes through")
+        self.assertFalse(self.held())
+
+    def test_a_foreground_subagent_continued_after_its_result_holds(self):
+        # Seen on 2.1.299: a foreground subagent returned, Claude sent it more work with SendMessage, and it ran
+        # on after the turn (meta still "foreground") until a task notification.
+        def result(tool_id, offset_s):
+            return {"type": "user", "timestamp": iso(offset_s), "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tool_id, "content": [{"type": "text", "text": "done"}]}]}}
+        tp = self.transcript(SID_A, ClearGuard.SKILL, result("toolu_fg1", -60), result("toolu_fg2", 0))
+        self.agent("afg1", requestShape="foreground", toolUseId="toolu_fg1", age_s=-1)
+        self.agent("afg2", requestShape="foreground", toolUseId="toolu_fg2", age_s=1)  # returned, done
+        self.agent("afg3", requestShape="foreground", toolUseId="toolu_fg3")             # still in its turn
+        out = self.guard(tp)
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("afg1", out["permissionDecisionReason"])
+        self.assertNotIn("afg2", out["permissionDecisionReason"])
+        self.assertNotIn("afg3", out["permissionDecisionReason"])
+        self.agent("afg1", requestShape="foreground", toolUseId="toolu_fg1", age_s=1)
+        self.add(tp, notification("afg1", 'Agent "job afg1" finished'))
+        self.assertIsNone(self.guard(tp), "it reported and the result was read")
+
+    def test_a_subagent_of_the_conversation_before_a_typed_clear_holds(self):
+        # A /clear typed in the app keeps the process (SessionStart source "clear", seen on 11/11/2026); the
+        # app's JSON still names the earlier conversation (cliSessionId) and its subagents run on.
+        tp = self.transcript(SID_NEW, ClearGuard.SKILL)
+        self.transcript(SID_A)
+        self.agent("aprev", sid=SID_A, description="started before the /clear")
+        self.assertIsNone(self.guard(tp, sid=SID_NEW, CLAUDE_CODE_HOST_SESSION_ID=APP), "no app JSON: not seen")
+        self.app_row(cliSessionId=SID_A)
+        out = self.guard(tp, sid=SID_NEW, CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn('aprev ("started before the /clear")', out["permissionDecisionReason"])
+        self.assertTrue(self.held(SID_NEW))
+        app = dict(CLAUDE_CODE_ENTRYPOINT="claude-desktop", CLAUDE_CODE_SESSION_ID=SID_NEW,
+                   CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertIn("subagents running: 1 (aprev", self.run_py("bin/save-clear", ["arm-clear"], **app).stdout)
+        # Its result reaches the new conversation: done.
+        self.agent("aprev", sid=SID_A, finished=True, age_s=1)
+        self.add(tp, notification("aprev", 'Agent "started before the /clear" completed'))
+        self.assertIsNone(self.guard(tp, sid=SID_NEW, CLAUDE_CODE_HOST_SESSION_ID=APP))
+
+    def test_a_session_started_from_remote_control_is_not_held(self):
+        # The app never lets a tool clear it (RC-LOCKED: "You can /clear now."), and the /clear the user types
+        # keeps the process and its subagents: waiting would be for nothing.
+        self.transcript(SID_A)
+        self.agent("arc1")
+        self.app_row(remoteControlSpawn={"ccrSessionId": "cse_x"})
+        app = dict(CLAUDE_CODE_ENTRYPOINT="claude-desktop", CLAUDE_CODE_SESSION_ID=SID_A,
+                   CLAUDE_CODE_HOST_SESSION_ID=APP)
+        r = self.run_py("bin/save-clear", ["arm-clear"], **app)
+        self.assertNotIn("subagents running", r.stdout)
+        self.assertIn("save-clear-relay request", r.stdout, "the usual app steps (the relay says RC-LOCKED)")
+        self.assertFalse(self.held())
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.assertIsNone(self.guard(tp, CLAUDE_CODE_HOST_SESSION_ID=APP))
+        self.assertFalse(self.held())
+
+    def test_a_direct_call_after_the_hold_with_remote_control_on_is_asked_once_to_redo_the_relay_steps(self):
+        # The hold's deny asks to turn Remote Control back on. Claude may then call clear_session on its own
+        # (seen live with 0.17.0) instead of through the Stop hook's steps, which print RC-OFF-SELF again;
+        # the app does not clear a session while its Remote Control is on.
+        self.app_row(remoteControlUserEnabled=True)
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("arc2")
+        self.assertIn("turn it back on now", self.guard(tp, CLAUDE_CODE_HOST_SESSION_ID=APP)["permissionDecisionReason"])
+        self.agent("arc2", finished=True, age_s=300)
+        out = self.guard(tp, CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("Remote Control is on here", out["permissionDecisionReason"])
+        self.assertIn("save-clear-relay\" request", out["permissionDecisionReason"])
+        self.assertIn("RC-OFF-SELF", out["permissionDecisionReason"])
+        self.assertFalse(self.held())
+        self.assertIsNone(self.guard(tp, CLAUDE_CODE_HOST_SESSION_ID=APP), "asked once: the next call goes through")
+        self.app_row(remoteControlUserEnabled=False)
+        self.agent("arc3")
+        self.guard(tp, CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.agent("arc3", finished=True, age_s=300)
+        self.assertIsNone(self.guard(tp, CLAUDE_CODE_HOST_SESSION_ID=APP), "Remote Control off: goes through")
 
 
 EXAMPLE = os.path.join(ROOT, "config.example.json")
