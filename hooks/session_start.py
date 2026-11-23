@@ -13,8 +13,44 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (RESUME_FLAG, RESUME_TURN_DIR, log, now_ms, read_hook_input, resume_turn_marker,  # noqa: E402
-                    run_hook_command, save_config, save_pointer, seed_user_config, write_json)
+from common import (RESUME_FLAG, RESUME_TURN_DIR, cut_off_subagents, log, now_ms, process_start_ms,  # noqa: E402
+                    read_hook_input, resume_turn_marker, run_hook_command, save_config, save_pointer,
+                    seed_user_config, subagent_dir, transcript_of, write_json)
+
+RECENT_CUT_MS = 30 * 60 * 1000  # a dead subagent older than this counts only if the snapshot names it
+
+
+def cut_off(hook, entry):
+    """Background subagents of the conversation before the clear that never finished and were last active
+    before this process started: the clear ended their process (desktop app) and they will never report.
+    In a terminal the /clear keeps the process, so its subagents are alive and none is listed.
+    Only recent ones, or ones the snapshot names, so a subagent that died long ago is not brought back."""
+    old = entry.get("session_id") or ""
+    if not old or old == hook.get("session_id"):
+        return []
+    tp = hook.get("transcript_path") or ""
+    old_tp = os.path.join(os.path.dirname(tp), old + ".jsonl") if tp else ""
+    if not (old_tp and os.path.exists(old_tp)):
+        old_tp = transcript_of(old)
+    if not old_tp:
+        return []
+    try:
+        with open(entry["snapshot"], encoding="utf8") as f:
+            summary = f.read()
+    except (OSError, KeyError):
+        summary = ""
+    start = process_start_ms()
+    try:
+        agents = [a for a in cut_off_subagents(old_tp, old, start)
+                  if (start or 0) - a["active_ms"] < RECENT_CUT_MS or a["id"] in summary]
+    except Exception as e:
+        log("resume", f"subagent check failed: {e!r}")
+        return []
+    if agents:
+        log("resume", f"{len(agents)} subagent(s) of {old[:8]} stopped mid-work by the clear: "
+                      + ", ".join(a["id"] for a in agents))
+    folder = subagent_dir(old_tp, old)
+    return [dict(a, transcript=os.path.join(folder, f"agent-{a['id']}.jsonl")) for a in agents]
 
 
 def wake_instruction():
@@ -66,7 +102,8 @@ def main():
         "SAVE_CLEAR_SNAPSHOT": entry["snapshot"], "SAVE_CLEAR_SESSION_ID": hook.get("session_id") or "",
         "SAVE_CLEAR_PREVIOUS_SESSION_ID": entry.get("session_id") or "",
         "SAVE_CLEAR_PROJECT_DIR": hook.get("cwd") or ""}, timeout=5)
-    text = resume.resume_text(entry["snapshot"], extra if rc == 0 else "", hook.get("session_id") or "")
+    text = resume.resume_text(entry["snapshot"], extra if rc == 0 else "", hook.get("session_id") or "",
+                              cut_off(hook, entry))
     if not text:
         if wake:
             emit(wake)

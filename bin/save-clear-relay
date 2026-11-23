@@ -688,6 +688,31 @@ def ready(path):
     return True
 
 
+def newest_requests():
+    """{target: file name of its newest resume request in the inbox}. A session whose clear was held (its
+    subagents were still at work) asks again before the real clear: only the newest is delivered."""
+    newest = {}
+    for p in sorted(glob.glob(os.path.join(INBOX, "*.json"))):
+        try:
+            with open(p, encoding="utf-8") as f:
+                job = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(job, dict) and job.get("why") == "save-clear" and job.get("to"):
+            newest[job["to"]] = os.path.basename(p)
+    return newest
+
+
+def retire(path, why):
+    """An older resume request replaced by a newer one: out of the queue, never delivered."""
+    try:
+        os.makedirs(OUT, exist_ok=True)
+        os.replace(path, os.path.join(OUT, os.path.basename(path) + ".replaced"))
+        rlog(f"{os.path.basename(path)}: not delivered, {why}")
+    except OSError as e:
+        rlog(f"{os.path.basename(path)}: could not retire it ({e})")
+
+
 def write_job(path, job):
     tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path))
     with open(tmp, "w", encoding="utf-8") as f:
@@ -764,10 +789,14 @@ def cmd_listen():
             f.write(f"{os.getpid()} {int(time.time())}\n")
         reclaim()
         done = []
+        newest = newest_requests()
         for p in sorted(glob.glob(os.path.join(INBOX, "*.json"))):
             if ready(p):
                 with open(p, encoding="utf-8") as f:
                     job = json.load(f)
+                if job.get("why") == "save-clear" and newest.get(job.get("to")) not in (None, os.path.basename(p)):
+                    retire(p, f"a newer resume request of {str(job.get('to'))[6:14]} replaces it")
+                    continue
                 job["attempts"] = int(job.get("attempts") or 0) + 1
                 job["claimed"] = time.time()
                 dst = os.path.join(CLAIMED, os.path.basename(p))

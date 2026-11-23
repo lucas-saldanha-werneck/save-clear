@@ -22,9 +22,10 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (BIN, all_clears, clear_key, extra_steps, kill_background_tasks, language, log,  # noqa: E402
-                    now_ms, publish_link, read_json, resume_turn_marker, run_hook_command, seed_user_config, setting, snapshot_dir,
-                    stop_tasks_instruction, tmux_bin, write_clear, write_json)
+from common import (BIN, all_clears, clear_key, describe_subagents, extra_steps, kill_background_tasks,  # noqa: E402
+                    language, log, mark_app_wait, now_ms, pending_subagents, publish_link, read_json,
+                    resume_turn_marker, run_hook_command, seed_user_config, setting, snapshot_dir,
+                    stop_tasks_instruction, tmux_bin, transcript_of, write_clear, write_json)
 
 
 def cmd_dir():
@@ -142,11 +143,23 @@ def cmd_arm_clear(args):
         if mode == "manual":
             print("No automatic /clear here. Tell the user to type /clear; the summary comes back by itself.")
         else:
+            if kill_background_tasks():
+                print(stop_tasks_instruction("If you have not done it yet, before calling clear_session,"))
+            # The app's clear ends this process; a subagent still at work would die with it (see common.py).
+            agents = pending_subagents(transcript_of(sid), sid) if sid else []
+            if agents:
+                mark_app_wait(sid, agents)
+                log("arm", f"mode=app for session {sid[:8]}: {len(agents)} subagent(s) still at work, the clear waits")
+                print(f"subagents running: {len(agents)} ({describe_subagents(agents)}). In the desktop app, "
+                      "clear_session ends this session's process when the turn ends, and they would die with it. "
+                      "Do not run the relay steps and do not call clear_session now: end the turn with the step 7 "
+                      "reply, saying the clear waits for these subagents. Each result comes back here as a task "
+                      "notification: handle it and add it to the snapshot under \"## After the save\". When none "
+                      "is left, the Stop hook tells you how to finish the clear.")
+                return 0
             print("Not a terminal session. If the clear_session tool exists: run save-clear-relay ensure, then "
                   "save-clear-relay request (the relay sends the resume), then call clear_session with session_id "
                   "\"self\"; otherwise tell the user to type /clear.")
-            if kill_background_tasks():
-                print(stop_tasks_instruction("If you have not done it yet, before calling clear_session,"))
         return 0
     key = clear_key(job=target) if mode == "bg" else clear_key(sid)
     write_clear({"session_id": sid, "mode": mode, "target": target, "key": key, "ts": now_ms()})

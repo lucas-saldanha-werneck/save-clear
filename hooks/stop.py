@@ -11,7 +11,10 @@ No flag: exits at once. Rules:
   adds it to the snapshot and re-arms. The message never vanishes in the /clear.
 - A background subagent's result that reached THIS conversation after the save (before the /clear)
   blocks the stop the same way: Claude records it in the snapshot and re-arms. Subagents still running
-  are left alone: they survive /clear and report to the new conversation.
+  are left alone: they survive a terminal /clear and report to the new conversation.
+- Desktop app: a clear held for running subagents (app-wait/<session>.json, written by the clear guard or
+  `save-clear arm-clear`) waits quietly while any is pending; at the end of the first turn with none left,
+  the stop is blocked once and Claude is asked to finish the clear.
 """
 import json
 import os
@@ -20,8 +23,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (BIN, CLEAR_DIR, MARGIN_MS, clear_key, clear_path, kill_background_tasks, log,  # noqa: E402
-                    notify, now_ms, read_hook_input, read_json, stop_tasks_instruction, subagent_reports_since,
+from common import (APP_WAIT_DIR, APP_WAIT_MAX_AGE_MS, BIN, CLEAR_DIR, MARGIN_MS, app_wait_path,  # noqa: E402
+                    clear_key, clear_path, drop_app_wait, kill_background_tasks, log, notify, now_ms,
+                    pending_subagents, read_hook_input, read_json, stop_tasks_instruction, subagent_reports_since,
                     user_messages_since, write_json)
 
 MAX_DELTAS = 3
@@ -75,10 +79,52 @@ def find_flag(hook, job):
     return None
 
 
+def app_wait(hook):
+    """Desktop app: this session's clear was held for its background subagents. Any still pending: nothing
+    to do (each result starts a new turn). None left: block once and ask Claude to finish the clear.
+    True = the stop was blocked."""
+    sid = hook.get("session_id") or ""
+    path = app_wait_path(sid)
+    if not sid or not os.path.exists(path):
+        return False
+    hold = read_json(path)
+    if not isinstance(hold, dict) or now_ms() - int(hold.get("ts") or 0) > APP_WAIT_MAX_AGE_MS:
+        drop_app_wait(sid)
+        log("stop", f"{sid[:8]}: subagent hold expired or unreadable; dropped")
+        return False
+    if pending_subagents(hook.get("transcript_path") or "", sid):
+        return False
+    drop_app_wait(sid)  # asked once: never again for this hold
+    ids = ", ".join(str(x) for x in (hold.get("agents") or [])[:8]) or "see the snapshot"
+    snap = my_snapshot(hook) or "(the one you wrote; it is this session's entry in the save-clear status output)"
+    relay = os.path.join(BIN, "save-clear-relay")
+    log("stop", f"{sid[:8]}: the subagents the clear waited for are done; asked Claude to finish the clear")
+    print(json.dumps({
+        "decision": "block",
+        "reason": (f"save-clear: the background subagents this session's clear was waiting for are done ({ids}). "
+                   f"Finish the save-and-clear now. 1) Make sure the snapshot {snap} has each of their results in "
+                   "a section \"## After the save\" (id, what it returned, what you did with it, what is still "
+                   "open) and marks them finished under \"## Running subagents\"; if the conversation moved on "
+                   "since the save, update \"Last topic\" and \"Next steps\" too. 2) Do the desktop app part of "
+                   f"step 8 of the save-clear skill again: run `python3 \"{relay}\" ensure`, then "
+                   f"`python3 \"{relay}\" request` (it replaces the request made before the wait), and follow "
+                   "what they print (DO lines, the Remote Control line). 3) As the very last action, call "
+                   "clear_session with session_id \"self\". If the user asked you not to clear, skip 2) and 3) "
+                   "and say so in one line."),
+    }))
+    return True
+
+
 def main():
-    if not os.path.isdir(CLEAR_DIR) or not os.listdir(CLEAR_DIR):
+    waits = os.path.isdir(APP_WAIT_DIR) and bool(os.listdir(APP_WAIT_DIR))
+    clears = os.path.isdir(CLEAR_DIR) and bool(os.listdir(CLEAR_DIR))
+    if not waits and not clears:
         return
     hook = read_hook_input()
+    if waits and app_wait(hook):
+        return
+    if not clears:
+        return
     job = os.path.basename(os.environ.get("CLAUDE_JOB_DIR") or "")
     flag = find_flag(hook, job)
     if not flag:

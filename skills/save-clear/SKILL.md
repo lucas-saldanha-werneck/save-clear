@@ -42,8 +42,9 @@ The numbered steps below are the full procedure.
    log, process): done → leave it out; could not check → mark it "(not checked)". Items the user
    postponed go in with their trigger ("before the meeting"). Subagents this session started that are
    still running (Agent tool, background) are work in progress, not leftovers: never stop them for the
-   save. They survive the /clear and their results arrive in the new conversation, so list each one
-   under `## Running subagents` (step 3) with enough to act on its result there.
+   save. In a terminal they survive the /clear and their results arrive in the new conversation; in the
+   desktop app the clear waits for them (step 8). Either way, list each one under `## Running subagents`
+   (step 3) with enough to act on its result.
 
 2. **Update persistent memory, if the project has it.** Claude Code's auto memory lives in
    `~/.claude/projects/<project>/memory/` with a `MEMORY.md` index. If that folder exists:
@@ -61,7 +62,7 @@ The numbered steps below are the full procedure.
    line says now: stop the background tasks THIS session started that are still running (TaskStop with
    each task id) and list them under `## Stopped background tasks` in the snapshot (that heading stays in
    English, exactly, even when the snapshot is in another language: the resume looks for it). Never stop anything
-   this session did not start, and never stop a subagent (Agent tool task): it survives the /clear. That option off (no such line) = leave background tasks alone.
+   this session did not start, and never stop a subagent (Agent tool task): it is work in progress. That option off (no such line) = leave background tasks alone.
    Write `<folder>/SESSION-SUMMARY-<YYYYMMDD-HHMMSS>-<short-slug>.md`:
 
    ```markdown
@@ -142,6 +143,13 @@ The numbered steps below are the full procedure.
      terminal that may belong to another session. If the `mcp__ccd_session_mgmt__clear_session` tool
      is missing (load it with ToolSearch if it is only listed), reply "You can /clear now." and stop.
      Otherwise:
+     0. **Subagents still at work?** If `arm-clear` printed a line starting with `subagents running:`,
+        do what it says: skip sub-steps 1-3 for now and end the turn with the step 7 reply, saying the
+        clear waits for those subagents. In the desktop app `clear_session` ends this session's process
+        when the turn ends, and a subagent still running dies with it, its work cut off halfway. Handle
+        each result as it arrives and add it to the snapshot under `## After the save`; when none is
+        left, the Stop hook asks you to do sub-steps 1-3. The clear-guard hook also refuses
+        `clear_session` while one runs: then do what its message says.
      1. **Make sure the relay exists.** A session cannot message itself, so the resume comes from one
         helper app session, the relay. Run `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear-relay" ensure`
         (it can take up to a minute the first time: it creates the relay session):
@@ -173,19 +181,23 @@ The numbered steps below are the full procedure.
         call `mcp__ccd_session_mgmt__set_remote_control` with `session_id: "self"`, `enabled: false`;
         then call `clear_session` with `session_id: "self"`. The app clears only this session when the
         turn ends. If `clear_session` refuses, turn Remote Control back on at once (`enabled: true`) when
-        you turned it off, and change the reply to "You can /clear now."
+        you turned it off. A refusal that starts with `save-clear:` is one of this plugin's holds: do
+        what it says. Any other refusal: change the reply to "You can /clear now."
 
-   **Subagents still running.** Do not stop them and do not wait for them: a background subagent
-   survives the /clear, and its result arrives in the new conversation as a notification. The
-   `## Running subagents` section is what lets the next session understand that result, so fill it in
-   fully. If a result reaches THIS conversation after the save but before the /clear, the Stop hook asks
-   you to record it under `## After the save` and run the `save-clear rearm <session id> --subagents`
-   command it gives. Stop a subagent only when the user asks.
+   **Subagents still running.** Never stop them. In a terminal (`tmux`, `bg`, `manual`) do not wait for
+   them either: a background subagent survives the /clear, and its result arrives in the new
+   conversation as a notification. The `## Running subagents` section is what lets the next session
+   understand that result, so fill it in fully. If a result reaches THIS conversation after the save but
+   before the /clear, the Stop hook asks you to record it under `## After the save` and run the
+   `save-clear rearm <session id> --subagents` command it gives. In the desktop app (`app`) the clear
+   waits for them (sub-step 0): the app's clear starts a new process and would stop them halfway. If you
+   reply "You can /clear now." there while one runs, add that the user should wait until it reports.
+   Stop a subagent only when the user asks.
 
    **Long work goes to background subagents.** During the session, hand long jobs (builds, long
    tests, research, anything over a few minutes) to background subagents (Agent tool with
-   `run_in_background`), not to the main thread: subagents survive the /clear, so save-clear never
-   has to wait for them.
+   `run_in_background`), not to the main thread: in a terminal they survive the /clear, and in the
+   desktop app the clear waits for them, so their work is never cut off.
 
    **Busy session (kill_background_tasks on).** If the helper found the session still busy, the Stop
    hook blocks once and asks you to stop this session's leftover background tasks (Bash, Monitor; never
@@ -217,12 +229,14 @@ The numbered steps below are the full procedure.
 ## Limitations
 
 - In a terminal without tmux the automatic /clear is not possible: Claude tells the user to type /clear, and the summary still comes back by itself.
+- In the desktop app the clear waits for background subagents still at work (the app's clear ends the session's process), so a long subagent delays the clear.
 - On Windows save and resume work, but the user always types /clear.
 - The idle trigger never runs unless a scheduler is installed (launchd on macOS, cron on Linux).
 
 ## Troubleshooting
 
 - The /clear did not happen by itself: the session is not in a tmux pane (or tmux is missing). Ask the user to type /clear.
+- Desktop app, not cleared yet: a background subagent is still at work (save-clear log: `[clear-guard] ... held`). The clear follows when the last one reports.
 - Memory step skipped: the project has no `~/.claude/projects/<project>/memory/` folder; this is expected.
 - An EMERGENCY-COMPACT marker newer than the last SESSION-SUMMARY means the session compacted without a save: treat that state as not verified.
 

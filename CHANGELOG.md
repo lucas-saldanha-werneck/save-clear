@@ -2,6 +2,14 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.17.0 (2026-11-23)
+
+- Desktop app: the automatic clear no longer stops background subagents. `clear_session` ends the session's process when the turn ends (the new session starts with SessionStart `startup`), and every subagent still running died with it (seen on Claude Code 2.1.330: four subagents stopped mid-work, their results lost). Now `save-clear arm-clear` and the clear-guard hook check the session's subagents (Claude Code's `agent-<id>.meta.json`: not finished, not stopped, active since this process started; or finished less than 2 minutes ago with a result Claude has not read yet) and hold the clear while any is at work. At the end of the first turn with none left, the Stop hook asks Claude once to finish the clear. A hold older than 12 hours is dropped.
+- The relay delivers only the newest resume request of a session, so asking again after the wait does not send the resume twice.
+- The resume names the subagents a clear cut off anyway (never finished, last active before the new process started), with their transcripts, and asks Claude to check how far each one got and start it again when the work is still needed.
+- Terminal: unchanged. A typed or automatic `/clear` keeps the process, so subagents keep running and report to the new conversation (checked again on 2.1.330).
+- Skill and README: subagents survive the clear in a terminal only; in the desktop app the clear waits for them.
+
 ## 0.16.1 (2026-11-15)
 
 - Without the `language` option, the resume now tells Claude to reply in the language the user writes in (the snapshot's language), not in English because the resume message is in English. The skill also says to write the snapshot in the user's language when no language is set. With `language` set, nothing changes.
