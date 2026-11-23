@@ -206,6 +206,65 @@ def listener_rcon():
         return False
 
 
+VERSION_RE = re.compile(r"[\\/]save-clear[\\/](\d+(?:\.\d+)+)[\\/]bin[\\/]save-clear-relay")
+
+
+def _version(text):
+    try:
+        return tuple(int(x) for x in str(text).split("."))
+    except ValueError:
+        return None
+
+
+def own_version():
+    """This copy's version (its .claude-plugin/plugin.json), or None."""
+    v = (read_json(os.path.join(ROOT, ".claude-plugin", "plugin.json")) or {}).get("version")
+    return _version(v) if v else None
+
+
+def listener_cmd(pid):
+    try:
+        return subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                              timeout=5, env=dict(os.environ, LC_ALL="C")).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def listener_pid():
+    try:
+        with open(ALIVE, encoding="utf-8") as f:
+            return int(f.read().split()[0])
+    except Exception:
+        return None
+
+
+def listener_outdated():
+    """True when the running listener runs from an installed copy older than this one (plugin cache
+    .../save-clear/<version>/bin/save-clear-relay): `claude plugin update` and /reload-plugins never restart
+    it, so it would go on with the old code. Unknown (a checkout, no ps) = False."""
+    pid = listener_pid()
+    if not pid or not listening():
+        return False
+    m = VERSION_RE.search(listener_cmd(pid))
+    mine = own_version()
+    return bool(m and mine and "listen" in listener_cmd(pid) and _version(m.group(1)) < mine)
+
+
+def newer_install():
+    """Path of a newer installed save-clear-relay next to this copy (.../save-clear/<newer>/bin/...), or None."""
+    parent, here = os.path.split(ROOT)
+    mine = _version(here)
+    if not mine or os.path.basename(parent) != "save-clear":
+        return None
+    best = None
+    for d in os.listdir(parent) if os.path.isdir(parent) else []:
+        v = _version(d)
+        path = os.path.join(parent, d, "bin", "save-clear-relay")
+        if v and v > mine and os.path.isfile(path) and (best is None or v > best[0]):
+            best = (v, path)
+    return best[1] if best else None
+
+
 def wake_text():
     return f"RELAY listen. Run `{CMD} rules` and follow the cycle from step 1."
 
@@ -229,10 +288,11 @@ def cmd_wake_claim():
         return 0
     if archived(rid) is not False:  # archived, or not found in the app: a wake would go nowhere
         return 0
-    if listening():
+    outdated = listener_outdated()
+    if listening() and not outdated:
         return 0
     age = beat_age()
-    if age is not None and age < WAKE_AFTER_S:  # it may be re-arming, or its own clear is being handled by the waker
+    if not outdated and age is not None and age < WAKE_AFTER_S:  # it may be re-arming, or its own clear is being handled by the waker
         return 0
     ensure_state()
     try:  # lock; a lock left by a crash for more than 30 s is stale
@@ -252,7 +312,10 @@ def cmd_wake_claim():
             pass
         with open(WAKE_STAMP, "w", encoding="utf-8") as f:
             f.write(f"{me}\n")
-        rlog(f"listener dead for {'unknown time' if age is None else str(int(age)) + ' s'}: asking {me} to wake {rid}")
+        if outdated:
+            rlog(f"listener runs an older save-clear: asking {me} to wake {rid} with this version's rules")
+        else:
+            rlog(f"listener dead for {'unknown time' if age is None else str(int(age)) + ' s'}: asking {me} to wake {rid}")
         print(f"{rid} {wake_text()}")
         return 0
     finally:
@@ -594,6 +657,7 @@ def cmd_status():
     unacked, failed = names(CLAIMED), names(FAILED)
     app = app_session(rid) if rid else None
     print(json.dumps({"relay": rid or None, "waker": v.get("waker"), "listening": listening(),
+                      "listener_outdated": listener_outdated(),
                       "archived": None if app is None else bool(app.get("isArchived")),
                       "title": (app or {}).get("title"), "model": (app or {}).get("model"),
                       "permission_mode": (app or {}).get("permissionMode"),
@@ -688,6 +752,47 @@ def ready(path):
     return True
 
 
+def newest_requests():
+    """{target: file name of its newest resume request}. A session whose clear was held (its subagents were
+    still at work) asks again before the real clear: only the newest is delivered. Claimed and delivered
+    requests count too, so an older one handed back to the inbox (no ack) is not sent after a newer one."""
+    newest = {}
+    for folder in (INBOX, CLAIMED, OUT):
+        for p in glob.glob(os.path.join(folder, "*.json")):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    job = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(job, dict) and job.get("why") == "save-clear" and job.get("to"):
+                key = (float(job.get("created") or 0), os.path.basename(p))
+                if job["to"] not in newest or key > newest[job["to"]]:
+                    newest[job["to"]] = key
+    return {to: key[1] for to, key in newest.items()}
+
+
+def carry_rc_on(old, newest_name):
+    """The retired request turned the session's Remote Control off for the clear (rc_on): the newer one,
+    still queued, must turn it back on after its delivery."""
+    path = os.path.join(INBOX, newest_name)
+    if not old.get("rc_on") or not os.path.exists(path):
+        return
+    job = read_json(path)
+    if isinstance(job, dict) and not job.get("rc_on"):
+        job["rc_on"] = True
+        write_job(path, job)
+
+
+def retire(path, why):
+    """An older resume request replaced by a newer one: out of the queue, never delivered."""
+    try:
+        os.makedirs(OUT, exist_ok=True)
+        os.replace(path, os.path.join(OUT, os.path.basename(path) + ".replaced"))
+        rlog(f"{os.path.basename(path)}: not delivered, {why}")
+    except OSError as e:
+        rlog(f"{os.path.basename(path)}: could not retire it ({e})")
+
+
 def write_job(path, job):
     tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path))
     with open(tmp, "w", encoding="utf-8") as f:
@@ -740,6 +845,25 @@ def cmd_ack(args):
     return 0
 
 
+def take_over(lock):
+    """The lock is held. When the holder is an older version's listener, stop it and take the lock (True)."""
+    if not fcntl or not listener_outdated():
+        return False
+    pid = listener_pid()
+    rlog(f"listener {pid} runs an older save-clear; this one ({CMD}) replaces it")
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+    for _ in range(50):
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
+
 def cmd_listen():
     ensure_state()
     for d in (OUT, CLAIMED, FAILED):
@@ -753,18 +877,36 @@ def cmd_listen():
             lock.seek(0)
             msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError:
-        print("ALREADY")  # another listener is alive: the relay does NOT start one again
-        return 0
+        if not take_over(lock):
+            print("ALREADY")  # another listener is alive: the relay does NOT start one again
+            return 0
     with open(CAPS, "w", encoding="utf-8") as f:
         f.write(f"{os.getpid()} rcon\n")
     rlog("listening")
     start = time.time()
+    checked = 0.0
     while True:
+        if os.name != "nt" and time.time() - checked > 30:
+            checked = time.time()
+            newer = newer_install()
+            if newer:
+                rlog(f"a newer save-clear is installed: the listener restarts from {newer}")
+                sys.stdout.flush()
+                lock.close()
+                os.execv(sys.executable, [sys.executable, newer, "listen"])
         with open(ALIVE, "w", encoding="utf-8") as f:
             f.write(f"{os.getpid()} {int(time.time())}\n")
         reclaim()
         done = []
+        newest = newest_requests()
         for p in sorted(glob.glob(os.path.join(INBOX, "*.json"))):
+            # An older resume request is retired before ready(), which could start its Remote Control timer.
+            old = read_json(p)
+            if isinstance(old, dict) and old.get("why") == "save-clear" \
+                    and newest.get(old.get("to")) not in (None, os.path.basename(p)):
+                carry_rc_on(old, newest[old["to"]])
+                retire(p, f"a newer resume request of {str(old.get('to'))[6:14]} replaces it")
+                continue
             if ready(p):
                 with open(p, encoding="utf-8") as f:
                     job = json.load(f)
@@ -790,7 +932,7 @@ def cmd_listen():
                 print(f"  ACK: {CMD} ack {name} ok")
                 print(f"  (if send_message failed: {CMD} ack {name} failed <reason>)")
                 rlog(f"handed to the relay: {name} (attempt {job['attempts']} of {MAX_ATTEMPTS})")
-            print(f"  THEN: run the ACK line of each job; start the listener again in the background. "
+            print(f"  THEN: run the ACK line of each job; start the listener again in the background (`{CMD} listen`). "
                   f"Without an ack a request is handed out again after {int(CLAIM_S)} s, "
                   f"at most {MAX_ATTEMPTS} times.")
             return 0

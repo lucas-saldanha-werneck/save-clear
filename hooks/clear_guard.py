@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """PreToolUse on the desktop app's clear_session tool (mcp__ccd_session_mgmt__clear_session).
 
-In the Claude desktop app the skill ends with clear_session("self"). A message the user sent
-DURING the save would vanish: its answer leaves the screen, or it runs after the turn and the
-clear wipes it. This hook denies the clear ONCE when messages arrived after the skill loaded,
-asks Claude to put them (and the answers) in the snapshot, and lets the second call through.
+In the Claude desktop app the skill ends with clear_session("self"). Two things would be lost:
+- Background subagents still running. When the turn ends, the app ends this session's process and starts
+  a new one, and every subagent dies with the old process (seen on 2.1.330). While one runs (or just
+  finished and its result has not reached the conversation), this hook denies the clear and records a
+  hold; hooks/stop.py asks Claude to finish the clear once they are all done.
+- A message the user sent DURING the save: its answer leaves the screen, or it runs after the turn and
+  the clear wipes it. This hook denies the clear ONCE when messages arrived after the skill loaded, asks
+  Claude to put them (and the answers) in the snapshot, and lets the second call through.
 """
 import json
 import os
@@ -12,8 +16,10 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import (STATE, SYSTEM_TAG, _text_of as text_of, ensure_state, log as _log, read_hook_input,  # noqa: E402
-                    read_json, run_hook_command, write_json)
+from common import (APP_WAIT_MAX_AGE_MS, STATE, SYSTEM_TAG, _text_of as text_of, app_wait_expired,  # noqa: E402
+                    describe_subagents, drop_app_wait, ensure_state, hold_resume_requests, log as _log,
+                    mark_app_wait, pending_subagents, process_start_ms, read_app_wait, read_hook_input,
+                    read_json, release_resume_requests, run_hook_command, write_json)
 import re  # noqa: E402
 
 GUARD_STATE = os.path.join(STATE, "clear-guard.json")  # transcript -> number of messages already asked about
@@ -63,17 +69,82 @@ def new_messages(entries):
             found.append(((o.get("timestamp") or "")[11:19], (c or "(queued message)")[:80]))
         elif t == "user":
             m = o.get("message") or {}
-            if m.get("role") != "user":
-                continue
+            if m.get("role") != "user" or o.get("isMeta") or o.get("isCompactSummary") or o.get("isSidechain"):
+                continue  # a subagent's hand-back (isMeta) or a compaction summary is not the user's words
             tx = text_of(m.get("content"))
             if not is_noise(tx) and "tool_result" not in json.dumps(m.get("content"))[:200]:
                 found.append(((o.get("timestamp") or "")[11:19], tx[:80]))
     return found
 
 
+def deny(reason):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
+
+
+def hold_for_subagents(data):
+    """Deny while this session's background subagents would be cut off (True = denied)."""
+    sid = data.get("session_id") or ""
+    try:
+        start = process_start_ms()
+        agents = pending_subagents(data.get("transcript_path") or "", sid, start)
+    except Exception as e:  # a broken check must not block every clear
+        log(f"{sid[:8]}: subagent check failed ({e!r}); not held for subagents")
+        return False
+    host = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or ""
+    if not agents:
+        if drop_app_wait(sid):
+            log(f"{sid[:8]}: the subagents it waited for are done")
+            release_resume_requests(host)
+        return False
+    hold = read_app_wait(sid, start)
+    if hold and app_wait_expired(hold):
+        release_resume_requests(host)
+        drop_app_wait(sid)
+        log(f"{sid[:8]}: held for over {APP_WAIT_MAX_AGE_MS // 3600000} h; the clear goes through anyway")
+        return False
+    running = [a for a in agents if a.get("why") == "running"]
+    if not running:
+        # Only finished subagents whose result has not reached the conversation. Nothing would make a later
+        # turn re-check, so deny ONCE: Claude reads them (TaskOutput, or the notification) and calls again.
+        told = set(str(x) for x in (hold.get("reported") or []))
+        if all(a["id"] in told for a in agents):
+            release_resume_requests(host)
+            drop_app_wait(sid)
+            log(f"{sid[:8]}: only finished subagents left, already reported once; the clear goes through")
+            return False
+        mark_app_wait(sid, agents, reported=[a["id"] for a in agents], start_ms=start)
+        hold_resume_requests(host)
+        log(f"{sid[:8]}: held once, finished subagent(s) not read yet: " + ", ".join(a["id"] for a in agents))
+        deny(f"save-clear: not cleared yet: {len(agents)} background subagent(s) of this session just finished "
+             f"and their results are not in this conversation yet: {describe_subagents(agents)}. Read each "
+             "result now (TaskOutput with its id, or the task notification if it already arrived) and add it to "
+             "the snapshot in a section \"## After the save\" (its id, what it returned, what is still open). "
+             "Then redo the desktop app part of step 8 (`save-clear-relay request` again: the earlier request "
+             "was taken out of the queue) and call clear_session again in this turn: the next call goes through.")
+        return True
+    mark_app_wait(sid, agents, start_ms=start)
+    hold_resume_requests(host)
+    since = time.strftime("%H:%M:%S", time.localtime(start / 1000)) if start else "unknown"
+    log(f"{sid[:8]}: held, {len(agents)} subagent(s) still pending: " + ", ".join(a["id"] for a in agents)
+        + f" (process started {since})")
+    deny(f"save-clear: not cleared yet: {len(agents)} background subagent(s) of this session are still at work: "
+         f"{describe_subagents(agents)}. In the desktop app, clear_session ends this session's process when the "
+         "turn ends, and every subagent still running dies with it (its work stops halfway, its result is lost). "
+         "Do not stop them and do not call clear_session again in this turn. If you turned Remote Control off "
+         "for the clear, turn it back on now (mcp__ccd_session_mgmt__set_remote_control, session_id \"self\", "
+         "enabled true). End the turn with one short line saying the clear waits for these subagents. Each "
+         "result arrives here as a task notification: handle it as usual and add it to the snapshot, in a "
+         "section \"## After the save\" (its id, what it returned, what is still open). When none is left, the "
+         "Stop hook tells you how to finish the clear.")
+    return True
+
+
 def main():
     data = read_hook_input()
     if (data.get("tool_input") or {}).get("session_id") != "self":
+        return
+    if hold_for_subagents(data):
         return
     if decide(data):  # the clear goes through: run the user's pre_clear_command first (never blocks)
         run_hook_command("pre_clear_command", "pre_clear",
@@ -118,10 +189,11 @@ def decide(data):
     reason = ("save-clear: messages arrived during the save:\n" + lines + "\n"
               "Before clearing: 1) answer what you have not answered; 2) add to the snapshot a section "
               "'## After the save' with the FULL text of each of these messages and your answer in one line; "
-              "3) call clear_session again in this turn: the second call goes through. '(queued message)' = "
+              "3) call clear_session again in this turn: the second call goes through (if you turned Remote Control "
+              "off for the clear and turned it back on after this refusal, turn it off again right before the "
+              "call). '(queued message)' = "
               "a message still waiting to run; note in the snapshot that it was queued at clear time.")
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                             "permissionDecisionReason": reason}}))
+    deny(reason)
     return False
 
 

@@ -7,6 +7,7 @@ own entry. A global flag would hand the summary to whichever session starts firs
 """
 import os
 import re
+import time
 
 from common import (BIN, app_host, RESUME_FLAG, RESUME_LOCK, ANSWERS_SECTION, RUNNING_SECTION, STOPPED_SECTION, ensure_state, language, locked, log, now_ms,
                     read_json, write_json)
@@ -223,7 +224,22 @@ def after_save(summary):
 URL_RE = re.compile(r"^summary_url:\s*(https://\S+)\s*$", re.M)
 
 
-def resume_text(snapshot_path, extra="", session_id=""):
+def cut_off_text(agents):
+    """The resume's lines about subagents a clear stopped mid-work (see session_start.cut_off)."""
+    rows = "; ".join(
+        f'{a["id"]} ("{a.get("description") or "no description"}", last active '
+        f'{time.strftime("%H:%M", time.localtime(a["active_ms"] / 1000))}, transcript {a.get("transcript") or "?"})'
+        for a in agents[:10])
+    return [f"WARNING: {len(agents)} background subagent(s) of the previous conversation were stopped mid-work: the "
+            "clear ended the process they ran in (the desktop app does that), so they will NEVER report: " + rows + ". "
+            "Name them in your summary. Then, for each one: read the end of its transcript to see how far it got "
+            "(files written, commits, PRs, messages sent); if its work is still needed, start it again in the "
+            "background (Agent tool with run_in_background) with its original brief (the first message of its "
+            "transcript) plus what is already done. Never repeat something it may already have done that cannot be "
+            "undone (sending, posting, applying, paying): check first, and ask the user if you cannot tell.", ""]
+
+
+def resume_text(snapshot_path, extra="", session_id="", cut_off=()):
     try:
         with open(snapshot_path, encoding="utf8") as f:
             summary = f.read()
@@ -264,14 +280,17 @@ def resume_text(snapshot_path, extra="", session_id=""):
         lines += [f'The previous session stopped background tasks before the /clear (section "{STOPPED_SECTION[3:]}" '
                   "below). Name them in your summary, and say which ones need to be started again.", ""]
     if running_subagents(summary):
-        lines += [f'Subagents of the previous session were still running at the /clear (section '
-                  f'"{RUNNING_SECTION[3:]}" below). They keep running: each result arrives in THIS conversation '
+        lines += [f'Subagents of the previous session were still running at the save (section '
+                  f'"{RUNNING_SECTION[3:]}" below). A result already listed under "After the save" came in before '
+                  "the clear. The others keep running: each result arrives in THIS conversation "
                   "as a task notification with the subagent's id; one may already be here, before this text, "
                   "if it finished during the /clear. Look for those first. Name them in your summary. When a result "
                   "arrives, find its line in that section by id, check what it claims (PR, commit, CI, files) "
-                  "and do the follow-up that line names (install, test, tell the user). A result already listed "
-                  'under "After the save" is done. If one never reports, check its branch, worktree or PR before '
-                  "starting it again from its brief.", ""]
+                  "and do the follow-up that line names (install, test, tell the user). If one never reports, "
+                  "check its branch, worktree or PR before starting it again from its brief."
+                  + (" The ones in the WARNING below were stopped and will not report." if cut_off else ""), ""]
+    if cut_off:
+        lines += cut_off_text(list(cut_off))
     if extra:
         lines += ["## From your on_resume_command (do this first)", "", extra, ""]
     lines += [summary, "", "---",

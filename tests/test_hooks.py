@@ -1141,6 +1141,61 @@ class RelayAuto(Base):
         self.assertEqual(self.created(), [])
 
 
+class RelayUpgrade(Base):
+    """`claude plugin update` and /reload-plugins never restart the relay's listener: a newer install takes
+    over by itself (re-exec, or replacing an older listener) and app sessions wake the relay with the new
+    rules while an older listener runs."""
+
+    def install(self, parent, version):
+        import shutil
+        root = os.path.join(self.t, parent, "save-clear", version)
+        for d in ("bin", "lib", "relay", ".claude-plugin"):
+            shutil.copytree(os.path.join(ROOT, d), os.path.join(root, d))
+        pj = os.path.join(root, ".claude-plugin", "plugin.json")
+        with open(pj) as f:
+            meta = json.load(f)
+        meta["version"] = version
+        with open(pj, "w") as f:
+            json.dump(meta, f)
+        return os.path.join(root, "bin", "save-clear-relay")
+
+    def run_relay(self, path, *args, **env):
+        e = dict(self.env)
+        e.update({k: str(v) for k, v in env.items()})
+        return subprocess.run([PY, path, *args], capture_output=True, text=True, cwd=self.proj, env=e, timeout=60)
+
+    @unittest.skipIf(sys.platform == "win32", "no re-exec on Windows (os.execv starts a new process there)")
+    def test_listener_restarts_from_a_newer_install(self):
+        old = self.install("cache", "1.0.0")
+        new = self.install("cache", "1.1.0")
+        r = self.run_relay(old, "listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+        self.assertEqual(r.stdout.strip(), "IDLE", r.stderr)
+        with open(os.path.join(self.state, "relay.log")) as f:
+            self.assertIn(f"the listener restarts from {new}", f.read())
+
+    @unittest.skipIf(sys.platform == "win32", "uses ps and flock")
+    def test_a_newer_listener_replaces_an_older_one(self):
+        old = self.install("old", "1.0.0")  # separate folders: the old one must not re-exec by itself
+        new = self.install("new", "1.1.0")
+        e = dict(self.env, SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="60")
+        proc = subprocess.Popen([PY, old, "listen"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                cwd=self.proj, env=e)
+        try:
+            alive = os.path.join(self.state, "relay-listener.alive")
+            for _ in range(150):
+                if os.path.exists(alive) and open(alive).read().split()[:1] == [str(proc.pid)]:
+                    break
+                time.sleep(0.2)
+            self.assertTrue(json.loads(self.run_relay(new, "status").stdout)["listener_outdated"])
+            r = self.run_relay(new, "listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+            self.assertEqual(r.stdout.strip(), "IDLE", r.stdout + r.stderr)
+            self.assertIsNotNone(proc.wait(timeout=20), "the old listener was stopped")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
+
+
 class RelayWake(Base):
     """SessionStart of an app session wakes a dead relay (the app was quit or restarted): once per cool-down."""
     def setUp(self):
@@ -1180,6 +1235,21 @@ class RelayWake(Base):
         self.assertNotIn("systemMessage", json.loads(r.stdout), "no visible noise for the user")
         with open(os.path.join(self.state, "relay.log"), encoding="utf-8") as f:
             self.assertIn("to wake " + RELAY_ID, f.read())
+
+    @unittest.skipIf(sys.platform == "win32", "uses ps")
+    def test_an_older_listener_makes_the_session_wake_the_relay_with_the_new_rules(self):
+        fake = subprocess.Popen([PY, "-c", "import time; time.sleep(60)",
+                                 os.path.join(self.t, "c", "save-clear", "0.1.0", "bin", "save-clear-relay"), "listen"])
+        try:
+            self.beat(age=0, pid=fake.pid)
+            ctx = self.context(self.app_start())
+            self.assertIn(f"session_id={RELAY_ID}", ctx)
+            self.assertIn(os.path.join(ROOT, "bin", "save-clear-relay"), ctx, "the new copy's rules")
+            with open(os.path.join(self.state, "relay.log"), encoding="utf-8") as f:
+                self.assertIn("listener runs an older save-clear", f.read())
+        finally:
+            fake.kill()
+            fake.wait()
 
     def test_only_one_wake_per_cooldown(self):
         self.assertIn("send_message", self.context(self.app_start()))
@@ -2251,8 +2321,9 @@ def notification(task_id, summary, offset_s=1, status="completed"):
 
 
 class Subagents(Base):
-    """Background subagents survive /clear: they never hold it, are never stopped, and the new conversation
-    is told how to read their results (seen on 12/11/2026: subagents stopped mid-work, results lost)."""
+    """Background subagents survive a terminal /clear: they never hold it, are never stopped, and the new
+    conversation is told how to read their results (seen on 12/11/2026: subagents stopped mid-work, results
+    lost). The desktop app is different: see AppClearWaitsForSubagents."""
     PANE_PID = 4242
 
     def setUp(self):
@@ -2483,6 +2554,380 @@ class Subagents(Base):
         ctx = self.ctx_for("")
         self.assertIn("NO AskUserQuestion", ctx)
         self.assertIn("do not ask it now", ctx.lower())
+
+
+class AppClearWaitsForSubagents(Base):
+    """Desktop app: clear_session ends the session's process, so a background subagent still at work dies
+    with it (seen on 22/11/2026, Claude Code 2.1.330: four subagents stopped mid-work, results lost). The
+    clear waits for them; the next session is told about any that a clear cut off anyway."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = os.path.join(self.t, "cfg")
+        self.projdir = os.path.join(self.cfg, "projects", "-tmp-project")
+        os.makedirs(self.projdir)
+        # This session's process started 10 minutes ago.
+        self.env.update(CLAUDE_CONFIG_DIR=self.cfg,
+                        SAVE_CLEAR_PROCESS_START_MS=str(int(time.time() * 1000) - 600000))
+
+    def transcript(self, sid, *entries):
+        tp = os.path.join(self.projdir, sid + ".jsonl")
+        with open(tp, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        return tp
+
+    def add(self, tp, *entries):
+        with open(tp, "a") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def agent(self, aid, sid=SID_A, age_s=0, **meta):
+        """Claude Code's files for one subagent: agent-<id>.meta.json and agent-<id>.jsonl, last written age_s ago."""
+        d = os.path.join(self.projdir, sid, "subagents")
+        os.makedirs(d, exist_ok=True)
+        m = {"agentType": "general-purpose", "description": f"job {aid}", "requestShape": "background"}
+        m.update(meta)
+        t = time.time() - age_s
+        for name, body in ((f"agent-{aid}.meta.json", json.dumps(m)), (f"agent-{aid}.jsonl", "{}\n")):
+            p = os.path.join(d, name)
+            with open(p, "w") as f:
+                f.write(body)
+            os.utime(p, (t, t))
+
+    def guard(self, tp, sid=SID_A, **env):
+        r = self.run_py("hooks/clear_guard.py", stdin={"tool_input": {"session_id": "self"}, "transcript_path": tp,
+                                                       "session_id": sid}, **env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
+
+    def stop(self, tp, sid=SID_A):
+        return self.run_py("hooks/stop.py", stdin={"session_id": sid, "transcript_path": tp}).stdout.strip()
+
+    def held(self, sid=SID_A):
+        return os.path.exists(os.path.join(self.state, "app-wait", sid + ".json"))
+
+    def test_guard_holds_while_a_subagent_runs_then_lets_the_clear_through(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("a111", description="build the thing")
+        out = self.guard(tp)
+        self.assertEqual(out["permissionDecision"], "deny")
+        reason = out["permissionDecisionReason"]
+        self.assertIn('a111 ("build the thing")', reason)
+        self.assertIn("ends this session's process", reason)
+        self.assertIn("## After the save", reason)
+        self.assertTrue(self.held())
+        self.assertEqual(self.guard(tp)["permissionDecision"], "deny", "held as long as it runs, not just once")
+        self.agent("a111", description="build the thing", finished=True)
+        self.add(tp, notification("a111", 'Agent "build the thing" completed'))
+        self.assertIsNone(self.guard(tp), "finished and read: the clear goes through")
+        self.assertFalse(self.held(), "hold dropped")
+        with open(self.flag_path("save-clear.log")) as f:
+            self.assertIn("held, 1 subagent(s) still pending: a111", f.read())
+
+    def test_ended_foreground_and_older_process_subagents_do_not_hold(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("aold", age_s=3600)               # never finished, last active before this process started
+        self.agent("afin", finished=True, age_s=300)
+        self.agent("astop", stoppedByUser=True)
+        self.agent("afg", requestShape="foreground")
+        self.agent("anote", age_s=60)                # no "finished" in its meta, but its notification is here
+        self.add(tp, notification("anote", 'Agent "job anote" completed', offset_s=-30))
+        self.assertIsNone(self.guard(tp))
+        self.assertFalse(self.held())
+
+    def test_a_result_not_read_yet_holds_the_clear(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("a222", finished=True)            # finished a moment ago
+        out = self.guard(tp)
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("its result is not in this conversation yet", out["permissionDecisionReason"])
+        text = notification("a222", 'Agent "job a222" completed')["message"]["content"]
+        self.add(tp, {"type": "attachment", "timestamp": iso(), "attachment": {"type": "queued_command", "prompt": text}},
+                 {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(), "content": text})
+        self.assertIsNone(self.guard(tp), "only a result on its way: denied once, the next call goes through")
+        self.assertFalse(self.held())
+        self.agent("a223", finished=True)
+        self.assertEqual(self.guard(tp)["permissionDecision"], "deny")
+        self.add(tp, {"type": "queue-operation", "operation": "remove", "timestamp": iso(), "content":
+                      notification("a223", 'Agent "job a223" completed')["message"]["content"]})
+        self.assertIsNone(self.guard(tp), "read mid-turn: the clear goes through")
+
+    def test_a_hand_back_counts_as_read(self):
+        # Seen in a terminal on 2.1.330: the final report arrives as a hand-back message, and the task
+        # notification stays queued until the next request reads it.
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("a123", finished=True)
+        self.add(tp, {"type": "user", "isMeta": True, "timestamp": iso(),
+                      "origin": {"kind": "peer", "from": "a123", "handback": True},
+                      "message": {"role": "user", "content": 'Another Claude session sent a message:\n'
+                                  '<agent-message from="a123">\n  done\n</agent-message>'}})
+        self.assertIsNone(self.guard(tp), "a hand-back is neither a pending result nor a message from the user")
+        self.assertFalse(self.held())
+
+    def test_ps_elapsed_time_parsing(self):
+        code = (f"import sys; sys.path.insert(0, {os.path.join(ROOT, 'lib')!r}); import common; "
+                "print([common._etime_seconds(t) for t in ('05:07', '04:05:07', '1-02:03:04', '', 'x')])")
+        r = subprocess.run([PY, "-c", code], capture_output=True, text=True, env=self.env, timeout=30)
+        self.assertEqual(r.stdout.strip(), "[307, 14707, 93784, None, None]", r.stderr)
+
+    def test_unknown_process_start_falls_back_to_recent_activity(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("a333", age_s=60)
+        self.assertEqual(self.guard(tp, SAVE_CLEAR_PROCESS_START_MS="unknown")["permissionDecision"], "deny")
+        self.agent("a333", age_s=3 * 3600)
+        self.assertIsNone(self.guard(tp, SAVE_CLEAR_PROCESS_START_MS="unknown"))
+
+    def test_user_messages_are_still_held_once_after_the_wait(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL,
+                             {"type": "user", "timestamp": iso(-20), "message": {"role": "user", "content": "also do Z"}})
+        self.agent("a999")
+        self.assertIn("still at work", self.guard(tp)["permissionDecisionReason"])
+        self.agent("a999", finished=True, age_s=300)
+        out = self.guard(tp)
+        self.assertIn("also do Z", out["permissionDecisionReason"], "the message check runs once none is pending")
+        self.assertIsNone(self.guard(tp))
+
+    def test_stop_hook_waits_then_asks_once_to_finish_the_clear(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("a444")
+        self.guard(tp)
+        self.assertEqual(self.stop(tp), "", "still running: the turn ends quietly")
+        self.assertTrue(self.held())
+        self.agent("a444", finished=True)
+        self.add(tp, notification("a444", 'Agent "job a444" completed'))
+        out = json.loads(self.stop(tp))
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("a444", out["reason"])
+        self.assertIn("save-clear-relay", out["reason"])
+        self.assertIn('call clear_session with session_id "self"', out["reason"])
+        self.assertFalse(self.held())
+        self.assertEqual(self.stop(tp), "", "asked once")
+
+    def test_stop_hook_forgets_an_old_hold(self):
+        os.makedirs(os.path.join(self.state, "app-wait"))
+        with open(os.path.join(self.state, "app-wait", SID_A + ".json"), "w") as f:
+            json.dump({"session_id": SID_A, "ts": int(time.time() * 1000) - 13 * 3600 * 1000, "agents": ["a1"]}, f)
+        self.assertEqual(self.stop(self.transcript(SID_A)), "")
+        self.assertFalse(self.held())
+
+    def test_arm_clear_in_the_app_waits_for_running_subagents(self):
+        self.transcript(SID_A)
+        app = dict(CLAUDE_CODE_ENTRYPOINT="claude-desktop", CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_HOST_SESSION_ID=APP)
+        r = self.run_py("bin/save-clear", ["arm-clear"], **app)
+        self.assertIn("save-clear-relay request", r.stdout, "nothing running: the usual app steps")
+        self.assertFalse(self.held())
+        self.agent("a555", description="long research")
+        r = self.run_py("bin/save-clear", ["arm-clear"], **app)
+        self.assertIn('subagents running: 1 (a555 ("long research"))', r.stdout)
+        self.assertNotIn("save-clear-relay request", r.stdout)
+        self.assertTrue(self.held())
+
+    def session_start(self, start_ms=None):
+        hook = {"session_id": SID_NEW, "source": "clear", "cwd": self.proj,
+                "transcript_path": os.path.join(self.projdir, SID_NEW + ".jsonl")}
+        env = {"CLAUDE_PID": 4242}
+        if start_ms is not None:
+            env["SAVE_CLEAR_PROCESS_START_MS"] = str(start_ms)
+        r = self.run_py("hooks/session_start.py", stdin=hook, **env)
+        return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def test_resume_names_subagents_a_clear_cut_off(self):
+        self.transcript(SID_A)
+        self.agent("a666", age_s=30, description="apply to job")  # last active before the new process started
+        self.agent("a777", finished=True, age_s=40)
+        self.agent("aolder", age_s=7200)                         # died long ago and not in the snapshot
+        self.arm(self.snapshot())
+        ctx = self.session_start(int(time.time() * 1000) - 5000)
+        self.assertIn("stopped mid-work", ctx)
+        self.assertIn('a666 ("apply to job"', ctx)
+        self.assertIn(os.path.join(self.projdir, SID_A, "subagents", "agent-a666.jsonl"), ctx)
+        self.assertNotIn("a777", ctx)
+        self.assertNotIn("aolder", ctx)
+
+    def test_resume_in_the_same_process_does_not_warn(self):
+        # Terminal: the /clear keeps the process, so its subagents are alive and report later.
+        self.transcript(SID_A)
+        self.agent("a888", age_s=30)
+        self.arm(self.snapshot())
+        self.assertNotIn("stopped mid-work", self.session_start())
+
+    def test_a_held_clear_takes_its_resume_request_out_of_the_relay_queue(self):
+        # Step 8 queues the resume before clear_session; a denied clear never happens, so the relay must not
+        # deliver it (60 s later without an app log, into a session that was never cleared).
+        self.run_py("bin/save-clear-relay", ["setup", RELAY_ID])
+        self.run_py("bin/save-clear-relay", ["request"], CLAUDE_CODE_HOST_SESSION_ID=APP)
+        inbox = os.path.join(self.state, "relay-inbox")
+        self.assertEqual(len([n for n in os.listdir(inbox) if n.endswith(".json")]), 1)
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("ah1")
+        self.assertEqual(self.guard(tp, CLAUDE_CODE_HOST_SESSION_ID=APP)["permissionDecision"], "deny")
+        self.assertEqual([n for n in os.listdir(inbox) if n.endswith(".json")], [])
+        self.assertEqual(len([n for n in os.listdir(os.path.join(inbox, "out")) if n.endswith(".held")]), 1)
+        # Claude calls clear_session again without a new `request`: the held one goes back to the queue.
+        self.agent("ah1", finished=True, age_s=300)
+        self.assertIsNone(self.guard(tp, CLAUDE_CODE_HOST_SESSION_ID=APP))
+        queued = [n for n in os.listdir(inbox) if n.endswith(".json")]
+        self.assertEqual(len(queued), 1)
+        with open(os.path.join(inbox, queued[0])) as f:
+            self.assertGreater(json.load(f)["created"], time.time() - 30, "as if made at the real clear")
+
+    def test_arm_clear_outside_the_desktop_app_does_not_hold(self):
+        # IDE / SDK sessions are mode=app too, but have no clear_session (no local_ host id).
+        self.transcript(SID_A)
+        self.agent("ai1")
+        r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_ENTRYPOINT="claude-vscode",
+                        CLAUDE_CODE_SESSION_ID=SID_A)
+        self.assertIn("mode=app", r.stdout)
+        self.assertNotIn("subagents running", r.stdout)
+        self.assertFalse(self.held())
+
+    def test_stop_hook_does_not_clear_when_the_user_wrote_after_the_hold(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("au1")
+        self.guard(tp)
+        self.assertTrue(self.held())
+        self.agent("au1", finished=True)
+        self.add(tp, notification("au1", 'Agent "job au1" completed'),
+                 {"type": "user", "timestamp": iso(2), "message": {"role": "user", "content": "now look at Y"}})
+        out = json.loads(self.stop(tp))
+        self.assertNotIn("decision", out, "no forced clear over the user's new conversation")
+        self.assertIn("you wrote since", out["systemMessage"])
+        self.assertFalse(self.held())
+
+    def test_a_hung_subagent_does_not_hold_forever(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        two_h = str(int(time.time() * 1000) - 2 * 3600 * 1000)
+        self.agent("ah2", age_s=40 * 60)  # no write for 40 min, in this process
+        self.assertIsNone(self.guard(tp, SAVE_CLEAR_PROCESS_START_MS=two_h))
+        self.agent("ah2", age_s=10 * 60)
+        self.assertEqual(self.guard(tp, SAVE_CLEAR_PROCESS_START_MS=two_h)["permissionDecision"], "deny")
+        # A hold older than APP_WAIT_MAX_AGE_MS, made in this process: the guard lets the clear through anyway.
+        with open(os.path.join(self.state, "app-wait", SID_A + ".json"), "w") as f:
+            json.dump({"session_id": SID_A, "ts": int(time.time() * 1000) - 13 * 3600 * 1000, "agents": ["ah2"]}, f)
+        self.assertIsNone(self.guard(tp, SAVE_CLEAR_PROCESS_START_MS=str(int(time.time() * 1000) - 14 * 3600 * 1000)))
+        self.assertFalse(self.held())
+
+    def test_only_reporting_subagents_do_not_stall_the_stop_hook(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("ar1")
+        self.guard(tp)
+        self.agent("ar1", finished=True)  # finished, result not read: the turn must still be asked to clear
+        out = json.loads(self.stop(tp))
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("ar1", out["reason"])
+
+    def test_an_expired_hold_restarts_its_clock(self):
+        os.makedirs(os.path.join(self.state, "app-wait"))
+        path = os.path.join(self.state, "app-wait", SID_A + ".json")
+        old = int(time.time() * 1000) - 13 * 3600 * 1000
+        with open(path, "w") as f:
+            json.dump({"session_id": SID_A, "ts": old, "agents": ["a0"]}, f)
+        self.transcript(SID_A)
+        self.agent("ae1")
+        self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_ENTRYPOINT="claude-desktop",
+                    CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_HOST_SESSION_ID=APP)
+        with open(path) as f:
+            hold = json.load(f)
+        self.assertGreater(hold["ts"], old + 3600 * 1000)
+        self.assertEqual(hold["agents"], ["ae1"])
+
+    def test_relay_does_not_resend_an_old_request_after_a_newer_one_was_delivered(self):
+        self.run_py("bin/save-clear-relay", ["setup", RELAY_ID])
+        inbox = os.path.join(self.state, "relay-inbox")
+        os.makedirs(os.path.join(inbox, "out"))
+        now = time.time()
+        old = {"to": APP, "message": "m", "due": 0, "after_clear": None, "why": "save-clear", "created": now - 100}
+        new = dict(old, created=now - 10)
+        with open(os.path.join(inbox, f"{int((now - 100) * 1000)}-save-clear-11111111.json"), "w") as f:
+            json.dump(old, f)  # handed back to the inbox after a lost ack
+        with open(os.path.join(inbox, "out", f"{int((now - 10) * 1000)}-save-clear-11111111.json"), "w") as f:
+            json.dump(new, f)  # already delivered
+        r = self.run_py("bin/save-clear-relay", ["listen"], SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+        self.assertEqual(r.stdout.count("JOB "), 0, r.stdout)
+        self.assertEqual(len([n for n in os.listdir(os.path.join(inbox, "out")) if n.endswith(".replaced")]), 1)
+
+    def test_a_subagent_stopped_with_taskstop_is_not_running(self):
+        # Seen on 23/11/2026: TaskStop leaves a meta with no "finished" and no "stoppedByUser"; the
+        # subagent's transcript ends with "[Request interrupted by user for tool use]".
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("ats", description="Consertar save-clear")
+        with open(os.path.join(self.projdir, SID_A, "subagents", "agent-ats.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}}) + "\n")
+            f.write(json.dumps({"type": "user", "timestamp": iso(), "message": {"role": "user", "content": [
+                {"type": "text", "text": "[Request interrupted by user for tool use]"}]}}) + "\n")
+        self.assertIsNone(self.guard(tp))
+        self.assertFalse(self.held())
+
+    def test_a_compaction_summary_is_not_a_message_from_the_user(self):
+        tp = self.transcript(SID_A, ClearGuard.SKILL,
+                             {"type": "user", "isCompactSummary": True, "timestamp": iso(), "message": {
+                                 "role": "user", "content": "This session is being continued from a previous "
+                                 "conversation that ran out of context."}})
+        self.assertIsNone(self.guard(tp))
+
+    def test_a_hold_left_by_an_earlier_process_is_dropped_without_asking(self):
+        # The app quit during the wait: the held subagents died with that process. The session resumed in a
+        # new process must not be told they are done and asked to clear.
+        os.makedirs(os.path.join(self.state, "app-wait"))
+        with open(os.path.join(self.state, "app-wait", SID_A + ".json"), "w") as f:
+            json.dump({"session_id": SID_A, "ts": int(time.time() * 1000) - 20 * 60 * 1000, "agents": ["a1"]}, f)
+        self.assertEqual(self.stop(self.transcript(SID_A)), "")
+        self.assertFalse(self.held())
+
+    def test_cut_off_warning_includes_a_subagent_that_wrote_just_before_the_new_process(self):
+        self.transcript(SID_A)
+        self.agent("a5s", age_s=3, description="still streaming")
+        self.arm(self.snapshot())
+        self.assertIn('a5s ("still streaming"', self.session_start(int(time.time() * 1000) - 1000))
+
+    def test_kill_background_tasks_line_waits_for_the_real_clear(self):
+        with open(self.env["SAVE_CLEAR_CONFIG"], "w") as f:
+            json.dump({"kill_background_tasks": "on"}, f)
+        tp = self.transcript(SID_A, ClearGuard.SKILL)
+        self.agent("ak1")
+        r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_ENTRYPOINT="claude-desktop",
+                        CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_HOST_SESSION_ID=APP)
+        self.assertIn("subagents running", r.stdout)
+        self.assertNotIn("kill_background_tasks: on", r.stdout, "a held subagent may need those tasks")
+        self.agent("ak1", finished=True)
+        self.add(tp, notification("ak1", 'Agent "job ak1" completed'))
+        self.assertIn("kill_background_tasks: on", json.loads(self.stop(tp))["reason"])
+
+    def test_relay_keeps_the_remote_control_step_of_a_replaced_request(self):
+        self.run_py("bin/save-clear-relay", ["setup", RELAY_ID])
+        inbox = os.path.join(self.state, "relay-inbox")
+        os.makedirs(inbox, exist_ok=True)
+        now = time.time()
+        old = {"to": APP, "message": "m", "due": 0, "after_clear": APP, "why": "save-clear", "created": now - 60,
+               "rc_on": True}
+        new = dict(old, created=now - 5)
+        new.pop("rc_on")
+        with open(os.path.join(inbox, f"{int((now - 60) * 1000)}-save-clear-11111111.json"), "w") as f:
+            json.dump(old, f)
+        with open(os.path.join(inbox, f"{int((now - 5) * 1000)}-save-clear-11111111.json"), "w") as f:
+            json.dump(new, f)
+        with open(self.env["SAVE_CLEAR_APP_LOG"], "w") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + f" [info] Clearing session {APP}\n")
+        r = self.run_py("bin/save-clear-relay", ["listen"], SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+        self.assertEqual(r.stdout.count("JOB "), 1, r.stdout)
+        self.assertIn(f"RCON {APP}", r.stdout)
+
+    def test_relay_delivers_only_the_newest_resume_request(self):
+        relay = lambda *a, **e: self.run_py("bin/save-clear-relay", a, **e)  # noqa: E731
+        relay("setup", RELAY_ID)
+        relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)  # before the hold
+        time.sleep(0.05)
+        relay("request", CLAUDE_CODE_HOST_SESSION_ID=APP)  # after the wait, right before the real clear
+        inbox = os.path.join(self.state, "relay-inbox")
+        self.assertEqual(len([n for n in os.listdir(inbox) if n.endswith(".json")]), 2)
+        with open(self.env["SAVE_CLEAR_APP_LOG"], "w") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + f" [info] Clearing session {APP}\n")
+        r = relay("listen", SAVE_CLEAR_RELAY_POLL="0.2", SAVE_CLEAR_RELAY_MAXWAIT="1")
+        self.assertEqual(r.stdout.count("JOB "), 1, r.stdout)
+        self.assertEqual([n for n in os.listdir(inbox) if n.endswith(".json")], [])
+        self.assertEqual(len([n for n in os.listdir(os.path.join(inbox, "out")) if n.endswith(".replaced")]), 1)
 
 
 EXAMPLE = os.path.join(ROOT, "config.example.json")

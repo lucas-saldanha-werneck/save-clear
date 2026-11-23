@@ -212,7 +212,7 @@ How the `/clear` happens:
 | iTerm2 tab (macOS), no tmux | Claude tells you to type `/clear`. Through AppleScript the helper cannot see whether the prompt is empty or the session idle, so it does not type there. |
 | `claude --bg` session | The helper waits up to 60 seconds for the job to leave the working state; if it does not, it types nothing and re-arms. It also types nothing if a message arrived after the save. Otherwise it attaches in a hidden tmux session, waits for an idle, empty prompt, types `/clear`, checks the prompt again before Enter, and detaches. It types the resume request only if the job's state file then shows a new conversation id; otherwise the summary comes with your next message. Needs tmux. |
 | Any other terminal | Claude tells you to type `/clear`. |
-| Claude desktop app | Claude calls the app's `clear_session` tool with `session_id: "self"`. The summary arrives with your next message, or right away if you set up the relay. |
+| Claude desktop app | Claude calls the app's `clear_session` tool with `session_id: "self"`. The summary arrives with your next message, or right away if you set up the relay. While a background subagent of the session is still at work, the clear waits for it (see [Subagents still running](#subagents-still-running)). |
 
 If you send a message after the save, the Stop hook does not clear. It asks Claude to answer it, add
 it to the summary under `## After the save`, and run `save-clear rearm <session id>`. This repeats up
@@ -254,9 +254,50 @@ can stop its own tasks, so this works through instructions to Claude, not from a
 
 ### Subagents still running
 
-A background subagent (Agent tool) is work in progress, not a leftover, and it survives `/clear`: it
-keeps running and its result arrives in the new conversation as a notification (watched on Claude Code
-2.1.322). While one runs, `claude agents` reports the session as `busy` even after the turn ended with
+A background subagent (Agent tool) is work in progress, not a leftover. What a clear does to it depends
+on where the session runs.
+
+**Desktop app: the clear waits for it.** `clear_session` does not clear in place: when the turn ends,
+the app ends the session's process and starts a new one (the new session's SessionStart says `startup`,
+not `clear`), and every subagent still running dies with the old process. Seen on Claude Code 2.1.330
+on 22/11/2026: four subagents stopped mid-work at the automatic clear (one of their shell commands was
+killed with exit code 137, the new process started 7 seconds after their last write), no result ever
+arrived, and `SendMessage` to them failed in the new session. Up to 0.16.1 save-clear cleared anyway,
+because it took the terminal behavior below for granted. Since 0.17.0:
+
+- A background subagent counts as still at work when its `agent-<id>.meta.json` (Claude Code writes it
+  under `<project>/<session id>/subagents/`) has neither `finished` nor `stoppedByUser`, no task
+  notification for it is in the transcript, and it wrote something after this session's process started
+  (`CLAUDE_PID`, `ps` elapsed time; without `ps`, as on Windows: active in the last 2 hours). One with no
+  write for 30 minutes (hung), or whose transcript ends with "[Request interrupted by user" (stopped with
+  TaskStop, which writes neither key), does not count. One that finished in the last 2 minutes and whose
+  notification Claude has not read yet holds the clear once, so Claude reads it first.
+- Only desktop app sessions wait (a `local_` host id and the `clear_session` tool); IDE and SDK sessions
+  keep the old "type /clear" step.
+- `save-clear arm-clear` checks first. With a subagent at work it prints `subagents running: ...`, and
+  Claude ends the turn without the relay steps or `clear_session`.
+- The clear-guard hook refuses `clear_session` on the same check, as often as needed (also when a
+  subagent started after `arm-clear`), and records a hold in `app-wait/<session id>.json`. It also takes
+  the session's resume request out of the relay queue (the clear did not happen), and puts it back when
+  the clear goes through.
+- Each result arrives as a notification and Claude adds it under `## After the save`. At the end of the
+  first turn with none left, the Stop hook blocks once and asks Claude to finish the clear: relay
+  `ensure` and `request` again, then `clear_session`. The relay delivers only the newest resume request
+  of a session, so the request made before the wait is not sent twice. If you wrote after the hold, the
+  Stop hook does not clear: it shows a note, and you say "save-clear" when you want it. A hold older than
+  12 hours lets the clear through; a hold left by an earlier process (the app quit during the wait) is
+  dropped.
+- Safety net: when a clear cuts subagents off anyway (one made outside this check), the next session's
+  resume lists each one that never finished and was last active before the new process started (in the
+  last 30 minutes, or named in the snapshot), with its transcript, and asks Claude to see how far it got
+  and start it again if the work is still needed, never repeating something that cannot be undone
+  without checking first.
+
+**Terminal: it survives the clear.** A `/clear` in a terminal (tmux, `--bg`, or typed by you) runs in
+the same process: the subagent keeps running and its result arrives in the new conversation as a
+notification (watched on 2.1.322, and again on 2.1.330 on 23/11/2026: a subagent busy for 50 seconds
+across a typed `/clear` wrote its file and reported to the new conversation). save-clear does not wait
+for it. While one runs, `claude agents` reports the session as `busy` even after the turn ended with
 an empty prompt. Before 0.11.0 the helper took that for a leftover task, and with
 `kill_background_tasks` on the Stop hook asked Claude to stop "every background task", so subagents
 were stopped mid-work and their results lost. Now:
@@ -283,7 +324,8 @@ were stopped mid-work and their results lost. Now:
   Claude is asked to record it under `## After the save` first. All three were seen live on 2.1.322.
 - The slash-command menu under the input box marks its item with the same sign as the prompt; the
   helper now reads the input box itself, so a typed `/clear` with the menu open is still recognized.
-- The skill asks Claude to hand long work to background subagents, so save-clear never has to wait.
+- The skill asks Claude to hand long work to background subagents: in a terminal they survive the
+  clear, and in the desktop app the clear waits for them, so their work is never cut off.
 
 Two backups run without the skill. Before any compaction, the full transcript is saved gzipped with
 an `EMERGENCY-COMPACT-<timestamp>-<id>.md` marker; the backup is readable by you only, and the 10 newest
@@ -446,9 +488,9 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
 
 ## Limits
 
-- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 193 tests,
+- Tested: the hooks and commands, with simulated input (`python3 tests/test_hooks.py`, 226 tests,
   also under Python 3.8), and the tmux path against a fake Claude in a separate tmux server
-  (`bash tests/run.sh`, 32 checks). The `claude --bg` helper is tested against a fake tmux and a
+  (`bash tests/run.sh`, 43 checks). The `claude --bg` helper is tested against a fake tmux and a
   fake job state file. CI runs both on Ubuntu and macOS. On Windows, CI runs the unit tests
   only, and skips the ones for the automatic `/clear`, which needs tmux. Install and uninstall were run with the
   `claude plugin` CLI.
@@ -456,6 +498,14 @@ idle trigger, run `./install.sh --uninstall` first (on Linux, remove the cron li
   and fake app session files. Not tested live: that a session imported this way honors the
   `--model` and `--permission-mode` given to `claude -p` (the `DO` lines correct it if the app shows
   otherwise), and the deep link on Linux and Windows.
+- The subagent hold (0.17.0) was run live on Claude Code 2.1.330 in throwaway terminal sessions (own
+  tmux server, no user settings), with a fake `ccd_session_mgmt` MCP server whose `clear_session` ends
+  the session's process group 20 seconds later, as the app did. With 0.16.1 the clear went through
+  while a 50-second background subagent ran, and the subagent never finished. With 0.17.0 the
+  clear-guard held it, the subagent wrote its file, and the clear came after (once through the Stop
+  hook's request, once with Claude calling `clear_session` again on its own). In the same setup a
+  `/clear` typed in a terminal left a running subagent alive. Not run: a real desktop app clear with
+  0.17.0, and whether a `/clear` typed in the app also replaces the process.
 - Not tested live: the desktop app relay round trip (request, clear, `send_message`, ack, resume),
   the waker, and `claude --bg` sessions. The unit tests cover their decision logic only. The
   `claude --bg` clear confirmation reads `resumeSessionId` from `~/.claude/jobs/<id>/state.json`;

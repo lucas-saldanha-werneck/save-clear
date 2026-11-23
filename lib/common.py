@@ -4,6 +4,7 @@ Files (all under the state folder: $SAVE_CLEAR_STATE_DIR, else $CLAUDE_PLUGIN_DA
   pending_resume.json  who armed a resume, and which snapshot to deliver (one entry or a list)
   pending_resume.lock  held while pending_resume.json is read, changed and written back
   clear/<key>.json     one auto-/clear request per session (key = session id, or job-<id> for --bg)
+  app-wait/<session>.json  desktop app: this session's clear is held until its background subagents finish
   cap/<session>.json   context size when the token-limit hook last asked for a save-clear
   idle/<session>.done  last idle stretch the idle trigger (bin/save-clear-idle) already handled
   config.json          plugin options, copied here by the SessionStart hook so bin/ commands see them
@@ -16,6 +17,7 @@ time, with every option null (= the built-in default); an existing file is never
 """
 import calendar
 import contextlib
+import glob
 import json
 import os
 import re
@@ -328,8 +330,9 @@ def kill_background_tasks():
 
 # Snapshot section where Claude lists the background tasks it stopped before the automatic /clear.
 STOPPED_SECTION = "## Stopped background tasks"
-# Snapshot section where Claude lists the subagents still running at the save: they survive /clear and
-# their results reach the new conversation, which reads this section to know what each one is for.
+# Snapshot section where Claude lists the subagents still running at the save. In a terminal they survive
+# the /clear and their results reach the new conversation, which reads this section to know what each one
+# is for; in the desktop app the clear waits for them and their results are added under "After the save".
 RUNNING_SECTION = "## Running subagents"
 # Snapshot section with the user's messages sent DURING the save and the answers given: the /clear wipes
 # those answers from the screen, so the new session shows them first.
@@ -342,7 +345,8 @@ def stop_tasks_instruction(when, snapshot=""):
     return (f"kill_background_tasks: on. {when} stop every background task THIS session started that is still "
             "running (Bash commands run with run_in_background, Monitor watches): use the TaskStop tool "
             "(KillShell in older versions) with each task id. Never stop a subagent (an Agent tool task): it is "
-            "work in progress, it survives the /clear and reports to the new conversation. Never stop anything this "
+            "work in progress (in a terminal it survives the /clear; in the desktop app the clear waits for it). "
+            "Never stop anything this "
             "session did not start (other sessions, the user's own programs, servers it did not launch). "
             "Then add to the snapshot "
             + (f"{snapshot} " if snapshot else "") + "a "
@@ -613,6 +617,349 @@ def subagent_reports_since(transcript, since_ms):
             st = STATUS_RE.search(block)
             out.append((tid.group(1), st.group(1) if st else "", " ".join(summ.group(1).split())[:200]))
     return out
+
+
+# Background subagents and the desktop app's clear.
+# A terminal /clear runs in the same process: background subagents keep running and report to the new
+# conversation (seen on 2.1.322 and 2.1.330). The desktop app's clear_session does not: when the turn ends,
+# the app ends the session's process and starts a new one (SessionStart source "startup"), and every subagent
+# still running dies with the old process (seen on 2.1.330: four subagents stopped mid-work, results lost).
+# So in the app the clear waits for them (hooks/clear_guard.py, hooks/stop.py).
+APP_WAIT_DIR = os.path.join(STATE, "app-wait")  # app-wait/<session id>.json: a clear held for subagents
+APP_WAIT_MAX_AGE_MS = 12 * 3600 * 1000            # an older hold is forgotten
+REPORTING_MS = 120 * 1000  # finished this recently, result not in the conversation yet: still on its way
+# A "running" subagent whose meta and transcript have not changed for this long is hung (or died without a
+# trace): it is not waited for, so a stuck subagent never blocks the clear for the life of the process.
+STALE_MS = int(os.environ.get("SAVE_CLEAR_SUBAGENT_STALE_MS") or 30 * 60 * 1000)
+UNKNOWN_START_WINDOW_MS = 2 * 3600 * 1000  # process start unknown: active this recently = still running
+# ps reports whole seconds, so the computed start is up to 1 s LATER than the real one: an agent of THIS
+# process can look up to 1 s older than the start (pending side), never the other way (cut-off side).
+START_MARGIN_MS = 2000
+
+
+def _etime_seconds(text):
+    """`ps -o etime=` ([[dd-]hh:]mm:ss) in seconds, or None."""
+    m = re.match(r"^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$", text or "")
+    if not m:
+        return None
+    d, h, mi, s = (int(x) if x else 0 for x in m.groups())
+    return ((d * 24 + h) * 60 + mi) * 60 + s
+
+
+def claude_pid():
+    """This session's Claude Code process: CLAUDE_PID (Claude Code sets it for hooks and Bash), else the
+    nearest ancestor whose command is claude. None when unknown (no ps, Windows)."""
+    pid = (os.environ.get("CLAUDE_PID") or "").strip()
+    if pid.isdigit():
+        return int(pid)
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=5,
+                             env=dict(os.environ, LC_ALL="C")).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    procs = {}
+    for ln in out.splitlines():
+        parts = ln.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2].strip())
+    p, seen = os.getppid(), set()
+    while p in procs and p not in seen and p > 1:
+        seen.add(p)
+        ppid, comm = procs[p]
+        if os.path.basename(comm).lower() == "claude":
+            return p
+        p = ppid
+    return None
+
+
+def process_start_ms():
+    """When this session's Claude Code process started (ms since the epoch), or None if unknown.
+    SAVE_CLEAR_PROCESS_START_MS overrides it (tests; a non-number = unknown)."""
+    forced = os.environ.get("SAVE_CLEAR_PROCESS_START_MS")
+    if forced is not None:
+        return int(forced) if forced.strip().isdigit() else None
+    pid = claude_pid()
+    if not pid:
+        return None
+    try:
+        out = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True, timeout=5,
+                             env=dict(os.environ, LC_ALL="C")).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    secs = _etime_seconds(out)
+    return None if secs is None else now_ms() - secs * 1000
+
+
+def transcript_of(session_id):
+    """A session's main transcript (<config dir>/projects/<project>/<session id>.jsonl), or ""."""
+    if not session_id:
+        return ""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+    hits = glob.glob(os.path.join(base, "projects", "*", glob.escape(session_id) + ".jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else ""
+
+
+def subagent_dir(transcript, session_id=""):
+    """Where Claude Code keeps a session's subagents: <project>/<session id>/subagents, next to the
+    session's transcript <project>/<session id>.jsonl."""
+    if not transcript:
+        return ""
+    folder, name = os.path.split(transcript)
+    sid = session_id or (name[:-len(".jsonl")] if name.endswith(".jsonl") else "")
+    return os.path.join(folder, sid, "subagents") if sid else ""
+
+
+def _notifications(transcript):
+    """(ended, delivered): task ids with a <task-notification> anywhere in the transcript's tail (the task
+    ended), and those whose result Claude has read: a user record (it started a turn), the queue's `remove`
+    record (taken in mid-turn; reason absorbed_mid_turn or none), or the subagent's hand-back: a user record
+    whose origin has handback true and the agent id in `from` (its final report; terminal, 2.1.330). The
+    `enqueue` record and the queued_command attachment are written as soon as the task ends, before Claude
+    reads it."""
+    ended, delivered = set(), set()
+    for line in tail_lines(transcript) if transcript else []:
+        if "<task-notification>" not in line and '"handback"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        origin = d.get("origin") if isinstance(d.get("origin"), dict) else {}
+        if d.get("type") == "user" and origin.get("handback") and origin.get("from"):
+            ended.add(str(origin["from"]))
+            delivered.add(str(origin["from"]))
+        read = d.get("type") == "user" or (d.get("type") == "queue-operation" and d.get("operation") == "remove"
+                                           and d.get("reason") in (None, "absorbed_mid_turn"))
+        for block in line.split("<task-notification>")[1:]:
+            tid = TASK_ID_RE.search(block)
+            if tid:
+                ended.add(tid.group(1))
+                if read:
+                    delivered.add(tid.group(1))
+    return ended, delivered
+
+
+def _interrupted(path):
+    """True when a subagent's transcript ends with "[Request interrupted by user...": it was stopped
+    (TaskStop, or the user) and will not go on. Claude Code then writes neither "finished" nor
+    "stoppedByUser" into its meta (seen on 23/11/2026)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return False
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue  # a partial first line of the tail
+        if not isinstance(d, dict):
+            return False
+        return d.get("type") == "user" and _text_of((d.get("message") or {}).get("content")).lstrip() \
+            .startswith("[Request interrupted by user")
+    return False
+
+
+def subagents(transcript, session_id=""):
+    """A session's background subagents, read from Claude Code's agent-<id>.meta.json files:
+    [{id, description, state, active_ms, delivered}], oldest activity first. state: "finished" (the meta
+    says so, or its task notification is in the transcript), "stopped" (stopped by the user) or "running"
+    (none of these: running, or killed with its process). active_ms: last write to its meta or transcript."""
+    folder = subagent_dir(transcript, session_id)
+    try:
+        names = os.listdir(folder) if folder else []
+    except OSError:
+        return []
+    ended, delivered = _notifications(transcript)
+    out = []
+    for n in names:
+        if not (n.startswith("agent-") and n.endswith(".meta.json")):
+            continue
+        meta = read_json(os.path.join(folder, n))
+        if not isinstance(meta, dict) or meta.get("requestShape") != "background":
+            continue  # a foreground subagent ends inside its turn
+        aid = n[len("agent-"):-len(".meta.json")]
+        times = []
+        for p in (os.path.join(folder, n), os.path.join(folder, f"agent-{aid}.jsonl")):
+            try:
+                times.append(os.path.getmtime(p))
+            except OSError:
+                pass
+        if meta.get("finished") or aid in ended:
+            state = "finished"
+        elif meta.get("stoppedByUser") or _interrupted(os.path.join(folder, f"agent-{aid}.jsonl")):
+            state = "stopped"
+        else:
+            state = "running"
+        out.append({"id": aid, "description": str(meta.get("description") or "")[:80], "state": state,
+                    "active_ms": int(max(times) * 1000) if times else 0, "delivered": aid in delivered})
+    return sorted(out, key=lambda a: a["active_ms"])
+
+
+def pending_subagents(transcript, session_id="", start_ms=-1):
+    """Subagents a desktop-app clear would cut off: [subagent + why]. why "running": still running in
+    THIS process; "reporting": finished in the last REPORTING_MS, its result not in the conversation yet.
+    One last active before this process started ran in a process that is gone (an app restart, a resumed
+    session): it is not waited for."""
+    start = process_start_ms() if start_ms == -1 else start_ms
+    now = now_ms()
+    out = []
+    for a in subagents(transcript, session_id):
+        if a["state"] == "running":
+            if now - a["active_ms"] >= STALE_MS:
+                continue  # no write for STALE_MS: hung, not waited for
+            if (a["active_ms"] >= start - START_MARGIN_MS) if start else (now - a["active_ms"] < UNKNOWN_START_WINDOW_MS):
+                out.append(dict(a, why="running"))
+        elif a["state"] == "finished" and not a["delivered"] and now - a["active_ms"] < REPORTING_MS:
+            out.append(dict(a, why="reporting"))
+    return out
+
+
+def cut_off_subagents(transcript, session_id, start_ms=-1):
+    """Subagents of an earlier conversation that never finished and were last active before THIS process
+    started: a clear ended their process (desktop app), so they will never report. Unknown start = []."""
+    start = process_start_ms() if start_ms == -1 else start_ms
+    if not start:
+        return []
+    return [a for a in subagents(transcript, session_id)
+            if a["state"] == "running" and a["active_ms"] < start]
+
+
+def describe_subagents(agents, limit=8):
+    """One line: id ("description", note), ... for messages to Claude."""
+    notes = {"reporting": "just finished, its result is not in this conversation yet"}
+    parts = []
+    for a in agents[:limit]:
+        extra = notes.get(a.get("why", ""), "")
+        desc = f'"{a["description"]}"' if a.get("description") else ""
+        inner = ", ".join(x for x in (desc, extra) if x)
+        parts.append(a["id"] + (f" ({inner})" if inner else ""))
+    more = len(agents) - limit
+    return "; ".join(parts) + (f"; and {more} more" if more > 0 else "")
+
+
+def app_wait_path(session_id):
+    return os.path.join(APP_WAIT_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", session_id or "") + ".json")
+
+
+def read_app_wait(session_id, start_ms=None):
+    """This session's hold ({session_id, ts, agents, reported}), or {}. With start_ms (this process's start),
+    a hold made before this process started is {}: it was left by a process that is gone (the app quit or
+    restarted during the wait) and its subagents died with it."""
+    hold = read_json(app_wait_path(session_id)) if session_id else None
+    if not isinstance(hold, dict):
+        return {}
+    if start_ms and int(hold.get("ts") or 0) < start_ms - START_MARGIN_MS:
+        return {}
+    return hold
+
+
+def app_wait_expired(hold):
+    return now_ms() - int(hold.get("ts") or 0) > APP_WAIT_MAX_AGE_MS
+
+
+def mark_app_wait(session_id, agents, reported=None, start_ms=None):
+    """Remember that THIS session's desktop-app clear is held for these subagents (the Stop hook asks
+    Claude to finish the clear once none is pending). Keeps the first hold's time, unless that hold expired.
+    reported: ids of "reporting" subagents Claude was already told about (the next clear goes through)."""
+    if not session_id:
+        return
+    path = app_wait_path(session_id)
+    old = read_app_wait(session_id, start_ms)
+    if old and app_wait_expired(old):
+        old = {}
+    prev = old.get("agents") if isinstance(old.get("agents"), list) else []
+    ts = old.get("ts") or now_ms()
+    seen = list(dict.fromkeys([str(x) for x in prev] + [a["id"] for a in agents]))
+    rep = old.get("reported") if isinstance(old.get("reported"), list) else []
+    rep = list(dict.fromkeys([str(x) for x in rep] + [str(x) for x in (reported or [])]))
+    try:
+        os.makedirs(APP_WAIT_DIR, exist_ok=True)
+        write_json(path, {"session_id": session_id, "ts": ts, "agents": seen[-50:], "reported": rep[-50:]})
+    except OSError as e:
+        log("app-wait", f"could not record the hold for {short(session_id)}: {e!r}")
+
+
+RELAY_INBOX = os.path.join(STATE, "relay-inbox")  # bin/save-clear-relay's queue (INBOX there)
+
+
+def hold_resume_requests(host_id):
+    """A held clear never happens now, so the resume requests this desktop app session queued for it
+    (step 8 runs `save-clear-relay request` before clear_session) must not be delivered: move them out of
+    the relay's queue (relay-inbox/out/<name>.held). The real clear, later, queues a fresh one.
+    Returns how many were moved."""
+    if not host_id:
+        return 0
+    moved = 0
+    out = os.path.join(RELAY_INBOX, "out")
+    for folder in (RELAY_INBOX, os.path.join(RELAY_INBOX, "claimed")):
+        for p in glob.glob(os.path.join(folder, "*.json")):
+            job = read_json(p)
+            if not (isinstance(job, dict) and job.get("why") == "save-clear" and job.get("to") == host_id):
+                continue
+            try:
+                os.makedirs(out, exist_ok=True)
+                os.replace(p, os.path.join(out, os.path.basename(p) + ".held"))
+                moved += 1
+            except OSError as e:
+                log("app-wait", f"could not hold the resume request {os.path.basename(p)}: {e!r}")
+    if moved:
+        log("app-wait", f"{moved} resume request(s) of {host_id[6:14]} taken out of the relay queue: the clear is held")
+    return moved
+
+
+def release_resume_requests(host_id):
+    """The clear goes through after a hold: put the newest resume request taken out by
+    hold_resume_requests back in the relay's queue, as if made now, unless a newer one is already queued
+    (Claude ran `save-clear-relay request` again). So a clear_session called without that step still gets
+    its resume. Returns True when one was put back."""
+    if not host_id:
+        return False
+    out = os.path.join(RELAY_INBOX, "out")
+    held, queued = [], False
+    for p in glob.glob(os.path.join(out, "*.json.held")):
+        job = read_json(p)
+        if isinstance(job, dict) and job.get("why") == "save-clear" and job.get("to") == host_id:
+            held.append((float(job.get("created") or 0), p, job))
+    for folder in (RELAY_INBOX, os.path.join(RELAY_INBOX, "claimed")):
+        for p in glob.glob(os.path.join(folder, "*.json")):
+            job = read_json(p)
+            if isinstance(job, dict) and job.get("why") == "save-clear" and job.get("to") == host_id:
+                queued = True
+    if not held or queued:
+        return False
+    _, p, job = max(held, key=lambda h: h[0])
+    now = time.time()
+    job.update(created=now, due=now)
+    job.pop("attempts", None)
+    job.pop("claimed", None)
+    name = f"{int(now * 1000)}-save-clear-{host_id[6:14]}.json"
+    try:
+        write_json(os.path.join(RELAY_INBOX, name), job)
+        os.replace(p, p[:-len(".held")] + ".released")
+    except OSError as e:
+        log("app-wait", f"could not put the resume request of {host_id[6:14]} back: {e!r}")
+        return False
+    log("app-wait", f"resume request of {host_id[6:14]} back in the relay queue: the held clear goes through")
+    return True
+
+
+def desktop_app_session(env=None):
+    """A Claude desktop app session (the only place with clear_session): a local_<id> host id, an entrypoint
+    other than cli, and no terminal above it. IDE and SDK sessions have no local_ host id."""
+    env = os.environ if env is None else env
+    return bool(re.fullmatch(r"local_[0-9a-f-]{36}", env.get("CLAUDE_CODE_HOST_SESSION_ID") or "")) and \
+        (env.get("CLAUDE_CODE_ENTRYPOINT") or "cli") != "cli" and not under_terminal()
+
+
+def drop_app_wait(session_id):
+    try:
+        os.unlink(app_wait_path(session_id))
+        return True
+    except OSError:
+        return False
 
 
 def user_messages_since(transcript, since_ms):
