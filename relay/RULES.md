@@ -9,7 +9,8 @@ focus, never open a deep link.
 
 1. Run in Bash **with `run_in_background: true`**: `{RELAY} listen`
    First check that none is listening already: `{RELAY} status` shows `"listening": true` → do NOT
-   start another one; just end the turn.
+   start another one; just end the turn. Exception: it also shows `"listener_outdated": true` (an older
+   save-clear's listener is still running): start yours anyway; it replaces the old one.
 2. End the turn with one line ("listening"). The harness wakes you when the command exits.
 3. When you wake up, read the background output. For each `JOB <path>` line:
    - load `mcp__ccd_session_mgmt__send_message` with ToolSearch (if not loaded yet) and call it with

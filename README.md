@@ -268,16 +268,24 @@ because it took the terminal behavior below for granted. Since 0.17.0:
 - A background subagent counts as still at work when its `agent-<id>.meta.json` (Claude Code writes it
   under `<project>/<session id>/subagents/`) has neither `finished` nor `stoppedByUser`, no task
   notification for it is in the transcript, and it wrote something after this session's process started
-  (`CLAUDE_PID`, `ps` elapsed time; without `ps`, as on Windows: active in the last 2 hours). One that
-  finished in the last 2 minutes and whose notification Claude has not read yet counts too.
+  (`CLAUDE_PID`, `ps` elapsed time; without `ps`, as on Windows: active in the last 2 hours). One with no
+  write for 30 minutes (hung), or whose transcript ends with "[Request interrupted by user" (stopped with
+  TaskStop, which writes neither key), does not count. One that finished in the last 2 minutes and whose
+  notification Claude has not read yet holds the clear once, so Claude reads it first.
+- Only desktop app sessions wait (a `local_` host id and the `clear_session` tool); IDE and SDK sessions
+  keep the old "type /clear" step.
 - `save-clear arm-clear` checks first. With a subagent at work it prints `subagents running: ...`, and
   Claude ends the turn without the relay steps or `clear_session`.
 - The clear-guard hook refuses `clear_session` on the same check, as often as needed (also when a
-  subagent started after `arm-clear`), and records a hold in `app-wait/<session id>.json`.
+  subagent started after `arm-clear`), and records a hold in `app-wait/<session id>.json`. It also takes
+  the session's resume request out of the relay queue (the clear did not happen), and puts it back when
+  the clear goes through.
 - Each result arrives as a notification and Claude adds it under `## After the save`. At the end of the
   first turn with none left, the Stop hook blocks once and asks Claude to finish the clear: relay
   `ensure` and `request` again, then `clear_session`. The relay delivers only the newest resume request
-  of a session, so the request made before the wait is not sent twice. A hold older than 12 hours is
+  of a session, so the request made before the wait is not sent twice. If you wrote after the hold, the
+  Stop hook does not clear: it shows a note, and you say "save-clear" when you want it. A hold older than
+  12 hours lets the clear through; a hold left by an earlier process (the app quit during the wait) is
   dropped.
 - Safety net: when a clear cuts subagents off anyway (one made outside this check), the next session's
   resume lists each one that never finished and was last active before the new process started (in the

@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import resume  # noqa: E402
 from common import (APP_WAIT_DIR, APP_WAIT_MAX_AGE_MS, BIN, CLEAR_DIR, MARGIN_MS, app_wait_path,  # noqa: E402
                     clear_key, clear_path, drop_app_wait, kill_background_tasks, log, notify, now_ms,
-                    pending_subagents, read_hook_input, read_json, stop_tasks_instruction, subagent_reports_since,
+                    pending_subagents, process_start_ms, read_app_wait, read_hook_input, read_json, stop_tasks_instruction, subagent_reports_since,
                     user_messages_since, write_json)
 
 MAX_DELTAS = 3
@@ -87,15 +87,25 @@ def app_wait(hook):
     path = app_wait_path(sid)
     if not sid or not os.path.exists(path):
         return False
-    hold = read_json(path)
-    if not isinstance(hold, dict) or now_ms() - int(hold.get("ts") or 0) > APP_WAIT_MAX_AGE_MS:
+    start = process_start_ms()
+    hold = read_app_wait(sid, start)  # {} when unreadable or left by an earlier process (its agents died)
+    if not hold or now_ms() - int(hold.get("ts") or 0) > APP_WAIT_MAX_AGE_MS:
         drop_app_wait(sid)
-        log("stop", f"{sid[:8]}: subagent hold expired or unreadable; dropped")
+        log("stop", f"{sid[:8]}: subagent hold expired, unreadable or left by an earlier process; dropped")
         return False
-    if pending_subagents(hook.get("transcript_path") or "", sid):
-        return False
+    tp = hook.get("transcript_path") or ""
+    if any(a.get("why") == "running" for a in pending_subagents(tp, sid, start)):
+        return False  # a result that is only on its way ("reporting") does not wait: the guard asks once
     drop_app_wait(sid)  # asked once: never again for this hold
     ids = ", ".join(str(x) for x in (hold.get("agents") or [])[:8]) or "see the snapshot"
+    if user_messages_since(tp, int(hold.get("ts") or 0)):
+        # The user wrote after the hold: the conversation moved on, and a clear now could wipe what they
+        # are doing. Do not force it; tell them how to finish it.
+        log("stop", f"{sid[:8]}: the subagents the clear waited for are done, but the user wrote since; not cleared")
+        print(json.dumps({"systemMessage": (
+            f"save-clear: the background subagents the clear was waiting for are done ({ids}). The clear was "
+            "not finished because you wrote since then. Say \"save-clear\" when you want to clear.")}))
+        return False
     snap = my_snapshot(hook) or "(the one you wrote; it is this session's entry in the save-clear status output)"
     relay = os.path.join(BIN, "save-clear-relay")
     log("stop", f"{sid[:8]}: the subagents the clear waited for are done; asked Claude to finish the clear")
@@ -107,10 +117,11 @@ def app_wait(hook):
                    "open) and marks them finished under \"## Running subagents\"; if the conversation moved on "
                    "since the save, update \"Last topic\" and \"Next steps\" too. 2) Do the desktop app part of "
                    f"step 8 of the save-clear skill again: run `python3 \"{relay}\" ensure`, then "
-                   f"`python3 \"{relay}\" request` (it replaces the request made before the wait), and follow "
+                   f"`python3 \"{relay}\" request` (the request made before the wait was taken out of the queue), and follow "
                    "what they print (DO lines, the Remote Control line). 3) As the very last action, call "
                    "clear_session with session_id \"self\". If the user asked you not to clear, skip 2) and 3) "
-                   "and say so in one line."),
+                   "and say so in one line.")
+                  + (" " + stop_tasks_instruction("Before calling clear_session,") if kill_background_tasks() else ""),
     }))
     return True
 
