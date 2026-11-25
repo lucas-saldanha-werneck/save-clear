@@ -139,6 +139,12 @@ The numbered steps below are the full procedure.
      each Enter, and types the resume request only after it confirmed the clear took.
    - **`manual`** (a terminal without tmux, including iTerm2): nothing can type for you. Reply with the
      "save" form of step 7: "You can /clear now." The summary comes back by itself after the /clear.
+   - **`t3`** (T3 Code): `arm-clear` already started a new thread in this project that begins from the
+     summary. Do what it printed (rename this thread if the T3 tool is there) and end the turn with one
+     short line telling the user to open the new thread, with its id. No relay, no `clear_session`.
+     **`t3-wait`**: subagents of this thread are still at work and report only here; end the turn with
+     the step 7 reply saying the move waits for them, add each result under `## After the save`, and run
+     `save-clear arm-clear` again when none is left.
    - **`app`** (Claude desktop app, IDE, SDK): the flag is NOT written, because nothing must type into a
      terminal that may belong to another session. If the `mcp__ccd_session_mgmt__clear_session` tool
      is missing (load it with ToolSearch if it is only listed), reply "You can /clear now." and stop.

@@ -13,6 +13,8 @@ from common import (BIN, app_host, RESUME_FLAG, RESUME_LOCK, ANSWERS_SECTION, RU
                     read_json, write_json)
 
 MAX_AGE_MS = 7 * 24 * 3600 * 1000  # older entries are dropped undelivered
+T3_PENDING = "pending"  # t3_thread while `t3 thread start` runs: the new thread id is not known yet
+T3_WAIT_MS = 60 * 1000  # a pending mark older than this is a failed start: T3 sessions stop waiting for it
 
 
 def _short(s):
@@ -67,6 +69,15 @@ def same_owner(a, b):
 def match(e, hook, env, now):
     """(ok, why): is this new session the one that armed entry e?"""
     src = hook.get("source") or "startup"
+    # T3 Code: the "clear" started a new thread for this summary; only that thread takes it (any folder:
+    # the thread id is unique, and a thread may run in a worktree of the project).
+    if e.get("t3_thread"):
+        here = env.get("T3CODE_THREAD_ID") or ""
+        if e["t3_thread"] == T3_PENDING:
+            return False, "T3 thread still being started"
+        if here == e["t3_thread"] and src in ("startup", "clear"):
+            return True, f"T3 thread {here}"
+        return False, f"for T3 thread {e['t3_thread']}, this is {here or 'not a T3 thread'}"
     ecwd = norm_dir(e.get("cwd"))
     dirs = [norm_dir(d) for d in (hook.get("cwd"), env.get("CLAUDE_PROJECT_DIR")) if d]
     if not ecwd or not any(d == ecwd or ecwd.startswith(d + "/") for d in dirs):
@@ -130,6 +141,35 @@ def arm(snapshot, session_id=None, env=None):
         msg += (f"\nwarning: no process id or app session id, so this summary is NOT delivered automatically. "
                 f"After the /clear, ask Claude to read {snap}.")
     return True, msg
+
+
+def bind_t3(session_id, thread):
+    """Point this session's newest resume entry at a T3 thread (T3_PENDING while it starts, None to undo).
+    Returns the entry, or None when this session armed no resume."""
+    with locked(RESUME_LOCK):
+        entries = read_entries() or []
+        mine = [e for e in entries if session_id and e.get("session_id") == session_id]
+        if not mine:
+            return None
+        e = max(mine, key=lambda x: int(x.get("ts") or 0))
+        if thread:
+            e["t3_thread"], e["t3_ts"] = thread, now_ms()
+        else:
+            e.pop("t3_thread", None)
+            e.pop("t3_ts", None)
+        write_entries(entries)
+    log("resume", f"{os.path.basename(e['snapshot'])} of session {_short(session_id)}: "
+                  + (f"for T3 thread {thread}" if thread else "T3 thread unbound"))
+    return e
+
+
+def t3_pending(env):
+    """True while a resume entry waits for its T3 thread id (a T3 session start should wait a moment)."""
+    if not env.get("T3CODE_THREAD_ID"):
+        return False
+    now = now_ms()
+    return any(e.get("t3_thread") == T3_PENDING and now - int(e.get("t3_ts") or 0) < T3_WAIT_MS
+               for e in (read_entries() or []))
 
 
 def _readable(path):

@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
@@ -17,6 +18,7 @@ from common import (RESUME_FLAG, RESUME_TURN_DIR, cut_off_subagents, log, now_ms
                     read_hook_input, resume_turn_marker, run_hook_command, save_config, save_pointer,
                     seed_user_config, subagent_dir, transcript_of, write_json)
 
+T3_WAIT_S = 4  # the hook has 10 s (hooks.json), on_resume_command up to 5; a miss falls back to the first message
 RECENT_CUT_MS = 30 * 60 * 1000  # a dead subagent older than this counts only if the snapshot names it
 
 
@@ -92,6 +94,11 @@ def main():
             emit(wake)
         return
     hook = read_hook_input()
+    # T3 Code: the thread that is meant to take a summary can start before `t3 thread start` returned its id
+    # to the session that armed it. Wait a few seconds for the id (only while such a start is under way).
+    deadline = time.time() + T3_WAIT_S
+    while resume.t3_pending(os.environ) and time.time() < deadline:
+        time.sleep(0.5)
     entry, _ = resume.take(hook, os.environ, now_ms())
     if not entry:
         if wake:

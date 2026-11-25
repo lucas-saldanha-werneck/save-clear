@@ -26,7 +26,8 @@ from common import (BIN, all_clears, app_session_info, clear_key, describe_subag
                     extra_steps,
                     hold_resume_requests, kill_background_tasks, language, process_start_ms, log, mark_app_wait, now_ms, pending_subagents, publish_link, read_json,
                     resume_turn_marker, run_hook_command, seed_user_config, setting, snapshot_dir,
-                    stop_tasks_instruction, tmux_bin, transcript_of, write_clear, write_json)
+                    stop_tasks_instruction, t3_cli, t3_session, t3_start_command, tmux_bin, transcript_of,
+                    write_clear, write_json, resume_msg)
 
 
 def cmd_dir():
@@ -102,10 +103,101 @@ def check(mode, target, sid):
     return r.returncode, r.stdout.strip()
 
 
+def t3_run(cmd, stdin=None, timeout=60):
+    """(returncode, stdout, stderr) of a T3 CLI call; (None, "", why) when it could not run."""
+    try:
+        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "", repr(e)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def t3_thread_info(cli, thread):
+    """This thread's {title, providerInstanceId, model, link, ...} from `t3 thread show --json`, or {}."""
+    rc, out, _ = t3_run([cli, "thread", "show", "--json", "--messages", "0", thread], timeout=30)
+    try:
+        return (json.loads(out).get("thread") or {}) if rc == 0 else {}
+    except (ValueError, AttributeError):
+        return {}
+
+
+def t3_message(snapshot):
+    return (resume_msg() + "\n\n(save-clear: this thread continues an earlier one from its saved summary. If no "
+            f"\"Previous session (auto-resume)\" context came with this message, read {snapshot} and continue "
+            "from it.)")
+
+
+def arm_clear_t3(env, sid):
+    """T3 Code: the "clear" is a new thread in the same project that starts from the saved summary.
+    Returns (mode, target, note)."""
+    cli = t3_cli(env)
+    if not cli:
+        return "manual", "", "T3 Code session, but its CLI was not found (T3CODE_CLI_PATH, or t3 on PATH)"
+    # The old thread's process lives on: its subagents report THERE, never to the new thread. Wait for them.
+    try:
+        agents = [a for a in pending_subagents(transcript_of(sid), sid, process_start_ms()) if a.get("why") == "running"] \
+            if sid else []
+    except Exception as e:  # a broken check must not block the clear
+        log("arm", f"subagent check failed for {sid[:8]} ({e!r})")
+        agents = []
+    if agents:
+        return "t3-wait", "", f"{len(agents)} subagent(s) still at work: {describe_subagents(agents)}"
+    entry = resume.bind_t3(sid, resume.T3_PENDING)
+    if not entry:
+        return "manual", "", "T3 Code session with no armed resume for this session (run arm-resume first)"
+    here = env.get("T3CODE_THREAD_ID") or ""
+    info = t3_thread_info(cli, here)
+    title = info.get("title") or ""
+    title = (title + " (continued)") if title and not title.endswith("(continued)") else (title or "Continued")
+    folder = env.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    cmd = t3_start_command(cli, folder, "", title, info.get("providerInstanceId") or "", info.get("model") or "")
+    rc, out, err = t3_run(cmd, stdin=t3_message(entry["snapshot"]))
+    new = ""
+    try:
+        new = str((json.loads(out) if rc == 0 else {}).get("threadId") or "")
+    except (ValueError, AttributeError):
+        pass
+    if not new:
+        resume.bind_t3(sid, None)
+        why = ((err or out).splitlines() or [""])[-1][:300] or f"exit {rc}"
+        log("arm", f"mode=t3 for session {sid[:8]}: t3 thread start failed ({why})")
+        return "manual", "", f"T3 Code: could not start the new thread ({why})"
+    resume.bind_t3(sid, new)
+    log("arm", f"mode=t3 for session {sid[:8]}: thread {here} continues in {new}")
+    return "t3", new, ""
+
+
 def cmd_arm_clear(args):
     env = os.environ
     sid = env.get("CLAUDE_CODE_SESSION_ID") or (args[0] if args else "")
     ep = env.get("CLAUDE_CODE_ENTRYPOINT") or "cli"
+    t3 = t3_session(env)
+    if t3 and env.get("TMUX_PANE") and tmux_bin() and sid and check("tmux", env["TMUX_PANE"], sid)[0] == 0:
+        t3 = False  # a pane proven to run this session wins, as below for an inherited app entrypoint
+    if t3:
+        # Checked first: T3 is not a terminal (no tmux to type into) and not the Claude desktop app (its
+        # relay and clear_session belong to other sessions).
+        mode, target, note = arm_clear_t3(env, sid)
+        print(f"save-clear: mode={mode} target={target or 'none'} entrypoint={ep}" + (f" ({note})" if note else ""))
+        if mode == "t3-wait":
+            log("arm", f"mode=t3 for session {sid[:8]}: {note}; no new thread yet")
+            print("subagents running: their results come back to THIS thread only (a new thread never gets "
+                  "them). Do not start a new thread now: end the turn with the step 7 reply, saying the move to a "
+                  "new thread waits for these subagents. Add each result to the snapshot under \"## After the "
+                  "save\"; when none is left, run save-clear arm-clear again.")
+            return 0
+        if mode == "manual":
+            print("No automatic clear here. Tell the user to start a new thread in this project and ask it to "
+                  "read the snapshot (its path is in the snapshot step above); say why, from the note.")
+            return 0
+        if kill_background_tasks():
+            print(stop_tasks_instruction("If you have not done it yet, now, before ending the turn,"))
+        print(f"T3 Code: the conversation continues in the new thread {target}, which starts from the summary "
+              "by itself. This thread stays as it is. If the mcp__t3-code__t3_thread_update tool exists (load it "
+              f"with ToolSearch if it is only listed), rename this thread to its title plus \" (continued in "
+              f"{target})\". Then end the turn with one short line telling the user to open the new thread "
+              "(T3 lists it in this project), and run nothing else.")
+        return 0
     pid = env.get("CLAUDE_PID") or str(os.getppid())
     tty = tty_of(pid)
     target, note = "", ""

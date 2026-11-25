@@ -283,6 +283,10 @@ def cmd_wake_claim():
     only when the relay should be woken now; prints nothing and exits 0 otherwise. Claiming is atomic and
     writes a stamp, so at most one session wakes the relay per cool-down, however many start together."""
     me = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", "")
+    if os.environ.get("T3CODE_THREAD_ID"):
+        print("this is a T3 Code session: the desktop app relay cannot reach it; nothing queued "
+              "(save-clear arm-clear moves T3 sessions to a new thread)", file=sys.stderr)
+        return 4
     rid = relay_id()
     if not rid or not is_app_session() or me == rid or os.path.exists(OFF) or not relay_auto():
         return 0
@@ -372,6 +376,10 @@ def cmd_job(args):
 
 def cmd_request():
     me = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", "")
+    if os.environ.get("T3CODE_THREAD_ID"):
+        print("this is a T3 Code session: the desktop app relay cannot reach it; nothing queued "
+              "(save-clear arm-clear moves T3 sessions to a new thread)", file=sys.stderr)
+        return 4
     rid = relay_id()
     if not rid:
         print("no relay configured: after clear_session the resume arrives with the user's next message. "
@@ -440,7 +448,8 @@ def relay_auto():
 def is_app_session():
     """A Claude desktop app session: it has a local_<id> host id and is not a terminal (cli) session."""
     return bool(ID_RE.fullmatch(os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", ""))) and \
-        (os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli") != "cli" and not under_terminal()
+        (os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "cli") != "cli" and not under_terminal() and \
+        not os.environ.get("T3CODE_THREAD_ID")  # T3 Code moves to a new thread instead (save-clear arm-clear)
 
 
 def cli_mode(mode):

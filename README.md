@@ -171,6 +171,7 @@ you to type `/clear`, and the summary still comes back by itself.
 - tmux: automatic `/clear` in a tmux pane, and for `claude --bg` sessions. tmux does not run
   natively on Windows, so on Windows you always type `/clear` yourself.
 - A notifier for `notify_command`, for example a script that sends you a push message.
+- In T3 Code: its `t3` CLI (the app sets `T3CODE_CLI_PATH`; otherwise `t3` on PATH).
 - A relay session in the Claude desktop app, so the resume arrives right after the clear instead of
   with your next message. See [Desktop app relay](#desktop-app-relay).
 - A scheduler for the idle trigger: launchd on macOS (`./install.sh --idle` sets it up), cron on
@@ -212,6 +213,7 @@ How the `/clear` happens:
 | iTerm2 tab (macOS), no tmux | Claude tells you to type `/clear`. Through AppleScript the helper cannot see whether the prompt is empty or the session idle, so it does not type there. |
 | `claude --bg` session | The helper waits up to 60 seconds for the job to leave the working state; if it does not, it types nothing and re-arms. It also types nothing if a message arrived after the save. Otherwise it attaches in a hidden tmux session, waits for an idle, empty prompt, types `/clear`, checks the prompt again before Enter, and detaches. It types the resume request only if the job's state file then shows a new conversation id; otherwise the summary comes with your next message. Needs tmux. |
 | Any other terminal | Claude tells you to type `/clear`. |
+| [T3 Code](https://github.com/pingdotgg/t3code) | A T3 thread cannot be cleared, so save-clear starts a new thread in the same project with the T3 CLI (`t3 thread start`, same provider and model, title "<old title> (continued)") and the summary goes to that thread only. The old thread stays as it is; Claude renames it "(continued in <new thread>)" when T3's `t3_thread_update` tool is there. While a background subagent of the old thread is still at work, the move waits for it (its result can only come back to the old thread). If the T3 CLI is missing or fails, Claude tells you why and you start the new thread yourself. |
 | Claude desktop app | Claude calls the app's `clear_session` tool with `session_id: "self"`. The summary arrives with your next message, or right away if you set up the relay. While a background subagent of the session is still at work, the clear waits for it (see [Subagents still running](#subagents-still-running)). |
 
 If you send a message after the save, the Stop hook does not clear. It asks Claude to answer it, add
