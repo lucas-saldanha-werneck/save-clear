@@ -2,6 +2,12 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.17.2 (2026-11-25)
+
+- T3 Code (github.com/pingdotgg/t3code) support. T3 runs Claude Code in SDK mode (`CLAUDE_CODE_ENTRYPOINT=t3-code`, `T3CODE_THREAD_ID`, no tty), so `arm-clear` used to pick the desktop app mode and point Claude at the app relay and `clear_session`, which do not exist there. Now `arm-clear` picks a `t3` mode: it starts a new thread in the same project with the T3 CLI (`t3 thread start`, same provider and model as the current thread) and binds the summary to that thread id, so only that thread's SessionStart takes it. The first message is the resume request plus the snapshot path, as a fallback. A missing or failing CLI gives `manual` with the reason, never the app mode. Subagents still running hold the move (`t3-wait`): their results can only reach the old thread.
+- T3 variables are ignored when inherited: under a terminal (a tmux pane or T3's own terminal), or in a `claude` started by another `claude` (`claude -p`, a robot). A tmux pane wins only when its check proves it runs this session, as with an inherited desktop app entrypoint.
+- The desktop app relay refuses T3 sessions (`request` exit 4, `ensure` exit 5).
+
 ## 0.17.1 (2026-11-23)
 
 Fixes from the review of 0.17.0 (desktop app subagent hold):

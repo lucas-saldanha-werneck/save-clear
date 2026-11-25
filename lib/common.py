@@ -487,6 +487,38 @@ def under_terminal():
     return False
 
 
+def claude_ancestors():
+    """How many processes from this one up are a `claude` (by the base name of their argv[0]); 0 if unknown."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,args="], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    procs = {}
+    for ln in out.splitlines():
+        parts = ln.split(None, 3)
+        if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), os.path.basename(parts[2]))
+    p, seen, found = os.getpid(), set(), 0
+    while p in procs and p not in seen and p > 1:
+        seen.add(p)
+        ppid, name = procs[p]
+        found += name == "claude"
+        p = ppid
+    return found
+
+
+def nested_claude():
+    """True when two or more `claude` processes sit above this one: the caller runs under a claude that was
+    started from another claude's tools (`claude -p`, an Agent SDK robot, a script). Such a child inherits
+    the outer session's variables (CLAUDE_CODE_ENTRYPOINT, T3CODE_THREAD_ID), which then do not describe it.
+    SAVE_CLEAR_NESTED_CLAUDE=1/0 forces the answer (tests). Unknown (no ps, Windows) = False."""
+    forced = os.environ.get("SAVE_CLEAR_NESTED_CLAUDE")
+    if forced in ("0", "1"):
+        return forced == "1"
+    return claude_ancestors() >= 2
+
+
 def app_host(env=None):
     """The desktop app session id (local_...) of this session, or None in a terminal session."""
     env = os.environ if env is None else env
@@ -1047,6 +1079,41 @@ def desktop_app_session(env=None):
     env = os.environ if env is None else env
     return bool(re.fullmatch(r"local_[0-9a-f-]{36}", env.get("CLAUDE_CODE_HOST_SESSION_ID") or "")) and \
         (env.get("CLAUDE_CODE_ENTRYPOINT") or "cli") != "cli" and not under_terminal()
+
+
+def t3_session(env=None):
+    """A session run by T3 Code (github.com/pingdotgg/t3code): it starts `claude` in SDK mode with
+    CLAUDE_CODE_ENTRYPOINT=t3-code and T3CODE_THREAD_ID set. No tty, no tmux, no clear_session tool: a
+    "clear" there is a new thread in the same project. A terminal below it (T3's built-in terminal) inherits
+    the variables, so a terminal above the process means it is not the T3 session itself."""
+    env = os.environ if env is None else env
+    if not (env.get("T3CODE_THREAD_ID") and (env.get("CLAUDE_CODE_ENTRYPOINT") or "").startswith("t3")):
+        return False
+    # Inherited variables, as with an inherited claude-desktop entrypoint: a terminal above (a tmux pane, or
+    # T3's own terminal, started from a T3 session) or a claude started by a claude (`claude -p`, a robot).
+    # TMUX_PANE alone proves nothing (T3 itself may have been opened from a tmux shell): save-clear arm-clear
+    # lets the pane win only when its check proves the pane runs this session.
+    return not under_terminal() and not nested_claude()
+
+
+def t3_cli(env=None):
+    """Path of the T3 Code CLI (T3CODE_CLI_PATH, set by the app, else `t3` on PATH), or ""."""
+    env = os.environ if env is None else env
+    p = env.get("T3CODE_CLI_PATH") or ""
+    if p and os.path.isfile(p) and os.access(p, os.X_OK):
+        return p
+    return shutil.which("t3", path=env.get("PATH")) or ""
+
+
+def t3_start_command(cli, folder, message, title="", provider="", model=""):
+    """argv for `t3 thread start`: a new thread in the project that holds `folder`, message from stdin.
+    Provider and model go together (the CLI needs both, and a project without a default model needs them)."""
+    cmd = [cli, "thread", "start", "--json"]
+    if title:
+        cmd += ["--title", title]
+    if provider and model:
+        cmd += ["--provider", provider, "--model", model]
+    return cmd + [folder, "-"]
 
 
 def drop_app_wait(session_id):

@@ -40,8 +40,8 @@ class Base(unittest.TestCase):
         self.proj = os.path.join(t, "project")
         os.makedirs(self.proj)
         self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith(("CLAUDE", "TMUX", "SAVE_CLEAR", "TERM_PROGRAM", "LC_TERMINAL"))}
-        self.env.update(SAVE_CLEAR_UNDER_TERMINAL="0", SAVE_CLEAR_STATE_DIR=self.state, SAVE_CLEAR_SNAPSHOT_DIR=self.snaps,
+                    if not k.startswith(("CLAUDE", "TMUX", "SAVE_CLEAR", "TERM_PROGRAM", "LC_TERMINAL", "T3CODE"))}
+        self.env.update(SAVE_CLEAR_UNDER_TERMINAL="0", SAVE_CLEAR_NESTED_CLAUDE="0", SAVE_CLEAR_STATE_DIR=self.state, SAVE_CLEAR_SNAPSHOT_DIR=self.snaps,
                         SAVE_CLEAR_CLAUDE="/nonexistent/claude", SAVE_CLEAR_POINTER=os.path.join(t, "pointer"),
                         SAVE_CLEAR_APP_LOG=os.path.join(t, "app-main.log"),
                         SAVE_CLEAR_CONFIG=os.path.join(t, "user-config.json"))
@@ -2720,6 +2720,22 @@ class AppClearWaitsForSubagents(Base):
         self.assertEqual(self.stop(self.transcript(SID_A)), "")
         self.assertFalse(self.held())
 
+    def test_t3_waits_for_running_subagents(self):
+        # T3 Code keeps the old thread's process: its subagents report there, never to the new thread.
+        marker = os.path.join(self.t, "t3-started")
+        cli = os.path.join(self.t, "t3cli")
+        with open(cli, "w") as f:
+            f.write(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+        os.chmod(cli, 0o755)
+        self.transcript(SID_A)
+        self.agent("a777", description="long research")
+        self.arm(self.snapshot())
+        r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_ENTRYPOINT="t3-code", T3CODE_THREAD_ID="mcp:x",
+                        T3CODE_CLI_PATH=cli, CLAUDE_CODE_SESSION_ID=SID_A)
+        self.assertIn("mode=t3-wait", r.stdout)
+        self.assertIn("a777", r.stdout)
+        self.assertFalse(os.path.exists(marker), "no new thread while a subagent works")
+
     def test_arm_clear_in_the_app_waits_for_running_subagents(self):
         self.transcript(SID_A)
         app = dict(CLAUDE_CODE_ENTRYPOINT="claude-desktop", CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_HOST_SESSION_ID=APP)
@@ -3390,6 +3406,154 @@ class RcClear(Base):
         out = self.relay("rules").stdout
         self.assertIn("RCON <id>", out)
         self.assertIn("rc-on-ack", out)
+
+
+T3_OLD = "mcp:11111111-2222-4333-8444-555555555555"
+T3_NEW = "mcp:99999999-8888-4777-8666-555555555555"
+FAKE_T3 = r'''
+import json, os, sys
+log = os.environ["FAKE_T3_LOG"]
+args = sys.argv[1:]
+if args[:2] == ["thread", "show"]:
+    print(json.dumps({"thread": {"threadId": args[-1], "title": "Fix the parser",
+                                 "providerInstanceId": "claudeAgent", "model": "claude-test-1"}}))
+    sys.exit(0)
+if args[:2] == ["thread", "start"]:
+    stdin = sys.stdin.read() if args[-1] == "-" else ""
+    with open(log, "a") as f:
+        f.write(json.dumps({"argv": args, "stdin": stdin}) + "\n")
+    if os.environ.get("FAKE_T3_FAIL"):
+        print("Pass modelSelection: the project has no default model.", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({"threadId": os.environ["FAKE_T3_NEW"], "projectId": "p1", "runId": "r1"}))
+    sys.exit(0)
+sys.exit(2)
+'''
+
+
+class T3Code(Base):
+    """T3 Code (pingdotgg/t3code) runs claude in SDK mode with no tty: a clear there is a new thread."""
+
+    def setUp(self):
+        super().setUp()
+        self.t3log = os.path.join(self.t, "t3-calls.jsonl")
+        script = os.path.join(self.t, "fake_t3.py")
+        with open(script, "w") as f:
+            f.write(FAKE_T3)
+        self.cli = os.path.join(self.t, "t3cli")
+        with open(self.cli, "w") as f:
+            f.write(f'#!/bin/sh\nexec "{PY}" "{script}" "$@"\n')
+        os.chmod(self.cli, 0o755)
+        self.t3 = dict(CLAUDE_CODE_ENTRYPOINT="t3-code", T3CODE_THREAD_ID=T3_OLD, T3CODE_CLI_PATH=self.cli,
+                       FAKE_T3_LOG=self.t3log, FAKE_T3_NEW=T3_NEW, CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_PID=4242,
+                       CLAUDE_PROJECT_DIR=self.proj)
+
+    def calls(self):
+        if not os.path.exists(self.t3log):
+            return []
+        with open(self.t3log) as f:
+            return [json.loads(ln) for ln in f if ln.strip()]
+
+    def entries(self):
+        return json.loads(self.run_py("bin/save-clear", ["status"]).stdout)["resume"]
+
+    def test_detection(self):
+        from unittest import mock
+        sys.path.insert(0, os.path.join(ROOT, "lib"))
+        import common
+        t3 = {"CLAUDE_CODE_ENTRYPOINT": "t3-code", "T3CODE_THREAD_ID": T3_OLD}
+        with mock.patch.dict(os.environ, {"SAVE_CLEAR_UNDER_TERMINAL": "0", "SAVE_CLEAR_NESTED_CLAUDE": "0"}):
+            self.assertTrue(common.t3_session(t3))
+            self.assertTrue(common.t3_session(dict(t3, TMUX_PANE="%3")), "a pane wins only once arm-clear proves it")
+            self.assertFalse(common.t3_session({"CLAUDE_CODE_ENTRYPOINT": "t3-code"}), "no thread id")
+            self.assertFalse(common.t3_session({"T3CODE_THREAD_ID": T3_OLD}), "cli entrypoint")
+            self.assertFalse(common.t3_session({"CLAUDE_CODE_ENTRYPOINT": "claude-desktop",
+                                                "T3CODE_THREAD_ID": T3_OLD}), "the Claude desktop app")
+        with mock.patch.dict(os.environ, {"SAVE_CLEAR_UNDER_TERMINAL": "1", "SAVE_CLEAR_NESTED_CLAUDE": "0"}):
+            self.assertFalse(common.t3_session(t3), "a terminal claude that inherited T3's variables")
+        with mock.patch.dict(os.environ, {"SAVE_CLEAR_UNDER_TERMINAL": "0", "SAVE_CLEAR_NESTED_CLAUDE": "1"}):
+            self.assertFalse(common.t3_session(t3), "a claude -p started by the T3 session's tools")
+        self.assertEqual(common.t3_cli({"T3CODE_CLI_PATH": self.cli, "PATH": ""}), self.cli)
+        self.assertEqual(common.t3_cli({"T3CODE_CLI_PATH": "/nonexistent/t3", "PATH": self.fakebin}), "")
+
+    def test_start_command(self):
+        sys.path.insert(0, os.path.join(ROOT, "lib"))
+        import common
+        self.assertEqual(common.t3_start_command("t3", "/p", "", "T (continued)", "claudeAgent", "m1"),
+                         ["t3", "thread", "start", "--json", "--title", "T (continued)",
+                          "--provider", "claudeAgent", "--model", "m1", "/p", "-"])
+        self.assertEqual(common.t3_start_command("t3", "/p", "", "", "claudeAgent", ""),
+                         ["t3", "thread", "start", "--json", "/p", "-"], "provider without model is left out")
+
+    @unittest.skipIf(sys.platform == "win32", "the fake t3 CLI is a shell script")
+    def test_clear_starts_a_new_thread_that_takes_the_summary(self):
+        snap = self.snapshot()
+        self.assertEqual(self.arm(snap, **self.t3).returncode, 0)
+        r = self.run_py("bin/save-clear", ["arm-clear"], TMUX_PANE="%0", **self.t3)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"mode=t3 target={T3_NEW}", r.stdout)
+        self.assertNotIn("clear_session", r.stdout)
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "nothing typed into a pane")
+        [call] = self.calls()
+        self.assertEqual(call["argv"], ["thread", "start", "--json", "--title", "Fix the parser (continued)",
+                                        "--provider", "claudeAgent", "--model", "claude-test-1", self.proj, "-"])
+        self.assertTrue(call["stdin"].startswith(RESUME_MSG[:20]), "counts as the resume request, not the user")
+        self.assertIn(snap, call["stdin"], "fallback: the new thread can read the snapshot itself")
+        [e] = self.entries()
+        self.assertEqual(e["t3_thread"], T3_NEW)
+        # Another T3 thread in the same folder, or the old thread's process, does not take it.
+        t3_other = dict(CLAUDE_CODE_ENTRYPOINT="t3-code", T3CODE_THREAD_ID="mcp:other", CLAUDE_PID=7)
+        self.assertEqual(self.start(source="startup", sid=SID_B, **t3_other).stdout.strip(), "")
+        self.assertEqual(self.start(source="clear", CLAUDE_PID=4242, T3CODE_THREAD_ID=T3_OLD).stdout.strip(), "")
+        new = dict(CLAUDE_CODE_ENTRYPOINT="t3-code", T3CODE_THREAD_ID=T3_NEW, CLAUDE_PID=8)
+        out = self.start(source="startup", cwd=self.t, **new).stdout
+        self.assertIn("we were testing", out)
+        self.assertEqual(self.entries(), [], "delivered once")
+
+    @unittest.skipIf(sys.platform == "win32", "the fake t3 CLI is a shell script")
+    def test_failed_start_falls_back_to_manual_never_app(self):
+        self.arm(self.snapshot(), **self.t3)
+        r = self.run_py("bin/save-clear", ["arm-clear"], FAKE_T3_FAIL="1", CLAUDE_CODE_HOST_SESSION_ID=APP, **self.t3)
+        self.assertIn("mode=manual", r.stdout)
+        self.assertIn("no default model", r.stdout, "the CLI's reason is shown")
+        self.assertNotIn("mode=app", r.stdout)
+        self.assertNotIn("t3_thread", self.entries()[0], "the entry is unbound again")
+
+    def test_missing_cli_or_resume_is_manual(self):
+        r = self.run_py("bin/save-clear", ["arm-clear"], **dict(self.t3, T3CODE_CLI_PATH="/nonexistent/t3",
+                                                                 PATH=self.fakebin))
+        self.assertIn("mode=manual", r.stdout)
+        self.assertIn("CLI was not found", r.stdout)
+        r = self.run_py("bin/save-clear", ["arm-clear"], **self.t3)
+        self.assertIn("mode=manual", r.stdout)
+        self.assertIn("no armed resume", r.stdout)
+        self.assertEqual(self.calls(), [], "no thread started without a summary to hand over")
+
+    @unittest.skipIf(sys.platform == "win32" or not os.path.exists("/bin/bash"), "needs ps and bash")
+    def test_nested_claude_from_the_process_tree(self):
+        # bash started with argv[0] "claude" stands in for claude (python cannot: a macOS framework build
+        # re-execs itself and loses argv[0]); "; true" keeps bash from exec-ing its child.
+        # Counted relative to the start: the test itself may run under a real claude.
+        import shlex
+        probe = shlex.join([PY, "-c", f"import sys; sys.path.insert(0, {os.path.join(ROOT, 'lib')!r}); "
+                                      "import common; print(common.claude_ancestors())"])
+        as_claude = lambda cmd: f"(exec -a claude /bin/bash -c {shlex.quote(cmd + '; true')}); true"  # noqa: E731
+        run = lambda cmd: subprocess.run(["/bin/bash", "-c", cmd], capture_output=True, text=True,  # noqa: E731
+                                         timeout=60).stdout.strip()
+        base = int(run(probe))
+        self.assertEqual((run(as_claude(probe)), run(as_claude(as_claude(probe)))), (str(base + 1), str(base + 2)))
+
+    def test_inherited_t3_variables_do_not_start_a_thread(self):
+        self.arm(self.snapshot(), **self.t3)
+        for extra in ({"SAVE_CLEAR_NESTED_CLAUDE": "1"}, {"SAVE_CLEAR_UNDER_TERMINAL": "1", "TMUX_PANE": "%0"}):
+            r = self.run_py("bin/save-clear", ["arm-clear"], **dict(self.t3, **extra))
+            self.assertNotIn("mode=t3", r.stdout, extra)
+        self.assertEqual(self.calls(), [], "no thread started from a child or a pane")
+
+    def test_relay_refuses_t3_sessions(self):
+        r = self.run_py("bin/save-clear-relay", ["request"], CLAUDE_CODE_HOST_SESSION_ID=APP, **self.t3)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("T3 Code", r.stderr)
 
 
 class AppHost(unittest.TestCase):
