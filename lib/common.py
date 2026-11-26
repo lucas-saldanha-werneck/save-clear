@@ -130,6 +130,7 @@ OPTIONS = {
     "relay_model": "SAVE_CLEAR_RELAY_MODEL",
     "relay_title": "SAVE_CLEAR_RELAY_TITLE",
     "rc_idle_off_hours": "SAVE_CLEAR_RC_IDLE_OFF_HOURS",
+    "confirm_seconds": "SAVE_CLEAR_CONFIRM_SECONDS",
 }
 
 # Your own settings, outside the plugin folder: they survive plugin updates and reinstalls.
@@ -326,6 +327,26 @@ def kill_background_tasks():
     """The `kill_background_tasks` option: on = before the automatic /clear, Claude stops the background
     tasks this session left running. Anything but on/true/yes/1 (empty, null, a typo) = off."""
     return setting("kill_background_tasks").lower() in ON_VALUES
+
+
+CONFIRM_MAX_S = 300
+CONFIRM_DEFAULT_S = 6.0  # used when the option is empty or missing; 0 turns the question off
+# The header of the "clear now?" question. The helper that answers it after the wait finds the dialog on
+# the screen by this word, so it is the same in every language.
+CONFIRM_HEADER = "save-clear"
+
+
+def confirm_seconds():
+    """The `confirm_seconds` option: seconds the "clear now?" question waits for an answer before the
+    automatic /clear goes ahead by itself. On by default: empty, missing or not a number = CONFIRM_DEFAULT_S.
+    0 (or negative) = off (no question)."""
+    try:
+        v = float(setting("confirm_seconds").replace(",", "."))
+    except ValueError:
+        return CONFIRM_DEFAULT_S
+    if v != v:  # NaN
+        return CONFIRM_DEFAULT_S
+    return min(v, CONFIRM_MAX_S) if v > 0 else 0.0
 
 
 # Snapshot section where Claude lists the background tasks it stopped before the automatic /clear.

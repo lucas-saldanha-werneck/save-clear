@@ -137,6 +137,14 @@ The numbered steps below are the full procedure.
      nothing else after it. The Stop hook starts a helper that types `/clear` and then the resume
      request. It types only into an idle session with an empty prompt, checks again right before
      each Enter, and types the resume request only after it confirmed the clear took.
+     **If it printed a line starting with `confirm:`**, the user wants to be asked first (they may
+     still be reading): do exactly what that line says before ending the turn. Ask the question with
+     AskUserQuestion at once, with no text before it and the header it gives; a helper answers "go
+     ahead" by itself after the wait. On "go ahead", end the turn with the step 7 reply. On any other
+     answer run the `disarm` command it gives and reply that the summary is saved and the clear waits
+     for the user's word. When the user later asks to clear after such a wait, run
+     `save-clear arm-clear --now` (no question) instead of saving everything again; first add what
+     came after the save to the snapshot under `## After the save`, if anything did.
    - **`manual`** (a terminal without tmux, including iTerm2): nothing can type for you. Reply with the
      "save" form of step 7: "You can /clear now." The summary comes back by itself after the /clear.
    - **`t3`** (T3 Code): `arm-clear` already started a new thread in this project that begins from the

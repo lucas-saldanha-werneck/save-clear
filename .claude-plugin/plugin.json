@@ -1,6 +1,6 @@
 {
   "name": "save-clear",
-  "version": "0.17.2",
+  "version": "0.18.0",
   "description": "Saves decisions and next steps, clears the context, and the next session starts from them.",
   "author": {
     "name": "Lucas Saldanha Werneck",
@@ -143,6 +143,12 @@
       "type": "string",
       "title": "Turn idle Remote Control off (hours, optional)",
       "description": "Desktop app, relay only: once an hour the relay turns Remote Control off for sessions with no message from you for this many hours. Empty or 0 = off.",
+      "default": ""
+    },
+    "confirm_seconds": {
+      "type": "string",
+      "title": "Ask before the automatic /clear (seconds)",
+      "description": "Terminal (tmux) only. Before the automatic /clear, Claude asks \"clear now?\"; with no answer after this many seconds it goes ahead by itself, and \"wait\" keeps the conversation on screen (the summary stays saved). Empty = 6 seconds (on by default), 0 = off.",
       "default": ""
     }
   }

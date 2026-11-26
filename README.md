@@ -141,6 +141,7 @@ it, and an existing file is never overwritten, so edit it freely.
 | `relay_model` | `SAVE_CLEAR_RELAY_MODEL` | `haiku` | Model of the relay session the plugin creates |
 | `relay_title` | `SAVE_CLEAR_RELAY_TITLE` | `Don't touch it, relay` | Title of the relay session the plugin creates |
 | `rc_idle_off_hours` | `SAVE_CLEAR_RC_IDLE_OFF_HOURS` | off | Desktop app: once an hour the relay turns Remote Control off for sessions with no message from you for this many hours (the relay itself and sessions in `~/.claude/rc-auto-keep-on.json` stay on). `save-clear-relay rc-sweep --dry-run` lists them |
+| `confirm_seconds` | `SAVE_CLEAR_CONFIRM_SECONDS` | 6 | Terminal (tmux) only: before the automatic `/clear`, Claude asks "clear now?" and goes ahead by itself after this many seconds without an answer. Empty = 6, `0` = no question. See [Ask before the clear](#ask-before-the-clear) |
 | (none) | `SAVE_CLEAR_LAUNCHD_PREFIX` | `com.claude-tools` | Idle trigger only: prefix of the launchd job label (`<prefix>.save-clear-idle`) |
 | (none) | `SAVE_CLEAR_STATE_DIR` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/state/save-clear` | Flags, relay inbox and the logs `save-clear.log` and `relay.log` |
 
@@ -230,6 +231,26 @@ It asks again only after the context grows another 50k tokens, or after the cont
 limit (for example after a compaction) and crosses it again. It skips `claude -p` and SDK sessions,
 a session that already armed its `/clear` or armed a resume in the last 15 minutes, and the desktop
 app relay session.
+
+### Ask before the clear
+
+An automatic `/clear` can wipe the screen while you are still reading the last answer. By
+default (`confirm_seconds` empty = 6 seconds; set `0` to turn it off), `save-clear arm-clear` tells Claude to ask first, with
+AskUserQuestion: "clear now?", options "go ahead" and "wait".
+
+- No answer in that many seconds: a helper (`bin/save-clear-confirm`) presses Enter in the tmux pane,
+  which picks "go ahead", and the `/clear` follows as usual. Claude Code's own question timeout cannot
+  do this: its shortest wait is 60 s and it never counts down while Remote Control is connected.
+- "Wait" (or any other answer): Claude runs `save-clear disarm`. Nothing is cleared, the summary stays
+  saved, and the resume stays armed. Say "save and clear" (or just "clear") when you are done; Claude
+  then runs `save-clear arm-clear --now`, which does not ask again.
+- The helper presses nothing when the dialog is gone (you answered, in the terminal or from a phone)
+  or changed (you moved the selection or started to type). It finds the dialog by its header,
+  `save-clear`, and compares only the question block, so a clock elsewhere on the screen is ignored.
+
+This works only in a terminal session running inside tmux. In the desktop app (and in a terminal
+without tmux) nothing can press a key for you, so there the clear works as before, with no question.
+On by default; set `confirm_seconds` to `0` to turn it off.
 
 ### Leftover background tasks
 

@@ -44,7 +44,8 @@ class Base(unittest.TestCase):
         self.env.update(SAVE_CLEAR_UNDER_TERMINAL="0", SAVE_CLEAR_NESTED_CLAUDE="0", SAVE_CLEAR_STATE_DIR=self.state, SAVE_CLEAR_SNAPSHOT_DIR=self.snaps,
                         SAVE_CLEAR_CLAUDE="/nonexistent/claude", SAVE_CLEAR_POINTER=os.path.join(t, "pointer"),
                         SAVE_CLEAR_APP_LOG=os.path.join(t, "app-main.log"),
-                        SAVE_CLEAR_CONFIG=os.path.join(t, "user-config.json"))
+                        SAVE_CLEAR_CONFIG=os.path.join(t, "user-config.json"),
+                        SAVE_CLEAR_CHECK_WAIT="0")  # no pause between the tries of the target check
         # A fake tmux first on PATH: no test ever reaches a real tmux server.
         self.fakebin = os.path.join(t, "fakebin")
         os.makedirs(self.fakebin)
@@ -3568,6 +3569,307 @@ class AppHost(unittest.TestCase):
             self.assertIsNone(common.app_host(env))
         with mock.patch.dict(os.environ, {"SAVE_CLEAR_UNDER_TERMINAL": "0"}):
             self.assertEqual(common.app_host(env), env["CLAUDE_CODE_HOST_SESSION_ID"])
+
+
+LOAD = ("import importlib.machinery, importlib.util, json, os, sys\n"
+        "def load(rel):\n"
+        "    ld = importlib.machinery.SourceFileLoader('m_' + os.path.basename(rel).replace('-', '_'),\n"
+        "                                              os.path.join(sys.argv[1], rel))\n"
+        "    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(ld.name, ld))\n"
+        "    ld.exec_module(m)\n"
+        "    return m\n")
+
+DIALOG = (" ☐ save-clear\n"
+          "Clear the conversation now? It goes ahead by itself in 6 s.\n"
+          "❯ 1. Go ahead\n"
+          "     Clear now.\n"
+          "  2. Wait\n"
+          "     I am still reading.\n"
+          "  3. Type something.\n"
+          "────────────────────────────\n"
+          "  4. Chat about this\n"
+          "Enter to select · ↑/↓ to navigate · Esc to cancel\n")
+
+
+class CheckRetry(Base):
+    """`arm-clear` tries the target check again when the session list cannot be read (a busy machine)."""
+
+    def run_check(self, answers):
+        code = LOAD + (
+            "m = load('bin/save-clear')\n"
+            "answers = json.loads(sys.argv[2]); calls = []\n"
+            "class R:\n"
+            "    def __init__(self, rc, out): self.returncode, self.stdout = rc, out\n"
+            "def fake(cmd, **kw):\n"
+            "    calls.append(cmd)\n"
+            "    a = answers[min(len(calls), len(answers)) - 1]\n"
+            "    if a == 'hang':\n"
+            "        raise m.subprocess.TimeoutExpired(cmd, 30)\n"
+            "    return R(a[0], a[1])\n"
+            "m.subprocess.run = fake\n"
+            "rc, out = m.check('tmux', '%7', 'sid')\n"
+            "print(json.dumps({'rc': rc, 'out': out, 'calls': len(calls)}))\n")
+        r = subprocess.run([PY, "-c", code, ROOT, json.dumps(answers)], capture_output=True, text=True,
+                           encoding="utf-8", env=self.env, cwd=self.proj, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_a_slow_session_list_is_tried_again(self):
+        busy = [2, "refused: cannot-list in target %7"]
+        got = self.run_check([busy, busy, [0, "ok: target runs this session"]])
+        self.assertEqual((got["rc"], got["calls"]), (0, 3))
+        with open(os.path.join(self.state, "save-clear.log"), encoding="utf-8") as f:
+            self.assertIn("answered on try 3", f.read())
+
+    def test_it_gives_up_after_three_tries(self):
+        got = self.run_check([[2, "refused: cannot-list in target %7"]])
+        self.assertEqual((got["rc"], got["calls"]), (2, 3))
+        self.assertIn("cannot-list", got["out"])
+
+    def test_a_check_that_hangs_is_tried_again_and_never_raises(self):
+        got = self.run_check(["hang", [0, "ok: target runs this session"]])
+        self.assertEqual((got["rc"], got["calls"]), (0, 2))
+        got = self.run_check(["hang"])
+        self.assertEqual((got["rc"], got["calls"]), (2, 3))
+        self.assertIn("did not answer", got["out"])
+
+    def test_a_real_refusal_is_not_tried_again(self):
+        # Another session runs in the target (exit 1): a fact about the target, not a slow list.
+        got = self.run_check([[1, "refused: target %7 runs session bbbbbbbb, not aaaaaaaa"]])
+        self.assertEqual((got["rc"], got["calls"]), (1, 1))
+        got = self.run_check([[2, "refused: usage --check <tmux|iterm> <target> <session_id>"]])
+        self.assertEqual((got["rc"], got["calls"]), (2, 1))
+
+
+class ConfirmBeforeClear(Base):
+    """The `confirm_seconds` option: ask "clear now?" before the automatic /clear."""
+
+    def arm_tmux(self, args=(), **env):
+        """`save-clear arm-clear` in a tmux pane whose check passes; the helper start is only recorded."""
+        code = LOAD + (
+            "m = load('bin/save-clear')\n"
+            "m.check = lambda *a: (0, 'ok: target runs this session')\n"
+            "started, real = [], m.subprocess.Popen\n"
+            "def popen(cmd, *a, **kw):\n"   # subprocess.run goes through Popen too: only the helper is faked
+            "    if any('save-clear-confirm' in str(c) for c in cmd):\n"
+            "        return started.append(cmd)\n"
+            "    return real(cmd, *a, **kw)\n"
+            "m.subprocess.Popen = popen\n"
+            "rc = m.cmd_arm_clear(json.loads(sys.argv[2]))\n"
+            "print('STARTED=' + json.dumps(started))\n"
+            "sys.exit(rc)\n")
+        e = dict(self.env, CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli", TMUX_PANE="%7")
+        e.update({k: str(v) for k, v in env.items()})
+        r = subprocess.run([PY, "-c", code, ROOT, json.dumps(list(args))], capture_output=True, text=True,
+                           encoding="utf-8", env=e, cwd=self.proj, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        started = json.loads(r.stdout.split("STARTED=")[-1])
+        return r.stdout.split("STARTED=")[0], started
+
+    def test_the_option_reads_seconds_defaults_to_6_and_0_is_off(self):
+        code = ("import json, os, sys\n"
+                "sys.path.insert(0, os.path.join(sys.argv[1], 'lib'))\n"
+                "import common\n"
+                "print(common.confirm_seconds())\n")
+        for raw, want in (("6", 6.0), ("6,5", 6.5), ("0.5", 0.5), ("0", 0.0), ("", 6.0), ("-3", 0.0),
+                          ("soon", 6.0), ("nan", 6.0), ("99999", 300.0)):
+            r = subprocess.run([PY, "-c", code, ROOT], capture_output=True, text=True, encoding="utf-8",
+                               env=dict(self.env, SAVE_CLEAR_CONFIRM_SECONDS=raw), cwd=self.proj, timeout=60)
+            self.assertEqual(float(r.stdout.strip()), want, f"{raw!r}: {r.stdout}{r.stderr}")
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_on_by_default(self):
+        out, started = self.arm_tmux()
+        self.assertIn("mode=tmux", out)
+        self.assertIn("confirm: 6 s", out)
+        self.assertNotIn("end the turn now with one short line", out)
+        [cmd] = started
+        self.assertEqual((os.path.basename(cmd[1]), cmd[2:]), ("save-clear-confirm", ["%7", "6"]))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_zero_turns_the_question_off(self):
+        out, started = self.arm_tmux(SAVE_CLEAR_CONFIRM_SECONDS="0")
+        self.assertIn("mode=tmux", out)
+        self.assertNotIn("confirm:", out)
+        self.assertIn("end the turn now", out)
+        self.assertEqual(started, [])
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_tmux_session_is_told_to_ask_first_and_the_helper_starts(self):
+        out, started = self.arm_tmux(SAVE_CLEAR_CONFIRM_SECONDS="6")
+        self.assertIn("mode=tmux", out)
+        line = next(ln for ln in out.splitlines() if ln.startswith("confirm:"))
+        self.assertIn("confirm: 6 s", line)
+        self.assertIn('header exactly "save-clear"', line)
+        self.assertIn("AskUserQuestion", line)
+        self.assertIn(" disarm`", line)
+        self.assertNotIn("end the turn now with one short line", out, "the question comes first")
+        self.assertTrue(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "armed: 'go ahead' needs nothing else")
+        [cmd] = started
+        self.assertEqual((os.path.basename(cmd[1]), cmd[2:]), ("save-clear-confirm", ["%7", "6"]))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_now_skips_the_question(self):
+        out, started = self.arm_tmux(["--now"], SAVE_CLEAR_CONFIRM_SECONDS="6")
+        self.assertNotIn("confirm:", out)
+        self.assertIn("end the turn now", out)
+        self.assertEqual(started, [])
+        self.assertTrue(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_stopping_background_tasks_waits_for_the_answer(self):
+        out, _ = self.arm_tmux(SAVE_CLEAR_CONFIRM_SECONDS="6", SAVE_CLEAR_KILL_BACKGROUND_TASKS="on")
+        line = next(ln for ln in out.splitlines() if ln.startswith("confirm:"))
+        self.assertIn("TaskStop", line)
+        self.assertLess(line.index("Answer 1"), line.index("TaskStop"), "tasks are stopped only on 'go ahead'")
+        self.assertEqual(out.count("TaskStop"), line.count("TaskStop"), "no second, unconditional reminder")
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_background_job_and_app_never_ask(self):
+        r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli",
+                        CLAUDE_JOB_DIR=os.path.join(self.t, "jobs", "j1"), SAVE_CLEAR_CONFIRM_SECONDS="6")
+        self.assertIn("mode=bg", r.stdout)
+        self.assertNotIn("confirm:", r.stdout)
+        r = self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_SESSION_ID=SID_A,
+                        CLAUDE_CODE_ENTRYPOINT="claude-desktop", SAVE_CLEAR_CONFIRM_SECONDS="6")
+        self.assertIn("mode=app", r.stdout)
+        self.assertNotIn("confirm:", r.stdout)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_disarm_takes_the_request_back_and_the_stop_hook_does_nothing(self):
+        env = dict(CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli")
+        self.arm_tmux(SAVE_CLEAR_CONFIRM_SECONDS="6")
+        self.assertTrue(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+        r = self.run_py("bin/save-clear", ["disarm"], **env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Disarmed", r.stdout)
+        self.assertIn("arm-clear --now", r.stdout)
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+        tp = os.path.join(self.proj, "t.jsonl")
+        open(tp, "w").close()
+        r = self.run_py("hooks/stop.py", stdin={"session_id": SID_A, "transcript_path": tp}, **env)
+        self.assertEqual(r.stdout.strip(), "", "nothing armed: the Stop hook starts no helper")
+
+    def test_disarm_with_nothing_armed_is_harmless(self):
+        r = self.run_py("bin/save-clear", ["disarm"], CLAUDE_CODE_SESSION_ID=SID_B)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("No /clear request", r.stdout)
+
+    def test_disarm_leaves_another_sessions_request_alone(self):
+        job = dict(CLAUDE_JOB_DIR=os.path.join(self.t, "jobs", "jobA"), CLAUDE_CODE_ENTRYPOINT="cli")
+        self.run_py("bin/save-clear", ["arm-clear"], CLAUDE_CODE_SESSION_ID=SID_A, **job)
+        before = json.loads(self.run_py("bin/save-clear", ["status"]).stdout)["clear"]
+        self.run_py("bin/save-clear", ["disarm"], CLAUDE_CODE_SESSION_ID=SID_B)
+        self.assertEqual(json.loads(self.run_py("bin/save-clear", ["status"]).stdout)["clear"], before)
+
+
+class ConfirmHelper(Base):
+    """bin/save-clear-confirm: presses Enter on the question only when nobody answered it."""
+
+    def show(self, text):
+        with open(os.path.join(self.t, "screen.txt"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def helper(self, secs, **env):
+        e = dict(self.env, SAVE_CLEAR_CONFIRM_POLL="0.05")
+        e.update({k: str(v) for k, v in env.items()})
+        return subprocess.Popen([PY, os.path.join(ROOT, "bin", "save-clear-confirm"), "%7", str(secs)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=e, cwd=self.proj)
+
+    def done(self, p):
+        _, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 0, err)
+
+    def enters(self):
+        p = os.path.join(self.t, "tmux-calls.jsonl")
+        if not os.path.exists(p):
+            return 0
+        with open(p) as f:
+            return sum(1 for ln in f if json.loads(ln)[:1] == ["send-keys"] and "Enter" in json.loads(ln))
+
+    def logged(self):
+        p = os.path.join(self.state, "save-clear.log")
+        if not os.path.exists(p):
+            return ""
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+
+    def test_dialog_is_found_by_its_header_and_options(self):
+        code = LOAD + (
+            "m = load('bin/save-clear-confirm')\n"
+            "print(json.dumps([m.dialog(t) for t in json.loads(sys.stdin.read())]))\n")
+        above = "⏺ Bash(save-clear arm-clear)\n  ⎿ save-clear: mode=tmux target=%7 entrypoint=cli\n     confirm: 6 s. Ask first.\n\n"
+        moved = DIALOG.replace("❯ 1. Go ahead", "  1. Go ahead").replace("  2. Wait", "❯ 2. Wait")
+        typed = DIALOG.replace("3. Type something.", "3. not yet")
+        other = DIALOG.replace("☐ save-clear", "☐ Deploy")
+        texts = [above + DIALOG + "\n 05:41:07  ctx 81%\n", above + DIALOG + "\n 05:41:09  ctx 81%\n",
+                 above + moved, above + typed, above + other, above + "❯ \n",
+                 "\x1b[1m ☐ save-clear\x1b[0m\n\x1b[36m❯ 1. Go ahead\x1b[0m\n  2. Wait\n"]
+        r = subprocess.run([PY, "-c", code, ROOT], input=json.dumps(texts), capture_output=True, text=True,
+                           encoding="utf-8", env=self.env, cwd=self.proj, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        a, b, mv, ty, ot, none, ansi = json.loads(r.stdout)
+        self.assertTrue(a.startswith(" ☐ save-clear") and a.endswith("4. Chat about this"), a)
+        self.assertEqual(a, b, "a clock below the question is not a change")
+        self.assertNotEqual(a, mv, "moving the selection is a change")
+        self.assertNotEqual(a, ty, "typing an answer is a change")
+        self.assertEqual((ot, none), ("", ""), "another question, or no dialog: not ours")
+        self.assertEqual(ansi, " ☐ save-clear\n❯ 1. Go ahead\n  2. Wait")
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_no_answer_presses_enter_once(self):
+        self.show(DIALOG)
+        p = self.helper(0.4)
+        self.done(p)
+        self.assertEqual(self.enters(), 1)
+        self.assertIn("picked the first option", self.logged())
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_an_answer_before_the_wait_ends_presses_nothing(self):
+        self.show(DIALOG)
+        p = self.helper(5)
+        time.sleep(1.0)
+        os.unlink(os.path.join(self.t, "screen.txt"))  # answered (from a phone, say): the dialog closes
+        self.done(p)
+        self.assertEqual(self.enters(), 0)
+        self.assertIn("the user answered", self.logged())
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_a_moved_selection_presses_nothing(self):
+        self.show(DIALOG)
+        p = self.helper(6)
+        time.sleep(2.5)  # past the settle time: a change now is the user
+        self.show(DIALOG.replace("❯ 1. Go ahead", "  1. Go ahead").replace("  2. Wait", "❯ 2. Wait"))
+        self.done(p)
+        self.assertEqual(self.enters(), 0)
+        self.assertIn("the dialog changed", self.logged())
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_a_question_that_never_shows_up_presses_nothing(self):
+        p = self.helper(0.2, SAVE_CLEAR_CONFIRM_APPEAR="0.5")
+        self.done(p)
+        self.assertEqual(self.enters(), 0)
+        self.assertIn("did not show up", self.logged())
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_the_wait_starts_when_the_question_shows_up(self):
+        p = self.helper(0.4, SAVE_CLEAR_CONFIRM_APPEAR="20")
+        time.sleep(1.5)
+        self.assertEqual(self.enters(), 0, "nothing on screen yet")
+        self.show(DIALOG)
+        self.done(p)
+        self.assertEqual(self.enters(), 1)
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_a_newer_helper_takes_over_the_pane(self):
+        self.show(DIALOG)
+        old = self.helper(3)
+        time.sleep(1.0)
+        new = self.helper(3)
+        self.done(old)
+        self.done(new)
+        self.assertEqual(self.enters(), 1, "one Enter, from the newer helper")
+        self.assertIn("a newer helper watches this pane", self.logged())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Answers the "clear now?" question by itself when nobody does (the `confirm_seconds` option).
+
+  save-clear-confirm <tmux pane> <seconds>
+
+Started by `save-clear arm-clear` in a tmux session, right before Claude asks the question with
+AskUserQuestion. Claude Code's own question timeout cannot do this: its shortest wait is 60 s and it
+never counts down while Remote Control is connected.
+
+It watches the pane. Once the question (header "save-clear", options 1 and 2) is on the screen, it waits
+<seconds>. If the dialog is still there and unchanged, it presses Enter, which picks the first option
+("go ahead"). It presses nothing when:
+- the dialog is gone: the user answered, in the terminal or from a phone;
+- the dialog changed: the user moved the selection or started to type an answer;
+- the question never showed up: Claude did not ask it;
+- a newer helper watches the same pane.
+"""
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from common import CONFIRM_HEADER, CONFIRM_MAX_S, STATE, ensure_state, log as _log, tmux_bin  # noqa: E402
+
+TMUX = tmux_bin() or "tmux"
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# The header chip alone on its line (" ☐ save-clear"), not a line that only mentions the word.
+HEADER = re.compile(r"[\W_]*" + re.escape(CONFIRM_HEADER) + r"[\W_]*", re.I)
+OPTION = re.compile(r"^\W{0,4}(\d)\.\s+\S")
+SETTLE_S = 1.0    # the dialog can be drawn in more than one step: a change this early is not the user
+
+
+def num(name, default):
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return float(default)
+
+
+def screen(pane):
+    try:
+        return subprocess.run([TMUX, "capture-pane", "-p", "-t", pane], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=10).stdout
+    except Exception:
+        return ""
+
+
+def dialog(text):
+    """The question as shown (header line down to the last numbered option), or '' when it is not there.
+
+    Only that block is returned, so a clock or a spinner elsewhere on the screen never counts as a change;
+    the selection mark and a typed answer are inside it, so the user's own keys do."""
+    lines = [ANSI.sub("", ln).rstrip() for ln in (text or "").splitlines()]
+    for i in range(len(lines) - 1, -1, -1):
+        if not HEADER.fullmatch(lines[i]):
+            continue
+        last, seen = i, set()
+        for j in range(i + 1, min(i + 24, len(lines))):
+            m = OPTION.match(lines[j])
+            if m:
+                last = j
+                seen.add(m.group(1))
+        if {"1", "2"} <= seen:
+            return "\n".join(lines[i:last + 1])
+    return ""
+
+
+def main(argv):
+    if len(argv) != 2:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    pane = argv[0]
+    try:
+        secs = min(max(float(argv[1]), 0.0), CONFIRM_MAX_S)
+    except ValueError:
+        return 2
+
+    def log(msg):
+        _log(f"confirm {pane}", msg)
+
+    ensure_state()
+    lock = os.path.join(STATE, "confirm-" + re.sub(r"[^A-Za-z0-9_-]", "", pane)[:60] + ".pid")
+    me = str(os.getpid())
+    try:
+        with open(lock, "w") as f:
+            f.write(me)
+    except OSError:
+        pass
+
+    def mine():
+        try:
+            with open(lock) as f:
+                return f.read().strip() == me
+        except OSError:
+            return True  # no lock file to compare with: act as the only helper
+
+    appear = num("SAVE_CLEAR_CONFIRM_APPEAR", 300)   # how long Claude has to put the question on the screen
+    poll = num("SAVE_CLEAR_CONFIRM_POLL", 0.4)
+    started = time.time()
+    shown, since = "", 0.0
+    try:
+        while mine():
+            cur = dialog(screen(pane))
+            now = time.time()
+            if not shown:
+                if cur:
+                    shown, since = cur, now
+                elif now - started > appear:
+                    log(f"the question did not show up in {appear:g} s: nothing pressed")
+                    return 0
+            elif not cur:
+                log("the user answered: nothing pressed")
+                return 0
+            elif cur != shown:
+                if now - since < SETTLE_S:
+                    shown, since = cur, now  # still being drawn: start the wait again
+                else:
+                    log("the dialog changed (the user is answering): nothing pressed")
+                    return 0
+            elif now - since >= secs:
+                if dialog(screen(pane)) != shown or not mine():
+                    continue  # it changed in this very moment: look again
+                subprocess.run([TMUX, "send-keys", "-t", pane, "Enter"], capture_output=True, timeout=10)
+                log(f"no answer in {secs:g} s: picked the first option (go ahead)")
+                return 0
+            time.sleep(poll)
+        log("a newer helper watches this pane: nothing pressed")
+        return 0
+    finally:
+        if mine():
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception as e:  # never leave a traceback behind: nothing reads this helper's output
+        _log("confirm", f"error: {e!r}")
+        sys.exit(1)
