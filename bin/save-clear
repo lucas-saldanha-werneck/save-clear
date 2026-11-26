@@ -5,7 +5,10 @@
                                  (publish_link, language, extra steps from your config)
   save-clear arm-resume <file>   run on_save_command (its output is appended to <file>), then: the next
                                  session started by /clear in THIS session gets <file>
-  save-clear arm-clear           pick how the automatic /clear can be sent and arm the Stop hook
+  save-clear arm-clear [--now]   pick how the automatic /clear can be sent and arm the Stop hook. With the
+                                 confirm_seconds option (tmux only) it also tells Claude to ask "clear now?"
+                                 first; --now skips that question
+  save-clear disarm [session_id] take back THIS session's /clear request (the user answered "wait")
   save-clear rearm [session_id] [--subagents]
                                  after saving "what came after the save", arm THIS session's /clear again
                                  (--subagents: the round was a subagent's result, not a user message)
@@ -19,11 +22,12 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (BIN, all_clears, app_session_info, clear_key, describe_subagents, desktop_app_session,  # noqa: E402
-                    extra_steps,
+from common import (BIN, CONFIRM_HEADER, all_clears, app_session_info, clear_key, clear_path, confirm_seconds,  # noqa: E402
+                    describe_subagents, desktop_app_session, extra_steps,
                     hold_resume_requests, kill_background_tasks, language, process_start_ms, log, mark_app_wait, now_ms, pending_subagents, publish_link, read_json,
                     resume_turn_marker, run_hook_command, seed_user_config, setting, snapshot_dir,
                     stop_tasks_instruction, t3_cli, t3_session, t3_start_command, tmux_bin, transcript_of,
@@ -97,10 +101,48 @@ def is_iterm():
             and (os.environ.get("TERM_PROGRAM") == "iTerm.app" or os.environ.get("LC_TERMINAL") == "iTerm2"))
 
 
+CHECK_TRIES = 3
+
+
 def check(mode, target, sid):
-    r = subprocess.run([sys.executable, os.path.join(BIN, "save-clear-send"), "--check", mode, target, sid],
-                       capture_output=True, text=True, timeout=30)
-    return r.returncode, r.stdout.strip()
+    """Does the target run this session? (returncode, text) of `save-clear-send --check`.
+
+    On a busy machine `claude agents --json` can be too slow, and the check answers "cannot-list" (exit 2)
+    or does not answer at all. That says nothing about the target, so it is tried again (CHECK_TRIES in
+    all) before the automatic /clear turns into "type /clear yourself"."""
+    try:
+        wait = float(os.environ.get("SAVE_CLEAR_CHECK_WAIT") or 4)
+    except ValueError:
+        wait = 4.0
+    rc, out, tries = 2, "", 0
+    for tries in range(1, CHECK_TRIES + 1):
+        try:
+            r = subprocess.run([sys.executable, os.path.join(BIN, "save-clear-send"), "--check", mode, target, sid],
+                               capture_output=True, text=True, timeout=30)
+            rc, out = r.returncode, r.stdout.strip()
+        except subprocess.TimeoutExpired:
+            rc, out = 2, f"refused: cannot-list in target {target} (the check did not answer in 30 s)"
+        if rc != 2 or "cannot-list" not in out or tries == CHECK_TRIES:
+            break
+        time.sleep(max(wait, 0))
+    if tries > 1:
+        log("arm", f"check of target {target}: the session list could not be read at first; "
+                   f"{'answered' if rc != 2 else 'still unreadable'} on try {tries}")
+    return rc, out
+
+
+def confirm_instruction(secs):
+    """What Claude is told when the `confirm_seconds` option is on: ask before the clear."""
+    stop = (stop_tasks_instruction("If you have not done it yet,") + " Then end") if kill_background_tasks() else "End"
+    disarm = f"python3 \"{os.path.join(BIN, 'save-clear')}\" disarm"
+    return (f"confirm: {secs:g} s. Automatic /clear armed, but ask first. Write no text before the question. "
+            f"Call AskUserQuestion now with ONE question: header exactly \"{CONFIRM_HEADER}\"; the question, in "
+            f"the user's language, asks whether to clear the conversation now and says that it goes ahead by "
+            f"itself in {secs:g} s; exactly two options, in this order: 1) go ahead and clear, 2) wait, I am "
+            f"still reading. A helper picks option 1 after {secs:g} s without an answer. "
+            f"Answer 1: {stop} the turn with one short line; the /clear follows by itself. "
+            f"Any other answer (option 2, typed text, dismissed): run `{disarm}`, do not clear, and end the "
+            "turn with one line: the summary is saved and the clear waits until the user asks for it.")
 
 
 def t3_run(cmd, stdin=None, timeout=60):
@@ -272,6 +314,20 @@ def cmd_arm_clear(args):
     key = clear_key(job=target) if mode == "bg" else clear_key(sid)
     write_clear({"session_id": sid, "mode": mode, "target": target, "key": key, "ts": now_ms()})
     log("arm", f"auto-clear armed: mode={mode} target={target} session {sid[:8]}")
+    # The question is for a terminal the helper can press Enter in. `--now`: the user just asked for the
+    # clear (after a "wait"), so asking again would only be in the way.
+    secs = confirm_seconds() if mode == "tmux" and "--now" not in args else 0
+    if secs:
+        try:
+            subprocess.Popen([sys.executable, os.path.join(BIN, "save-clear-confirm"), target, f"{secs:g}"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError as e:  # nobody would answer the question for the user: do not ask it
+            log("arm", f"could not start the confirm helper ({e!r}); clearing without the question")
+        else:
+            log("arm", f"confirm: the question waits {secs:g} s for session {sid[:8]}")
+            print(confirm_instruction(secs))
+            return 0
     if kill_background_tasks():
         print(stop_tasks_instruction("If you have not done it yet, now, before ending the turn,"))
     print("Automatic /clear armed: end the turn now with one short line.")
@@ -308,6 +364,27 @@ def cmd_rearm(args):
     return 0
 
 
+def cmd_disarm(args):
+    """Take back this session's /clear request (the user answered "wait"). The resume stays armed."""
+    pos = [a for a in args if not a.startswith("--")]
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or (pos[0] if pos else "")
+    job = os.path.basename(os.environ.get("CLAUDE_JOB_DIR") or "")
+    flag = own_clear(sid, job)
+    if flag:
+        key = flag.get("key") or (clear_key(job=job) if job and flag.get("mode") == "bg" else clear_key(sid))
+        try:
+            os.unlink(clear_path(key))
+        except OSError:
+            pass
+        log("arm", f"disarmed: the user asked to wait (session {sid[:8] or '?'})")
+    rearm = f"python3 \"{os.path.join(BIN, 'save-clear')}\" arm-clear --now"
+    print(("Disarmed: no automatic /clear now." if flag else "No /clear request of this session was armed.")
+          + " The summary stays saved and comes back after any /clear. When the user asks to clear: if the "
+          "conversation moved on since the save, add what came after to the snapshot in a section "
+          f"\"## After the save\"; then run `{rearm}` (no question this time) and end the turn.")
+    return 0
+
+
 def cmd_decision_waiting(args):
     """Flag, in this session's resume-turn marker, that a decision is waiting (see hooks/resume_turn_guard.py)."""
     sid = (args[0] if args else "") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
@@ -338,6 +415,8 @@ def main(argv):
         return cmd_arm_clear(args)
     if cmd == "rearm":
         return cmd_rearm(args)
+    if cmd == "disarm":
+        return cmd_disarm(args)
     if cmd == "decision-waiting":
         return cmd_decision_waiting(args)
     if cmd == "status":

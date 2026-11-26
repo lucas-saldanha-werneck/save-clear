@@ -2,6 +2,12 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.18.0 (2026-11-26)
+
+- New option `confirm_seconds` (on by default, 6 seconds; `0` turns it off; terminal sessions in tmux only, not the desktop app): before the automatic `/clear`, Claude asks "clear now?" with AskUserQuestion. With no answer after that many seconds, the new helper `bin/save-clear-confirm` presses Enter in the pane, which picks "go ahead"; "wait" runs the new `save-clear disarm`, which keeps the conversation on screen with the summary saved. `save-clear arm-clear --now` skips the question (the user just asked for the clear). Why: an automatic clear wiped the screen while the user was still reading a long answer. Claude Code's own question timeout does not fit: 60 s at least, and never with Remote Control connected.
+- `save-clear arm-clear` tries the target check again (3 times in all) when the session list cannot be read (`cannot-list`: `claude agents --json` too slow on a busy machine) or the check does not answer in 30 s. Before, one slow moment turned the automatic `/clear` into "type /clear yourself" (seen on 23/11/2026 with a load average of 156), and a check that hung ended `arm-clear` with a traceback.
+- The Stop hook now logs when it drops a clear request older than 15 minutes (it used to drop it silently).
+
 ## 0.17.2 (2026-11-25)
 
 - T3 Code (github.com/pingdotgg/t3code) support. T3 runs Claude Code in SDK mode (`CLAUDE_CODE_ENTRYPOINT=t3-code`, `T3CODE_THREAD_ID`, no tty), so `arm-clear` used to pick the desktop app mode and point Claude at the app relay and `clear_session`, which do not exist there. Now `arm-clear` picks a `t3` mode: it starts a new thread in the same project with the T3 CLI (`t3 thread start`, same provider and model as the current thread) and binds the summary to that thread id, so only that thread's SessionStart takes it. The first message is the resume request plus the snapshot path, as a fallback. A missing or failing CLI gives `manual` with the reason, never the app mode. Subagents still running hold the move (`t3-wait`): their results can only reach the old thread.

@@ -20,8 +20,16 @@ if cmd == "list-panes":
     # FAKE_TMUX_PANES: "<pane_pid> <pane_id>" lines, e.g. "4242 %7"
     sys.stdout.write(os.environ.get("FAKE_TMUX_PANES", "").replace(";", "\n") + "\n")
 elif cmd == "capture-pane":
-    sys.stdout.write("\x1b[0m\n❯ " + draft + "\n")
+    # screen.txt, when a test wrote one, is what the pane shows (e.g. an open question dialog).
+    shown = os.path.join(D, "screen.txt")
+    if os.path.exists(shown):
+        with open(shown, encoding="utf-8") as f:
+            sys.stdout.buffer.write(f.read().encode("utf-8"))
+    else:
+        sys.stdout.buffer.write(("\x1b[0m\n❯ " + draft + "\n").encode("utf-8"))
 elif cmd == "send-keys":
+    if "Enter" in args and "-l" not in args and os.path.exists(os.path.join(D, "screen.txt")):
+        os.unlink(os.path.join(D, "screen.txt"))  # Enter answers the open dialog: it closes
     rest, literal, i = [], False, 1
     while i < len(args):
         if args[i] == "-t":

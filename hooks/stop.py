@@ -142,6 +142,7 @@ def main():
         return
     if now_ms() - int(flag.get("armed_at") or flag.get("ts") or 0) > MAX_AGE_MS:
         drop_flag()
+        log("stop", f"clear request older than {MAX_AGE_MS // 60000} min; dropped")
         return
 
     if flag.get("mode") == "iterm":
