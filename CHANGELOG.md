@@ -6,6 +6,7 @@ Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
 - New option `confirm_seconds` (on by default, 6 seconds; `0` turns it off; terminal sessions in tmux only, not the desktop app): before the automatic `/clear`, Claude asks "clear now?" with AskUserQuestion. With no answer after that many seconds, the new helper `bin/save-clear-confirm` presses Enter in the pane, which picks "go ahead"; "wait" runs the new `save-clear disarm`, which keeps the conversation on screen with the summary saved. `save-clear arm-clear --now` skips the question (the user just asked for the clear). Why: an automatic clear wiped the screen while the user was still reading a long answer. Claude Code's own question timeout does not fit: 60 s at least, and never with Remote Control connected.
 - `save-clear arm-clear` tries the target check again (3 times in all) when the session list cannot be read (`cannot-list`: `claude agents --json` too slow on a busy machine) or the check does not answer in 30 s. Before, one slow moment turned the automatic `/clear` into "type /clear yourself" (seen on 23/11/2026 with a load average of 156), and a check that hung ended `arm-clear` with a traceback.
+- The Stop hook now logs when it drops a clear request older than 15 minutes (it used to drop it silently).
 
 ## 0.17.2 (2026-11-25)
 
