@@ -3823,6 +3823,9 @@ class ConfirmHelper(Base):
         self.done(p)
         self.assertEqual(self.enters(), 1)
         self.assertIn("picked the first option", self.logged())
+        # the log says when the question showed up and how long it stayed, so the real wait can be measured
+        self.assertIn("the question is on the screen", self.logged())
+        self.assertRegex(self.logged(), r"was on the screen for \d+\.\d s")
 
     @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
     def test_an_answer_before_the_wait_ends_presses_nothing(self):
