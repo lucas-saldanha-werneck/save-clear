@@ -2,6 +2,10 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.18.1 (2026-11-26)
+
+- `bin/save-clear-confirm` logs the moment the question shows up on the screen (seconds after the arm) and, when it goes ahead by itself, how long the question was on the screen. Why: a user felt the wait was shorter than the setting, and the log only had the arm time and the Enter time, so the real wait could not be measured.
+
 ## 0.18.0 (2026-11-26)
 
 - New option `confirm_seconds` (on by default, 6 seconds; `0` turns it off; terminal sessions in tmux only, not the desktop app): before the automatic `/clear`, Claude asks "clear now?" with AskUserQuestion. With no answer after that many seconds, the new helper `bin/save-clear-confirm` presses Enter in the pane, which picks "go ahead"; "wait" runs the new `save-clear disarm`, which keeps the conversation on screen with the summary saved. `save-clear arm-clear --now` skips the question (the user just asked for the clear). Why: an automatic clear wiped the screen while the user was still reading a long answer. Claude Code's own question timeout does not fit: 60 s at least, and never with Remote Control connected.

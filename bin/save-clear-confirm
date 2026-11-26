@@ -99,7 +99,7 @@ def main(argv):
     appear = num("SAVE_CLEAR_CONFIRM_APPEAR", 300)   # how long Claude has to put the question on the screen
     poll = num("SAVE_CLEAR_CONFIRM_POLL", 0.4)
     started = time.time()
-    shown, since = "", 0.0
+    shown, since, first = "", 0.0, 0.0
     try:
         while mine():
             cur = dialog(screen(pane))
@@ -107,6 +107,8 @@ def main(argv):
             if not shown:
                 if cur:
                     shown, since = cur, now
+                    first = now
+                    log(f"the question is on the screen ({now - started:.1f} s after the arm); waiting {secs:g} s")
                 elif now - started > appear:
                     log(f"the question did not show up in {appear:g} s: nothing pressed")
                     return 0
@@ -123,7 +125,8 @@ def main(argv):
                 if dialog(screen(pane)) != shown or not mine():
                     continue  # it changed in this very moment: look again
                 subprocess.run([TMUX, "send-keys", "-t", pane, "Enter"], capture_output=True, timeout=10)
-                log(f"no answer in {secs:g} s: picked the first option (go ahead)")
+                log(f"no answer in {secs:g} s: picked the first option (go ahead); "
+                    f"the question was on the screen for {time.time() - first:.1f} s")
                 return 0
             time.sleep(poll)
         log("a newer helper watches this pane: nothing pressed")
