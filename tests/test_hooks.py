@@ -4023,11 +4023,13 @@ class NotWhileReading(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("re-armed", r.stdout)
         self.assertNotIn("not re-armed", r.stdout)
-        f = self.read_flag()
+        with open(self.flag_path(f"clear/{SID_A}.json")) as fh:
+            f = json.load(fh)
         self.assertEqual((f.get("rearms"), f.get("agent_rounds")), (1, 1))
         self.write_flag()
         self.run_py("bin/save-clear", ["rearm", SID_A, "--subagents"])
-        self.assertEqual(self.read_flag().get("rearms", 0), 0, "not counted")
+        with open(self.flag_path(f"clear/{SID_A}.json")) as fh:
+            self.assertEqual(json.load(fh).get("rearms", 0), 0, "not counted")
 
     def test_second_message_after_the_save_is_recorded_without_re_arming(self):
         self.write_flag(rearms=1, deltas=1)
