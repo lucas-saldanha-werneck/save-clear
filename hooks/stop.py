@@ -7,8 +7,12 @@ No flag: exits at once. Rules:
   TMUX_PANE is not proof: desktop app sessions inherit the pane of the terminal that opened them.
 - Modes that type into a terminal (tmux) only run in a terminal session, and only after
   `save-clear-send --check` confirms the target runs this session.
-- A user message that arrived after the save blocks the stop (up to 3 rounds): Claude answers it,
-  adds it to the snapshot and re-arms. The message never vanishes in the /clear.
+- A user message that arrived after the save, or one still waiting in the queue, blocks the stop: Claude
+  answers it, adds it to the snapshot and re-arms. The message never vanishes in the /clear.
+- The request is re-armed at most MAX_REARMS (1) time in all, whatever the reason (a message, a subagent
+  result, the helper finding the session busy). Past that, the stop is blocked once to record what came
+  after, without re-arming: the clear is called off and waits for the user's word. No loop.
+- After such a round, a long answer (the user is probably reading it) calls the clear off too.
 - A background subagent's result that reached THIS conversation after the save (before the /clear)
   blocks the stop the same way: Claude records it in the snapshot and re-arms. Subagents still running
   are left alone: they survive a terminal /clear and report to the new conversation.
@@ -23,12 +27,12 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (APP_WAIT_DIR, APP_WAIT_MAX_AGE_MS, BIN, CLEAR_DIR, MARGIN_MS, app_wait_path,  # noqa: E402
-                    clear_key, clear_path, drop_app_wait, kill_background_tasks, log, notify, now_ms,
-                    pending_subagents, process_start_ms, read_app_wait, read_hook_input, read_json, stop_tasks_instruction, subagent_reports_since,
-                    user_messages_since, write_json)
+from common import (APP_WAIT_DIR, APP_WAIT_MAX_AGE_MS, BIN, CLEAR_DIR, MARGIN_MS, MAX_REARMS, app_wait_path,  # noqa: E402
+                    clear_key, clear_path, drop_app_wait, kill_background_tasks, log, long_reply_chars, notify, now_ms,
+                    pending_subagents, process_start_ms, queued_user_messages, read_app_wait, read_hook_input,
+                    read_json, reply_chars, stop_tasks_instruction, subagent_reports_since, user_messages_since,
+                    write_json)
 
-MAX_DELTAS = 3
 MAX_AGE_MS = 15 * 60 * 1000
 MAX_AGENT_ROUNDS = 20
 
@@ -165,11 +169,35 @@ def main():
                 refuse(f"this session is {ep} and target {flag.get('target')} could not be checked in time")
             # cli: unknown for now; the helper checks again before every key
 
-    deltas = int(flag.get("deltas") or 0)
-    fresh = user_messages_since(hook.get("transcript_path"), int(flag.get("ts") or 0) - MARGIN_MS)
-    reports = subagent_reports_since(hook.get("transcript_path"), int(flag.get("ts") or 0) - MARGIN_MS)
+    tp = hook.get("transcript_path")
+    rearms = int(flag.get("rearms") or 0)
+    fresh = user_messages_since(tp, int(flag.get("ts") or 0) - MARGIN_MS)
+    fresh += [m for m in queued_user_messages(tp) if m not in fresh]  # waiting since before the save, too
+    reports = subagent_reports_since(tp, int(flag.get("ts") or 0) - MARGIN_MS)
+    if int(flag.get("agent_rounds") or 0) >= MAX_AGENT_ROUNDS:
+        reports = []
     listed = "; ".join(f"{tid} ({st or 'done'}): {summ}" for tid, st, summ in reports[-5:])
-    if fresh and deltas < MAX_DELTAS:
+    if (fresh or reports) and rearms >= MAX_REARMS:
+        # Already re-armed once: another round would start the loop the user complained about. Call the
+        # clear off, but still have what came after written down (the summary stays the source of truth).
+        drop_flag()
+        snap = my_snapshot(hook) or "(the one you wrote; it is this session's entry in the save-clear status output)"
+        what = ("a message from the user: " + "; ".join('"' + " ".join(m[:300].split()) + '"' for m in fresh[-5:])
+                if fresh else f"background subagent result(s): {listed}")
+        log("stop", f"came after the save again ({'message' if fresh else 'subagent result'}), already re-armed "
+                    f"{rearms} time(s): automatic clear called off")
+        print(json.dumps({
+            "decision": "block",
+            "reason": (f"save-clear: {what} arrived after the save, and the automatic /clear was already put off "
+                       "once, so it is called off now (no loop). 1) If you have not answered or handled it, do it. "
+                       f"2) Add to the snapshot {snap}, in a section \"## After the save\", only what came after "
+                       "(the message or result, your answer, what changed, any open question). Do not re-arm. "
+                       "3) End the turn with one short line: the summary is saved and the clear waits until the "
+                       "user says \"save-clear\" (or types /clear)."),
+        }))
+        return
+
+    if fresh:
         snap = my_snapshot(hook) or "(the one you wrote; it is this session's entry in the save-clear status output)"
         quoted = "; ".join('"' + " ".join(m[:300].split()) + '"' for m in fresh[-5:])
         rearm = f"python3 \"{os.path.join(BIN, 'save-clear')}\" rearm {flag.get('session_id') or ''}".strip()
@@ -185,7 +213,7 @@ def main():
         }))
         return
 
-    if reports and int(flag.get("agent_rounds") or 0) < MAX_AGENT_ROUNDS:
+    if reports:
         snap = my_snapshot(hook) or "(the one you wrote; it is this session's entry in the save-clear status output)"
         rearm = f"python3 \"{os.path.join(BIN, 'save-clear')}\" rearm {flag.get('session_id') or ''} --subagents"
         log("stop", f"asked Claude to record {len(reports)} subagent result(s) that came after the save")
@@ -217,6 +245,19 @@ def main():
                            + stop_tasks_instruction("Now,", my_snapshot(hook) or "(the one you wrote)")
                            + " End the turn with one short line; the /clear follows."),
             }))
+            return
+
+    long_at = long_reply_chars()
+    if int(flag.get("deltas") or 0) and long_at:
+        # The turn that ends now answered a message sent after the save. A long answer is one the user is
+        # reading: wiping it now is what the user complained about. Call the clear off instead.
+        chars = reply_chars(tp)
+        if chars >= long_at:
+            drop_flag()
+            log("stop", f"the answer after the save is long ({chars} chars): automatic clear called off")
+            print(json.dumps({"systemMessage": (
+                "save-clear: not cleared - the last answer is long and you may still be reading it. The summary "
+                "is saved; say \"save-clear\" (or type /clear) when you are done.")}))
             return
 
     drop_flag()  # consumed: fires at most once; the helper re-arms when needed

@@ -2,6 +2,14 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.19.0 (2026-11-28)
+
+The automatic save-clear no longer wipes a reply you are still reading, and no longer loops. Why: in 4 sessions the clear came while the user was reading a long answer ("enquanto estou lendo o texto grande a sessão faz o save-clear"), jumped ahead of a message waiting in the queue ("nao faça o clear agora, prioridade na resposta do meu prompt"), re-armed 5 times in a row, and the 6-second "clear now?" question only showed up after the whole save.
+
+- Not right after a long reply, not ahead of a queued message. The context-limit hook (`hooks/context_cap.py`) does not ask for a save-clear while a message from you waits in Claude Code's queue (rebuilt from the transcript's `queue-operation` records, new `queued_user_messages`), nor right after a long reply (1500 characters or more of Claude's text since your last message, `SAVE_CLEAR_LONG_REPLY_CHARS`): it asks at the end of a shorter turn, at most 3 turns later. The Stop hook and the helper also count a message queued before the save. After a message round, a long answer calls the clear off instead of wiping it.
+- Re-armed at most once. The automatic `/clear` is re-armed at most once in all (`MAX_REARMS`), whatever the reason: the helper finding the session busy (it used to re-arm up to 5 times), a message after the save (up to 3 rounds before) or a subagent result (up to 20). The next time the clear is called off: the Stop hook blocks once so Claude records what came after under `## After the save`, without re-arming; `save-clear rearm` refuses a second re-arm the same way; the helper gives up and notifies.
+- "Clear now?" before the save. New `save-clear ask`, the skill's new step 0 in save-and-clear mode: in tmux it starts the 6-second helper and tells Claude to ask before anything is saved. "Wait" saves nothing and clears nothing; "go ahead" (or no answer) runs the save, and `arm-clear` does not ask again (a mark in `state/asked/`, valid 20 minutes). The context-limit request now points to step 0. Without step 0, `arm-clear` still asks after the save as in 0.18.
+
 ## 0.18.1 (2026-11-26)
 
 - `bin/save-clear-confirm` logs the moment the question shows up on the screen (seconds after the arm) and, when it goes ahead by itself, how long the question was on the screen. Why: a user felt the wait was shorter than the setting, and the log only had the arm time and the Enter time, so the real wait could not be measured.

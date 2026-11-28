@@ -35,7 +35,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from common import (BIN, FOLLOWUP_MSG, MARGIN_MS, ancestors, claude_bin, clear_key, draft_why,  # noqa: E402
+from common import (BIN, FOLLOWUP_MSG, MARGIN_MS, MAX_REARMS, ancestors, queued_user_messages, claude_bin, clear_key, draft_why,  # noqa: E402
                     log as _log, notify, now_ms, prompt_block, prompt_text, ps_parents, resume_msg,
                     run_hook_command, short, squash, subagent_reports_since, tmux_bin, turn_over, user_messages_since,
                     write_clear)
@@ -135,27 +135,34 @@ def refuse(why):
     sys.exit(3)
 
 
-def rearm(why, busy=False):
+def rearm(why, busy=False, count=True):
     """Write this session's flag back so the next Stop hook tries again. busy=True: the session stayed
-    busy (with kill_background_tasks on, the Stop hook then asks Claude to stop leftover background tasks)."""
+    busy (with kill_background_tasks on, the Stop hook then asks Claude to stop leftover background tasks).
+
+    At most MAX_REARMS (1) re-arm in all: past that it gives up, with no loop. count=False: a message or a
+    subagent result came after the save; the round is counted when Claude runs `save-clear rearm` (or the Stop
+    hook calls the clear off), not twice. True = re-armed."""
     try:
         flag = json.loads(flag_json)
     except Exception:
         flag = {}
     if not flag:
         log(f"not re-armed ({why}): empty flag")
-        return
+        return False
     flag["armed_at"] = now_ms()
-    flag["rearms"] = flag.get("rearms", 0) + 1
-    if flag["rearms"] > 5:
-        log(f"gave up ({why}): already re-armed 5 times")
-        notify(f"save-clear: gave up on the automatic /clear ({why}). Type /clear by hand.")
-        return
+    if count:
+        flag["rearms"] = int(flag.get("rearms") or 0) + 1
+        if flag["rearms"] > MAX_REARMS:
+            log(f"gave up ({why}): already re-armed {MAX_REARMS} time(s); no loop")
+            notify(f"save-clear: gave up on the automatic /clear ({why}). The summary is saved; "
+                   "say save-clear or type /clear when you want.")
+            return False
     flag["key"] = flag.get("key") or (clear_key(job=target) if mode == "bg" else clear_key(flag.get("session_id") or sid))
     if busy:
         flag["busy_rearm"] = True
     write_clear(flag)  # this session's own request file only
     log(f"re-armed ({why}); the next end of turn tries again")
+    return True
 
 
 def pre_clear():
@@ -172,7 +179,8 @@ def new_messages():
         since = json.loads(flag_json).get("ts", 0) - MARGIN_MS
     except Exception:
         return []
-    return user_messages_since(transcript, since)
+    msgs = user_messages_since(transcript, since)
+    return msgs + [m for m in queued_user_messages(transcript) if m not in msgs]  # waiting in the queue
 
 
 def new_reports():
@@ -240,7 +248,7 @@ def bg_type(s, before):
         return 0
     msgs = new_messages()
     if msgs:
-        rearm(f"new message after the save ({msgs[-1][:40]!r}); typed nothing")
+        rearm(f"new message after the save ({msgs[-1][:40]!r}); typed nothing", count=False)
         notify("save-clear: a message arrived after the save, so the session was not cleared.")
         return 0
     pre_clear()
@@ -254,7 +262,7 @@ def bg_type(s, before):
     msgs = new_messages()  # a message can arrive during the pause between typing and Enter
     if msgs:
         sh([TMUX, "send-keys", "-t", s, *["BSpace"] * len("/clear")])
-        rearm(f"new message while /clear was in the prompt ({msgs[-1][:40]!r}); Enter not sent")
+        rearm(f"new message while /clear was in the prompt ({msgs[-1][:40]!r}); Enter not sent", count=False)
         notify("save-clear: a message arrived after the save, so the session was not cleared.")
         return 0
     sh([TMUX, "send-keys", "-t", s, "Enter"])
@@ -306,7 +314,7 @@ def run_bg():
     log(f"job state: {st}")
     msgs = new_messages()
     if msgs:
-        rearm(f"new message after the save ({msgs[-1][:40]!r}); typed nothing")
+        rearm(f"new message after the save ({msgs[-1][:40]!r}); typed nothing", count=False)
         notify("save-clear: a message arrived after the save, so the session was not cleared.")
         return 0
     before = conversation(job_state())
@@ -404,7 +412,7 @@ def press_enter(text):
         msgs = new_messages()  # a message can arrive during the pause between typing and Enter
         if msgs:
             keys(*["BSpace"] * len(text))  # the prompt holds exactly our text (just checked): erase it
-            rearm(f"new message while /clear was in the prompt ({msgs[-1][:40]!r}); Enter not sent")
+            rearm(f"new message while /clear was in the prompt ({msgs[-1][:40]!r}); Enter not sent", count=False)
             notify("save-clear: a message arrived after the save, so the session was not cleared.")
             sys.exit(0)
     keys("Enter")
@@ -470,11 +478,11 @@ def stop_if_new(step):
     if not msgs and not reports:
         return
     if msgs:
-        rearm(f"{step}: new message after the save ({msgs[-1][:40]!r})")
+        armed = rearm(f"{step}: new message after the save ({msgs[-1][:40]!r})", count=False)
     else:
-        rearm(f"{step}: subagent result after the save ({reports[-1][0]})")
+        armed = rearm(f"{step}: subagent result after the save ({reports[-1][0]})", count=False)
     ok, _ = free()
-    if ok:
+    if armed and ok:
         text = trigger() if msgs else trigger_reports(reports)
         keys("-l", text)
         time.sleep(1)

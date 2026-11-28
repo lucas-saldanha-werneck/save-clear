@@ -2393,7 +2393,7 @@ class Subagents(Base):
     def test_stop_tasks_instruction_never_includes_subagents(self):
         self.assertIn("Never stop a subagent", self.common("common.stop_tasks_instruction('Now,')"))
 
-    def run_helper(self, *entries):
+    def run_helper(self, *entries, **flag_extra):
         fake = os.path.join(self.t, "fake_claude.sh")
         with open(fake, "w") as f:
             f.write("#!/bin/sh\necho '" + json.dumps([{"kind": "interactive", "pid": self.PANE_PID, "sessionId": SID_A,
@@ -2402,6 +2402,7 @@ class Subagents(Base):
         tp = self.transcript(*entries)
         flag = {"session_id": SID_A, "mode": "tmux", "target": "%7", "key": SID_A,
                 "ts": int(time.time() * 1000) - 60000}
+        flag.update(flag_extra)
         r = self.run_py("bin/save-clear-send", ["tmux", "%7", SID_A, json.dumps(flag), tp], SAVE_CLEAR_CLAUDE=fake,
                         FAKE_TMUX_PANES=f"{self.PANE_PID} %7", SAVE_CLEAR_START_DELAY="0", SAVE_CLEAR_MAX_WAIT="30",
                         SAVE_CLEAR_DRY_RUN="1")
@@ -2490,6 +2491,15 @@ class Subagents(Base):
         self.assertNotIn("would type", log)
         self.assertIn("re-armed (the session went back to work", log)
         self.assertTrue(self.read_flag().get("busy_rearm"))
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_helper_re_arms_only_once(self):
+        # 0.19.0: the second time the session is found busy, the helper gives up (it used to re-arm 5 times).
+        log = self.run_helper({"type": "user", "timestamp": iso(-120), "message": {"role": "user", "content": "go"}},
+                              rearms=1)
+        self.assertIn("gave up (the session went back to work", log)
+        self.assertIn("no loop", log)
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "not re-armed a second time")
 
     def test_stop_hook_asks_to_record_a_result_after_the_save(self):
         self.write_flag(busy_rearm=True)
@@ -3873,6 +3883,221 @@ class ConfirmHelper(Base):
         self.done(new)
         self.assertEqual(self.enters(), 1, "one Enter, from the newer helper")
         self.assertIn("a newer helper watches this pane", self.logged())
+
+
+def text_reply(text, offset_s=0):
+    return {"type": "assistant", "timestamp": iso(offset_s), "message": {"role": "assistant", "content": [
+        {"type": "text", "text": text}]}}
+
+
+def human(text, offset_s=0):
+    return {"type": "user", "timestamp": iso(offset_s), "message": {"role": "user", "content": text}}
+
+
+class NotWhileReading(Base):
+    """0.19.0 (review item S04): the automatic save-clear no longer wipes a reply the user is reading, no
+    longer jumps ahead of a queued message, re-arms at most once, and asks "clear now?" before the save."""
+
+    def transcript(self, *rows, tokens=160000):
+        p = os.path.join(self.proj, "t.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"type": "assistant", "timestamp": iso(-600), "message": {"usage": {
+                "input_tokens": 10, "cache_read_input_tokens": tokens - 10}}}) + "\n")
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        return p
+
+    def cap(self, tp, **env):
+        return self.run_py("hooks/context_cap.py", stdin={"session_id": SID_A, "transcript_path": tp},
+                           CLAUDE_CODE_ENTRYPOINT="cli", **env)
+
+    def write_flag(self, **extra):
+        os.makedirs(self.flag_path("clear"), exist_ok=True)
+        f = {"session_id": SID_A, "mode": "manual-test", "target": "", "key": SID_A,
+             "ts": int(time.time() * 1000) - 5000}
+        f.update(extra)
+        with open(self.flag_path(f"clear/{SID_A}.json"), "w") as fh:
+            json.dump(f, fh)
+
+    def stop(self, tp, **env):
+        return self.run_py("hooks/stop.py", stdin={"session_id": SID_A, "transcript_path": tp}, **env)
+
+    def common(self, expr, tp):
+        code = (f"import sys; sys.path.insert(0, {os.path.join(ROOT, 'lib')!r}); import common; "
+                f"print(repr({expr}))")
+        r = subprocess.run([PY, "-c", code], capture_output=True, text=True, encoding="utf-8",
+                           env=dict(self.env, TP=tp), cwd=self.proj, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return ast.literal_eval(r.stdout.strip())
+
+    # ----- 1) not right after a long reply, not while a message waits in the queue -----
+
+    def test_queue_is_rebuilt_from_the_queue_records(self):
+        q = lambda c, op="enqueue", **kw: dict({"type": "queue-operation", "operation": op, "timestamp": iso(),
+                                               "content": c}, **kw)
+        tp = self.transcript(q("first"), {"type": "queue-operation", "operation": "dequeue", "timestamp": iso()},
+                             q("<task-notification>x</task-notification>"), q("second"), q("third"),
+                             q("third", "remove", reason="absorbed_mid_turn"))
+        self.assertEqual(self.common("common.queued_user_messages(__import__('os').environ['TP'])", tp), ["second"])
+        tp = self.transcript(q("first"), {"type": "queue-operation", "operation": "popAll", "timestamp": iso()})
+        self.assertEqual(self.common("common.queued_user_messages(__import__('os').environ['TP'])", tp), [])
+
+    def test_reply_chars_count_only_since_the_users_last_message(self):
+        tp = self.transcript(human("old", -50), text_reply("x" * 5000, -40), human("new", -30),
+                             text_reply("y" * 700, -20), {"type": "user", "timestamp": iso(-10), "message": {
+                                 "content": [{"type": "tool_result", "content": "z" * 9000}]}},
+                             text_reply("w" * 300, -5))
+        self.assertEqual(self.common("common.reply_chars(__import__('os').environ['TP'])", tp), 1000)
+
+    def test_cap_does_not_ask_while_a_message_waits_in_the_queue(self):
+        tp = self.transcript(human("go", -60), text_reply("done", -50),
+                             {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(-5),
+                              "content": "and one more thing"})
+        self.assertEqual(self.cap(tp).stdout, "", "answering the queued message comes first")
+        with open(tp, "a") as f:
+            f.write(json.dumps({"type": "queue-operation", "operation": "dequeue", "timestamp": iso()}) + "\n")
+        self.assertIn('"block"', self.cap(tp).stdout, "asked once the queue is empty")
+
+    def test_cap_waits_after_a_long_reply_at_most_3_turns(self):
+        tp = self.transcript(human("explain it all", -60), text_reply("long " * 400, -50))
+        for i in range(3):
+            self.assertEqual(self.cap(tp).stdout, "", f"long reply {i + 1}: the user is reading")
+        self.assertIn('"block"', self.cap(tp).stdout, "the 4th long turn in a row asks anyway")
+        with open(self.flag_path("save-clear.log")) as f:
+            self.assertIn("this reply is long", f.read())
+
+    def test_cap_asks_after_a_short_reply(self):
+        tp = self.transcript(human("explain it all", -60), text_reply("long " * 400, -50))
+        self.assertEqual(self.cap(tp).stdout, "")
+        tp = self.transcript(human("ok, thanks", -10), text_reply("You are welcome.", -5))
+        out = json.loads(self.cap(tp).stdout)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn('save-clear" ask`', out["reason"], "step 0 asks first")
+        self.assertFalse(os.path.exists(self.flag_path(f"cap/{SID_A}.defer")), "the wait count starts over")
+
+    def test_long_reply_threshold_can_change(self):
+        tp = self.transcript(human("hi", -60), text_reply("x" * 400, -50))
+        self.assertIn('"block"', self.cap(tp).stdout)
+        os.unlink(self.flag_path(f"cap/{SID_A}.json"))
+        self.assertEqual(self.cap(tp, SAVE_CLEAR_LONG_REPLY_CHARS="300").stdout, "")
+
+    def test_stop_hook_counts_a_message_queued_before_the_save(self):
+        tp = self.transcript({"type": "queue-operation", "operation": "enqueue", "timestamp": iso(-120),
+                              "content": "do not clear yet, answer this first"})
+        self.write_flag()
+        out = json.loads(self.stop(tp).stdout)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("answer this first", out["reason"])
+
+    def test_long_answer_after_the_save_is_not_wiped(self):
+        self.write_flag(deltas=1, rearms=1)
+        tp = self.transcript(human("one more thing", -60), text_reply("detail " * 400, -30))
+        r = self.stop(tp)
+        self.assertNotIn('"block"', r.stdout)
+        self.assertIn("not cleared - the last answer is long", r.stdout)
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "called off, not started")
+
+    def test_short_answer_after_the_save_clears(self):
+        self.write_flag(deltas=1, rearms=1)
+        tp = self.transcript(human("one more thing", -60), text_reply("Done.", -30))
+        self.assertIn("automatic /clear as soon as the session is free", self.stop(tp).stdout)
+
+    # ----- 2) re-armed at most once -----
+
+    def test_rearm_works_once_then_calls_the_clear_off(self):
+        self.write_flag()
+        r = self.run_py("bin/save-clear", ["rearm", SID_A])
+        self.assertIn("round 1", r.stdout)
+        with open(self.flag_path(f"clear/{SID_A}.json")) as f:
+            self.assertEqual(json.load(f)["rearms"], 1)
+        r = self.run_py("bin/save-clear", ["rearm", SID_A, "--subagents"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("not re-armed", r.stdout)
+        self.assertIn("no loop", r.stdout)
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+
+    def test_second_message_after_the_save_is_recorded_without_re_arming(self):
+        self.write_flag(rearms=1, deltas=1)
+        tp = self.transcript(human("and also this", 1))
+        out = json.loads(self.stop(tp).stdout)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("and also this", out["reason"])
+        self.assertIn("## After the save", out["reason"])
+        self.assertIn("Do not re-arm", out["reason"])
+        self.assertNotIn(" rearm ", out["reason"])
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "called off: no loop")
+        self.assertEqual(self.stop(tp).stdout.strip(), "", "nothing left to block on the next stop")
+
+    def test_subagent_result_after_a_re_arm_is_recorded_without_re_arming(self):
+        self.write_flag(rearms=1)
+        tp = self.transcript(notification("a456", 'Agent "fix the bug" completed'))
+        out = json.loads(self.stop(tp).stdout)
+        self.assertIn("a456", out["reason"])
+        self.assertIn("Do not re-arm", out["reason"])
+        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+
+    # ----- 3) "clear now?" before the save -----
+
+    def ask(self, **env):
+        """`save-clear ask` in a tmux pane whose check passes; the helper start is only recorded."""
+        code = LOAD + (
+            "m = load('bin/save-clear')\n"
+            "m.check = lambda *a: (0, 'ok: target runs this session')\n"
+            "started, real = [], m.subprocess.Popen\n"
+            "def popen(cmd, *a, **kw):\n"
+            "    if any('save-clear-confirm' in str(c) for c in cmd):\n"
+            "        return started.append(cmd)\n"
+            "    return real(cmd, *a, **kw)\n"
+            "m.subprocess.Popen = popen\n"
+            "rc = m.main(json.loads(sys.argv[2]))\n"
+            "print('STARTED=' + json.dumps(started))\n"
+            "sys.exit(rc)\n")
+        e = dict(self.env, CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli", TMUX_PANE="%7")
+        e.update({k: str(v) for k, v in env.items()})
+        out = {}
+        for cmd in (["ask"], ["arm-clear"]):
+            r = subprocess.run([PY, "-c", code, ROOT, json.dumps(cmd)], capture_output=True, text=True,
+                               encoding="utf-8", env=e, cwd=self.proj, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            out[cmd[0]] = (r.stdout.split("STARTED=")[0], json.loads(r.stdout.split("STARTED=")[-1]))
+        return out
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_ask_comes_before_the_save_and_arm_clear_does_not_ask_again(self):
+        out = self.ask()
+        text, started = out["ask"]
+        line = next(ln for ln in text.splitlines() if ln.startswith("ask:"))
+        self.assertIn("Before saving anything", line)
+        self.assertIn('header exactly "save-clear"', line)
+        self.assertIn("save nothing and clear nothing", line)
+        [cmd] = started
+        self.assertEqual((os.path.basename(cmd[1]), cmd[2:]), ("save-clear-confirm", ["%7", "6"]))
+        text, started = out["arm-clear"]
+        self.assertIn("mode=tmux", text)
+        self.assertNotIn("confirm:", text, "asked once, before the save")
+        self.assertIn("end the turn now", text)
+        self.assertEqual(started, [], "no second helper")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "asked", SID_A + ".json")), "mark used up")
+
+    @unittest.skipIf(NO_TMUX, NO_TMUX_WHY)
+    def test_ask_with_the_question_off_goes_straight_to_the_save(self):
+        out = self.ask(SAVE_CLEAR_CONFIRM_SECONDS="0")
+        self.assertIn("no question here (confirm_seconds is 0)", out["ask"][0])
+        self.assertEqual(out["ask"][1], [])
+
+    def test_ask_outside_tmux_or_in_the_app_asks_nothing(self):
+        r = self.run_py("bin/save-clear", ["ask"], CLAUDE_CODE_SESSION_ID=SID_A, CLAUDE_CODE_ENTRYPOINT="cli")
+        self.assertIn("no question here (not in a tmux pane)", r.stdout)
+        r = self.run_py("bin/save-clear", ["ask"], CLAUDE_CODE_SESSION_ID=SID_A,
+                        CLAUDE_CODE_ENTRYPOINT="claude-desktop", TMUX_PANE="%3")
+        self.assertIn("no question here", r.stdout, "an inherited pane that the check cannot prove asks nothing")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "asked")))
+
+    def test_cap_and_skill_point_to_step_0(self):
+        with open(os.path.join(ROOT, "skills", "save-clear", "SKILL.md"), encoding="utf-8") as f:
+            skill = f.read()
+        self.assertIn("0. **Save-and-clear mode only: ask first.**", skill)
+        self.assertIn("save-clear ask", skill)
 
 
 if __name__ == "__main__":
