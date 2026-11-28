@@ -220,10 +220,10 @@ How the `/clear` happens:
 If you send a message after the save, the Stop hook does not clear. It asks Claude to answer it, add
 it to the summary under `## After the save`, and run `save-clear rearm <session id>`. A message still
 waiting in the queue counts too, even one queued before the save. The request is re-armed at most
-once in all (for a message, a subagent result or a busy session): the next time, the clear is called
+once in all (for a message or a busy session; subagent results are outside this rule since 0.20.0): the next time, the clear is called
 off with no loop. Claude still writes what came after into the summary, does not re-arm, and says the
 clear waits for your word ("save-clear", or `/clear`). The clear is also called off when the answer to
-a message sent after the save is long (1500 characters or more, `SAVE_CLEAR_LONG_REPLY_CHARS`): you
+a message sent after the save is long (800 characters or more, `SAVE_CLEAR_LONG_REPLY_CHARS`): you
 are probably reading it. The helper checks for new messages
 again right before it presses Enter on `/clear`; if one arrived, it erases the `/clear` it typed,
 does not press Enter, and re-arms the request for the next end of turn.
@@ -232,11 +232,11 @@ In the desktop app, a PreToolUse hook holds the first `clear_session` call the s
 A second Stop hook watches the context size. When Claude ends a turn and the last reply used more
 than `context_cap_tokens` (input plus cache tokens, subagents not counted), it blocks the stop once
 and asks Claude to run save-clear in "save and clear" mode. It never acts in the middle of a task.
-It asks again only after the context grows another 50k tokens, or after the context drops below the
+It asks again only after the context grows another 25k tokens, or after the context drops below the
 limit (for example after a compaction) and crosses it again. It skips `claude -p` and SDK sessions,
 a session that already armed its `/clear` or armed a resume in the last 15 minutes, and the desktop
 app relay session. It also waits while a message from you sits in the queue (answering it comes
-first), and right after a long reply (1500 characters or more of Claude's text since your last
+first), and right after a long reply (800 characters or more of Claude's text since your last
 message; you are probably reading it): it asks at the end of a shorter turn, at most 3 turns later.
 
 ### Ask before the clear
@@ -360,8 +360,8 @@ were stopped mid-work and their results lost. Now:
   that results will arrive as notifications and to act on each one by that section.
 - A subagent result that reaches the old conversation after the save but before the `/clear` blocks
   the Stop hook once: Claude records it under `## After the save` and runs
-  `save-clear rearm <session id> --subagents`. This counts toward the single re-arm, like your own
-  messages: a second result after that calls the clear off.
+  `save-clear rearm <session id> --subagents`. Since 0.20.0 this does not count toward the single re-arm
+  (that rule is for your messages and a busy session): subagent rounds have their own limit of 20.
 - The stop-tasks instruction (`kill_background_tasks`) says never to stop a subagent.
 - A subagent's permission prompt (or any open dialog) makes `claude agents` say `waiting`. The helper
   never types then (keys would answer the dialog); it waits until the prompt is answered, then clears.

@@ -1334,8 +1334,8 @@ class ContextCap(Base):
         self.assertEqual(out["decision"], "block")
         self.assertIn("160k", out["reason"])
         self.assertIn("limit 150k", out["reason"])
-        self.assertEqual(self.cap(170000).stdout, "", "no second ask until +50k")
-        self.assertIn('"block"', self.cap(211000).stdout, "asks again after +50k")
+        self.assertEqual(self.cap(170000).stdout, "", "no second ask until +25k")
+        self.assertIn('"block"', self.cap(186000).stdout, "asks again after +25k")
 
     def test_user_can_change_or_turn_off_the_limit(self):
         self.assertIn("limit 300k", self.cap(310000, SAVE_CLEAR_CAP_TOKENS="300000").stdout)
@@ -4010,11 +4010,26 @@ class NotWhileReading(Base):
         self.assertIn("round 1", r.stdout)
         with open(self.flag_path(f"clear/{SID_A}.json")) as f:
             self.assertEqual(json.load(f)["rearms"], 1)
-        r = self.run_py("bin/save-clear", ["rearm", SID_A, "--subagents"])
+        r = self.run_py("bin/save-clear", ["rearm", SID_A])
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("not re-armed", r.stdout)
         self.assertIn("no loop", r.stdout)
         self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+
+    def test_subagent_rearm_is_outside_the_single_rearm(self):
+        # 0.20.0: a subagent result neither uses up nor is refused by the single re-arm.
+        self.write_flag(rearms=1)
+        r = self.run_py("bin/save-clear", ["rearm", SID_A, "--subagents"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("re-armed", r.stdout)
+        self.assertNotIn("not re-armed", r.stdout)
+        with open(self.flag_path(f"clear/{SID_A}.json")) as fh:
+            f = json.load(fh)
+        self.assertEqual((f.get("rearms"), f.get("agent_rounds")), (1, 1))
+        self.write_flag()
+        self.run_py("bin/save-clear", ["rearm", SID_A, "--subagents"])
+        with open(self.flag_path(f"clear/{SID_A}.json")) as fh:
+            self.assertEqual(json.load(fh).get("rearms", 0), 0, "not counted")
 
     def test_second_message_after_the_save_is_recorded_without_re_arming(self):
         self.write_flag(rearms=1, deltas=1)
@@ -4028,13 +4043,21 @@ class NotWhileReading(Base):
         self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "called off: no loop")
         self.assertEqual(self.stop(tp).stdout.strip(), "", "nothing left to block on the next stop")
 
-    def test_subagent_result_after_a_re_arm_is_recorded_without_re_arming(self):
+    def test_subagent_result_after_a_re_arm_still_re_arms(self):
+        # 0.20.0: subagents are outside the single re-arm.
         self.write_flag(rearms=1)
         tp = self.transcript(notification("a456", 'Agent "fix the bug" completed'))
         out = json.loads(self.stop(tp).stdout)
         self.assertIn("a456", out["reason"])
-        self.assertIn("Do not re-arm", out["reason"])
-        self.assertFalse(os.path.exists(self.flag_path(f"clear/{SID_A}.json")))
+        self.assertIn(f"rearm {SID_A} --subagents", out["reason"])
+        self.assertNotIn("Do not re-arm", out["reason"])
+        self.assertTrue(os.path.exists(self.flag_path(f"clear/{SID_A}.json")), "flag kept")
+
+    def test_long_reply_default_is_800_characters(self):
+        tp = self.transcript(human("hi", -60), text_reply("x" * 900, -50))
+        self.assertEqual(self.cap(tp).stdout, "", "900 chars: the user is reading")
+        tp = self.transcript(human("hi", -60), text_reply("x" * 700, -50))
+        self.assertIn('"block"', self.cap(tp).stdout, "700 chars: short enough")
 
     # ----- 3) "clear now?" before the save -----
 

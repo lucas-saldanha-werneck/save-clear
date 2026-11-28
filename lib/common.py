@@ -188,7 +188,7 @@ MAX_REARMS = 1
 # A reply at least this long (characters of Claude's text since the user's last message) is one the user is
 # probably still reading: the context limit does not ask for a save-clear right after it, and a re-armed
 # clear does not wipe it.
-LONG_REPLY_DEFAULT = 1500
+LONG_REPLY_DEFAULT = 800
 
 
 def ensure_state():

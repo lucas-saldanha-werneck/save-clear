@@ -408,7 +408,8 @@ def cmd_rearm(args):
     if not flag:
         print(f"save-clear: no /clear request of this session to re-arm (session {sid[:8] or '?'})", file=sys.stderr)
         return 1
-    if int(flag.get("rearms") or 0) >= MAX_REARMS:
+    subagents = "--subagents" in args  # a subagent result is outside the single re-arm (own limit in the Stop hook)
+    if not subagents and int(flag.get("rearms") or 0) >= MAX_REARMS:
         # One re-arm already: another would be the loop the user complained about. Call the clear off.
         key = flag.get("key") or (clear_key(job=job) if job and flag.get("mode") == "bg" else clear_key(sid))
         try:
@@ -422,8 +423,8 @@ def cmd_rearm(args):
               "summary is saved and the clear waits until the user says \"save-clear\" (or types /clear).")
         return 0
     flag["ts"] = flag["armed_at"] = now_ms()
-    flag["rearms"] = int(flag.get("rearms") or 0) + 1
-    subagents = "--subagents" in args
+    if not subagents:
+        flag["rearms"] = int(flag.get("rearms") or 0) + 1
     counter = "agent_rounds" if subagents else "deltas"  # subagent results do not use up the user's 3 rounds
     flag[counter] = flag.get(counter, 0) + 1
     # This round was the user's message (or a subagent's result), which is what kept the session busy:

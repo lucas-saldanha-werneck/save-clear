@@ -8,7 +8,7 @@ It does nothing when:
 - this session already armed its automatic /clear (by session id, or by job for `claude --bg`), or it
   armed a resume in the last 15 minutes (the other Stop hook, stop.py, may have just consumed the
   /clear request while both hooks run in parallel), or it is the desktop app relay session;
-- it already asked in this session and the context has not grown 50k tokens since. When the context
+- it already asked in this session and the context has not grown 25k tokens since. When the context
   drops below the limit again (a compaction), the next crossing asks again;
 - a message from the user is waiting in the queue: answering it comes first (the next end of turn asks);
 - this turn's reply is long (the user is probably still reading it): it waits for a shorter turn, at most
@@ -28,7 +28,7 @@ from common import (BIN, STATE, clear_key, clear_path, log, long_reply_chars, no
                     read_hook_input, read_json, reply_chars, setting, tail_lines, write_json)
 
 DEFAULT_CAP = 150000
-REPEAT_AFTER = 50000
+REPEAT_AFTER = 25000
 RECENT_SAVE_MS = 15 * 60 * 1000
 MARK_MAX_AGE_S = 7 * 24 * 3600
 CAP_DIR = os.path.join(STATE, "cap")
