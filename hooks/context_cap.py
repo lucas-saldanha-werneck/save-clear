@@ -9,7 +9,12 @@ It does nothing when:
   armed a resume in the last 15 minutes (the other Stop hook, stop.py, may have just consumed the
   /clear request while both hooks run in parallel), or it is the desktop app relay session;
 - it already asked in this session and the context has not grown 50k tokens since. When the context
-  drops below the limit again (a compaction), the next crossing asks again.
+  drops below the limit again (a compaction), the next crossing asks again;
+- a message from the user is waiting in the queue: answering it comes first (the next end of turn asks);
+- this turn's reply is long (the user is probably still reading it): it waits for a shorter turn, at most
+  3 turns in a row, then asks anyway.
+When it asks, Claude starts with `save-clear ask`: in a tmux terminal the "clear now?" question comes
+BEFORE the save, so "wait" keeps the screen as it is and nothing is saved or cleared.
 """
 import json
 import os
@@ -19,14 +24,15 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (STATE, clear_key, clear_path, log, now_ms, read_hook_input, read_json, setting,  # noqa: E402
-                    tail_lines, write_json)
+from common import (BIN, STATE, clear_key, clear_path, log, long_reply_chars, now_ms, queued_user_messages,  # noqa: E402
+                    read_hook_input, read_json, reply_chars, setting, tail_lines, write_json)
 
 DEFAULT_CAP = 150000
 REPEAT_AFTER = 50000
 RECENT_SAVE_MS = 15 * 60 * 1000
 MARK_MAX_AGE_S = 7 * 24 * 3600
 CAP_DIR = os.path.join(STATE, "cap")
+MAX_DEFERS = 3  # long replies in a row the ask waits for
 
 
 def cap_tokens():
@@ -107,27 +113,48 @@ def main():
     ctx = last_context(tp)
     mark = os.path.join(CAP_DIR, re.sub(r"[^A-Za-z0-9_-]", "", sid)[:120] + ".json")
     if ctx < cap:
-        if ctx and os.path.exists(mark):  # back under the limit (compaction): the next crossing asks again
-            try:
-                os.unlink(mark)
-            except OSError:
-                pass
+        if ctx:  # back under the limit (compaction): the next crossing asks again
+            for p in (mark, mark[:-len(".json")] + ".defer"):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
         return
     prev = read_json(mark)
     prev = int(prev.get("ctx") or 0) if isinstance(prev, dict) else 0
     if prev and ctx < prev + REPEAT_AFTER:
         return
+    if queued_user_messages(tp):
+        log("cap", f"session {sid[:8]} at {ctx} tokens: a message from the user is waiting in the queue; "
+                   "not asking now")
+        return
     os.makedirs(CAP_DIR, exist_ok=True)
+    defer = mark[:-len(".json")] + ".defer"
+    chars, long_at = reply_chars(tp), long_reply_chars()
+    deferred = read_json(defer)
+    deferred = int(deferred.get("n") or 0) if isinstance(deferred, dict) else 0
+    if long_at and chars >= long_at and deferred < MAX_DEFERS:
+        write_json(defer, {"n": deferred + 1})
+        log("cap", f"session {sid[:8]} at {ctx} tokens: this reply is long ({chars} chars), the user may be "
+                   f"reading it; not asking now ({deferred + 1} of {MAX_DEFERS})")
+        return
+    try:
+        os.unlink(defer)
+    except OSError:
+        pass
     prune_marks()
     write_json(mark, {"ctx": ctx, "cap": cap})
     log("cap", f"session {sid[:8]} at {ctx} tokens (limit {cap}): asked for save-clear")
+    ask = f"python3 \"{os.path.join(BIN, 'save-clear')}\" ask"
     print(json.dumps({
         "decision": "block",
         "reason": (f"save-clear: the context is at {round(ctx / 1000)}k tokens (limit {round(cap / 1000)}k) "
                    "and this turn's task is done. Run the save-clear skill now in \"save and clear\" mode "
-                   "(memory + snapshot with findings, plan, files changed and next step; arm the resume and "
-                   "the automatic /clear). If you ended the turn with a question to the user, put that "
-                   "question in the snapshot's next steps. Do not start new work first."),
+                   f"(memory + snapshot with findings, plan, files changed and next step; arm the resume and "
+                   f"the automatic /clear). Start with its step 0: run `{ask}` and do what it prints (it may "
+                   "ask the user \"clear now?\" first; on \"wait\", save nothing). If you ended the turn with "
+                   "a question to the user, put that question in the snapshot's next steps. Do not start new "
+                   "work first."),
     }))
 
 

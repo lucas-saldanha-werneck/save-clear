@@ -19,13 +19,14 @@ after /clear) must not rediscover anything.
 
 Two modes:
 - **"save" / "checkpoint"**: steps 1–7. The user types /clear.
-- **"save and clear" / "save-clear" / "salvalimpa" / "wrap up the session"**: steps 1–8. The /clear
+- **"save and clear" / "save-clear" / "salvalimpa" / "wrap up the session"**: steps 0–8. The /clear
   happens by itself when possible.
 
 The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (written `save-clear` from here on).
 
 ## Instructions
 
+0. In "save and clear" mode, run `save-clear ask` first: it may ask the user "clear now?" before anything is saved.
 1. List what must survive the session (decisions, verified state, next steps, open items).
 2. Update the project's persistent memory, then write the snapshot with `save-clear dir`.
 3. Verify the files on disk, then arm the auto-resume with the command in step 6.
@@ -34,6 +35,17 @@ The command used below is `python3 "${CLAUDE_PLUGIN_ROOT}/bin/save-clear"` (writ
 The numbered steps below are the full procedure.
 
 ## Steps
+
+0. **Save-and-clear mode only: ask first.** Before anything else, run `save-clear ask`.
+   - If it prints `save-clear: no question here (...)`, go on with step 1.
+   - If it prints a line starting with `ask:`, do exactly what that line says, at once and with no text
+     before the question: AskUserQuestion with the header it gives ("clear now?", two options: go ahead /
+     wait, I am still reading). A helper answers "go ahead" by itself after the wait (6 s by default). On
+     "go ahead", go on with step 1; `arm-clear` (step 8) will not ask again. On any other answer, save
+     nothing and clear nothing: end the turn with one line saying the save-and-clear waits until the user
+     asks for it.
+   The question comes before the save, so a user still reading the last reply loses nothing by answering
+   "wait", and the screen stays as it is while they decide.
 
 1. **List what must survive.** Go through the session: decisions (with the why), state that was
    actually **verified** (not what was planned), next steps, open items, paths/commands/IDs that were
@@ -137,8 +149,9 @@ The numbered steps below are the full procedure.
      nothing else after it. The Stop hook starts a helper that types `/clear` and then the resume
      request. It types only into an idle session with an empty prompt, checks again right before
      each Enter, and types the resume request only after it confirmed the clear took.
-     **If it printed a line starting with `confirm:`**, the user wants to be asked first (they may
-     still be reading): do exactly what that line says before ending the turn. Ask the question with
+     **If it printed a line starting with `confirm:`** (only when step 0 did not ask: `ask` was skipped,
+     or the mark expired), the user wants to be asked first (they may still be reading): do exactly
+     what that line says before ending the turn. Ask the question with
      AskUserQuestion at once, with no text before it and the header it gives; a helper answers "go
      ahead" by itself after the wait. On "go ahead", end the turn with the step 7 reply. On any other
      answer run the `disarm` command it gives and reply that the summary is saved and the clear waits
@@ -218,12 +231,26 @@ The numbered steps below are the full procedure.
    subagents) and list them in the snapshot. Do only that, end the turn with one short line, and the
    /clear follows.
 
+   **When the automatic /clear does not happen right away.** It is never put off in a loop: the request
+   is re-armed at most once in all (a message or a subagent result after the save, or the helper finding
+   the session busy). The next time, the clear is called off: the Stop hook (or `save-clear rearm`, which
+   then refuses) asks you to record what came after under `## After the save` without re-arming, and you
+   end the turn with one line saying the summary is saved and the clear waits for the user's word. Also
+   called off: when the answer to a message sent after the save is long (1500 characters or more), since
+   the user is probably reading it.
+
+   **The context limit (automatic).** At the end of a turn past `context_cap_tokens`, a Stop hook asks
+   for a save-clear, but not while a message from the user waits in the queue (answering it comes
+   first), and not right after a long reply (1500 characters or more since the user's last message: the
+   user is probably reading it; it waits for a shorter turn, at most 3 turns in a row). Then step 0 asks
+   "clear now?" before the save.
+
    **A user message during the save.** If one arrives while you save, answer it and put it in the
    snapshot before step 8, in the section `## Answers given during the save`: the full text of the
    message and your answer (short, but readable alone). Not only as an item of "Last topic": the next
    session shows this section first, because the /clear wipes your answer from the screen. If it arrives after step 8, the Stop hook does not clear: it blocks and asks
    for three things: (1) answer it; (2) add to the snapshot a section `## After the save` with only what
-   came after; (3) run the `save-clear rearm <session id>` command it gives. In the desktop app the clear-guard hook holds the first
+   came after; (3) run the `save-clear rearm <session id>` command it gives (once; see above). In the desktop app the clear-guard hook holds the first
    `clear_session` call the same way; answer, add the section, and call `clear_session` again in the
    same turn (the second call goes through).
 

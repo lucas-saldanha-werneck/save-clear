@@ -182,6 +182,13 @@ NOT_HUMAN = re.compile(r"^(" + SYSTEM_TAG + r"|Stop hook feedback|Base directory
                        r"save-clear \(automatic|\[Request interrupted|Caveat:|"
                        r"This session is being continued from a previous conversation)")
 MARGIN_MS = 15000  # a message delivered just before the flag may not be in the snapshot
+# The automatic /clear is re-armed at most this many times in all (the helper found the session busy, a
+# message or a subagent result came after the save...). After that it gives up and the user clears by word.
+MAX_REARMS = 1
+# A reply at least this long (characters of Claude's text since the user's last message) is one the user is
+# probably still reading: the context limit does not ask for a save-clear right after it, and a re-armed
+# clear does not wipe it.
+LONG_REPLY_DEFAULT = 1500
 
 
 def ensure_state():
@@ -1190,6 +1197,112 @@ def user_messages_since(transcript, since_ms):
         if txt and not NOT_HUMAN.match(txt) and not is_resume_text(txt, custom) and txt not in out:
             out.append(txt)
     return out
+
+
+def queued_user_messages(transcript):
+    """The user's messages still waiting in Claude Code's queue (typed while Claude worked, not read yet).
+
+    Rebuilt from the `queue-operation` records: enqueue adds, dequeue takes the oldest, remove takes that
+    text out, popAll empties the queue. Checked on 300 real transcripts: 299 end with no user message left."""
+    queue = []
+    for line in tail_lines(transcript) if transcript else []:
+        if '"queue-operation"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("type") != "queue-operation":
+            continue
+        op, c = d.get("operation"), d.get("content")
+        if op == "enqueue":
+            queue.append(c)
+        elif op == "dequeue":
+            if queue:
+                queue.pop(0)
+        elif op == "remove":
+            if c in queue:
+                queue.remove(c)
+        elif op == "popAll":
+            queue = []
+    custom = resume_msg()
+    out = []
+    for c in queue:
+        t = c.strip() if isinstance(c, str) else ""
+        if t and not t.startswith("<event ") and not NOT_HUMAN.match(t) and not is_resume_text(t, custom) \
+                and t not in out:
+            out.append(t)
+    return out
+
+
+def long_reply_chars():
+    try:
+        return max(0, int(os.environ.get("SAVE_CLEAR_LONG_REPLY_CHARS") or LONG_REPLY_DEFAULT))
+    except ValueError:
+        return LONG_REPLY_DEFAULT
+
+
+def reply_chars(transcript, since_ms=0):
+    """Characters of Claude's own text (main thread) since the user's last message, and after since_ms.
+
+    That is the reply the user is reading now. Tool calls, tool results, hook feedback and subagents do not
+    count; a message the user typed or queued starts the count again."""
+    total = 0
+    custom = resume_msg()
+    for line in tail_lines(transcript) if transcript else []:
+        if '"timestamp"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or d.get("isSidechain"):
+            continue
+        kind = d.get("type")
+        if kind == "assistant":
+            t = _ts_ms(d)
+            if since_ms and (t is None or t <= since_ms):
+                continue
+            for b in (d.get("message") or {}).get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    total += len(b.get("text") or "")
+            continue
+        if d.get("isMeta") or d.get("isCompactSummary"):
+            continue
+        txt = ""
+        att = d.get("attachment") or {}
+        if kind == "attachment" and isinstance(att, dict) and att.get("type") == "queued_command":
+            txt = att.get("prompt", "")
+        elif kind == "user":
+            c = (d.get("message") or {}).get("content")
+            if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                continue
+            txt = _text_of(c)
+        txt = (txt or "").strip() if isinstance(txt, str) else ""
+        if txt and not NOT_HUMAN.match(txt) and not is_resume_text(txt, custom):
+            total = 0
+    return total
+
+
+ASKED_DIR = os.path.join(STATE, "asked")   # asked/<session id>.json: "clear now?" was asked before the save
+ASKED_MAX_AGE_MS = 20 * 60 * 1000          # a save takes minutes; an older mark is from another save
+
+
+def asked_path(session_id):
+    return os.path.join(ASKED_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", str(session_id or ""))[:120] + ".json")
+
+
+def take_asked(session_id):
+    """True when `save-clear ask` put the question for this session in the last 20 min. Removes the mark."""
+    if not session_id:
+        return False
+    p = asked_path(session_id)
+    m = read_json(p) if os.path.exists(p) else None
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+    return isinstance(m, dict) and now_ms() - int(m.get("ts") or 0) < ASKED_MAX_AGE_MS
 
 
 # ----- tmux screen and process tree (shared by bin/save-clear-send and bin/save-clear-idle) -----

@@ -3,15 +3,19 @@
 
   save-clear dir                 print (and create) the snapshot folder; also the options in effect
                                  (publish_link, language, extra steps from your config)
+  save-clear ask                 save-and-clear mode, BEFORE the save: with the confirm_seconds option (tmux
+                                 only) tell Claude to ask "clear now?" first and start the helper that answers
+                                 "go ahead" after the wait; "wait" = nothing saved, nothing cleared
   save-clear arm-resume <file>   run on_save_command (its output is appended to <file>), then: the next
                                  session started by /clear in THIS session gets <file>
   save-clear arm-clear [--now]   pick how the automatic /clear can be sent and arm the Stop hook. With the
                                  confirm_seconds option (tmux only) it also tells Claude to ask "clear now?"
-                                 first; --now skips that question
+                                 first, unless `ask` already asked before the save; --now skips that question
   save-clear disarm [session_id] take back THIS session's /clear request (the user answered "wait")
   save-clear rearm [session_id] [--subagents]
                                  after saving "what came after the save", arm THIS session's /clear again
-                                 (--subagents: the round was a subagent's result, not a user message)
+                                 (--subagents: the round was a subagent's result, not a user message). Only
+                                 once: a second time calls the automatic /clear off
   save-clear decision-waiting [session_id]
                                  in the first turn after a resume: a decision is waiting. When that turn ends,
                                  save-clear sends the 2nd message ("pending questions") by itself
@@ -26,7 +30,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 import resume  # noqa: E402
-from common import (BIN, CONFIRM_HEADER, all_clears, app_session_info, clear_key, clear_path, confirm_seconds,  # noqa: E402
+from common import (ASKED_DIR, BIN, CONFIRM_HEADER, MAX_REARMS, all_clears, asked_path, take_asked, app_session_info, clear_key, clear_path, confirm_seconds,  # noqa: E402
                     describe_subagents, desktop_app_session, extra_steps,
                     hold_resume_requests, kill_background_tasks, language, process_start_ms, log, mark_app_wait, now_ms, pending_subagents, publish_link, read_json,
                     resume_turn_marker, run_hook_command, seed_user_config, setting, snapshot_dir,
@@ -143,6 +147,56 @@ def confirm_instruction(secs):
             f"Answer 1: {stop} the turn with one short line; the /clear follows by itself. "
             f"Any other answer (option 2, typed text, dismissed): run `{disarm}`, do not clear, and end the "
             "turn with one line: the summary is saved and the clear waits until the user asks for it.")
+
+
+def ask_instruction(secs):
+    """What Claude is told by `save-clear ask`: the question comes before anything is saved."""
+    return (f"ask: {secs:g} s. Before saving anything, ask. Write no text before the question. Call "
+            f"AskUserQuestion now with ONE question: header exactly \"{CONFIRM_HEADER}\"; the question, in the "
+            f"user's language, asks whether to save and clear the conversation now and says that it goes ahead by "
+            f"itself in {secs:g} s; exactly two options, in this order: 1) go ahead: save and clear, 2) wait, I am "
+            f"still reading. A helper picks option 1 after {secs:g} s without an answer. "
+            "Answer 1: go on with the save-and-clear steps; `arm-clear` will not ask again. "
+            "Any other answer (option 2, typed text, dismissed): save nothing and clear nothing; end the turn with "
+            "one line saying the save-and-clear waits until the user asks for it (\"save-clear\").")
+
+
+def cmd_ask(args):
+    """Save-and-clear mode, step 0: ask "clear now?" BEFORE the save, so "wait" costs nothing and the screen
+    the user is reading stays as it is while they decide. Only where the helper can answer for them (tmux)."""
+    env = os.environ
+    sid = env.get("CLAUDE_CODE_SESSION_ID") or (args[0] if args else "")
+    secs = confirm_seconds()
+    pane = env.get("TMUX_PANE") or ""
+    why = ""
+    if not secs:
+        why = "confirm_seconds is 0"
+    elif env.get("CLAUDE_JOB_DIR"):
+        why = "background session"
+    elif not pane or not tmux_bin():
+        why = "not in a tmux pane"
+    elif not sid:
+        why = "no session id to check the pane with"
+    else:
+        rc, out = check("tmux", pane, sid)
+        if rc != 0:
+            why = out or f"pane {pane} could not be checked"
+    if why:
+        print(f"save-clear: no question here ({why}). Go on with the save.")
+        return 0
+    try:
+        subprocess.Popen([sys.executable, os.path.join(BIN, "save-clear-confirm"), pane, f"{secs:g}"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as e:  # nobody would answer the question for the user: do not ask it
+        log("ask", f"could not start the confirm helper ({e!r}); saving without the question")
+        print("save-clear: no question here (the helper did not start). Go on with the save.")
+        return 0
+    os.makedirs(ASKED_DIR, exist_ok=True)
+    write_json(asked_path(sid), {"ts": now_ms(), "pane": pane})
+    log("ask", f"the question comes before the save: waits {secs:g} s for session {sid[:8]}")
+    print(ask_instruction(secs))
+    return 0
 
 
 def t3_run(cmd, stdin=None, timeout=60):
@@ -316,7 +370,10 @@ def cmd_arm_clear(args):
     log("arm", f"auto-clear armed: mode={mode} target={target} session {sid[:8]}")
     # The question is for a terminal the helper can press Enter in. `--now`: the user just asked for the
     # clear (after a "wait"), so asking again would only be in the way.
-    secs = confirm_seconds() if mode == "tmux" and "--now" not in args else 0
+    asked = take_asked(sid)  # `ask` put the question before the save: never a second time
+    secs = confirm_seconds() if mode == "tmux" and "--now" not in args and not asked else 0
+    if asked:
+        log("arm", f"session {sid[:8]}: the question was asked before the save; not asking again")
     if secs:
         try:
             subprocess.Popen([sys.executable, os.path.join(BIN, "save-clear-confirm"), target, f"{secs:g}"],
@@ -351,7 +408,21 @@ def cmd_rearm(args):
     if not flag:
         print(f"save-clear: no /clear request of this session to re-arm (session {sid[:8] or '?'})", file=sys.stderr)
         return 1
+    if int(flag.get("rearms") or 0) >= MAX_REARMS:
+        # One re-arm already: another would be the loop the user complained about. Call the clear off.
+        key = flag.get("key") or (clear_key(job=job) if job and flag.get("mode") == "bg" else clear_key(sid))
+        try:
+            os.unlink(clear_path(key))
+        except OSError:
+            pass
+        log("arm", f"rearm refused: already re-armed {MAX_REARMS} time(s); automatic clear called off "
+                   f"(session {sid[:8] or '?'})")
+        print(f"not re-armed: the automatic /clear was already put off {MAX_REARMS} time(s), so it is called off "
+              "now (no loop). Keep the \"## After the save\" section, and end the turn with one short line: the "
+              "summary is saved and the clear waits until the user says \"save-clear\" (or types /clear).")
+        return 0
     flag["ts"] = flag["armed_at"] = now_ms()
+    flag["rearms"] = int(flag.get("rearms") or 0) + 1
     subagents = "--subagents" in args
     counter = "agent_rounds" if subagents else "deltas"  # subagent results do not use up the user's 3 rounds
     flag[counter] = flag.get(counter, 0) + 1
@@ -409,6 +480,8 @@ def main(argv):
     cmd, args = argv[0], argv[1:]
     if cmd == "dir":
         return cmd_dir()
+    if cmd == "ask":
+        return cmd_ask(args)
     if cmd == "arm-resume":
         return cmd_arm_resume(args)
     if cmd == "arm-clear":
