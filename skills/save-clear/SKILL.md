@@ -232,16 +232,16 @@ The numbered steps below are the full procedure.
    /clear follows.
 
    **When the automatic /clear does not happen right away.** It is never put off in a loop: the request
-   is re-armed at most once in all (a message or a subagent result after the save, or the helper finding
+   is re-armed at most once in all (a message after the save, or the helper finding
    the session busy). The next time, the clear is called off: the Stop hook (or `save-clear rearm`, which
    then refuses) asks you to record what came after under `## After the save` without re-arming, and you
    end the turn with one line saying the summary is saved and the clear waits for the user's word. Also
-   called off: when the answer to a message sent after the save is long (1500 characters or more), since
+   called off: when the answer to a message sent after the save is long (800 characters or more), since
    the user is probably reading it.
 
    **The context limit (automatic).** At the end of a turn past `context_cap_tokens`, a Stop hook asks
    for a save-clear, but not while a message from the user waits in the queue (answering it comes
-   first), and not right after a long reply (1500 characters or more since the user's last message: the
+   first), and not right after a long reply (800 characters or more since the user's last message: the
    user is probably reading it; it waits for a shorter turn, at most 3 turns in a row). Then step 0 asks
    "clear now?" before the save.
 

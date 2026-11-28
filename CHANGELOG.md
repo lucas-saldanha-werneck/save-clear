@@ -2,6 +2,14 @@
 
 Versions are the `version` in `.claude-plugin/plugin.json`. Newest first.
 
+## 0.20.0 (2026-11-28)
+
+Three limits of 0.19.0 changed, as decided by the maintainer.
+
+- A "long reply" now starts at 800 characters (was 1500, `SAVE_CLEAR_LONG_REPLY_CHARS`): the context-limit hook waits after it, and a long answer after a post-save message calls the clear off.
+- The "clear now?" question comes back after the context grows another 25k tokens (was 50k).
+- Subagents are outside the single re-arm: a subagent result after the save is recorded and re-armed with `save-clear rearm <id> --subagents` even when the request was re-armed once already, and does not use up the single re-arm. Their own limit stays (20 rounds, `agent_rounds`).
+
 ## 0.19.0 (2026-11-28)
 
 The automatic save-clear no longer wipes a reply you are still reading, and no longer loops. Why: in 4 sessions the clear came while the user was reading a long answer ("enquanto estou lendo o texto grande a sessão faz o save-clear"), jumped ahead of a message waiting in the queue ("nao faça o clear agora, prioridade na resposta do meu prompt"), re-armed 5 times in a row, and the 6-second "clear now?" question only showed up after the whole save.

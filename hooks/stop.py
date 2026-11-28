@@ -9,8 +9,8 @@ No flag: exits at once. Rules:
   `save-clear-send --check` confirms the target runs this session.
 - A user message that arrived after the save, or one still waiting in the queue, blocks the stop: Claude
   answers it, adds it to the snapshot and re-arms. The message never vanishes in the /clear.
-- The request is re-armed at most MAX_REARMS (1) time in all, whatever the reason (a message, a subagent
-  result, the helper finding the session busy). Past that, the stop is blocked once to record what came
+- The request is re-armed at most MAX_REARMS (1) time in all, whatever the reason (a message, the helper
+  finding the session busy; a subagent result is outside this rule, with its own limit). Past that, the stop is blocked once to record what came
   after, without re-arming: the clear is called off and waits for the user's word. No loop.
 - After such a round, a long answer (the user is probably reading it) calls the clear off too.
 - A background subagent's result that reached THIS conversation after the save (before the /clear)
@@ -177,7 +177,7 @@ def main():
     if int(flag.get("agent_rounds") or 0) >= MAX_AGENT_ROUNDS:
         reports = []
     listed = "; ".join(f"{tid} ({st or 'done'}): {summ}" for tid, st, summ in reports[-5:])
-    if (fresh or reports) and rearms >= MAX_REARMS:
+    if fresh and rearms >= MAX_REARMS:  # subagent results are outside this rule (own limit: MAX_AGENT_ROUNDS)
         # Already re-armed once: another round would start the loop the user complained about. Call the
         # clear off, but still have what came after written down (the summary stays the source of truth).
         drop_flag()
